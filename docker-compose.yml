@@ -1,0 +1,127 @@
+version: '3.8'
+
+services:
+  # CustomerSupport-Agent Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: customer-support-agent
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      # API Configuration
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - APP_NAME=${APP_NAME:-CustomerSupport-Agent}
+      - APP_VERSION=${APP_VERSION:-1.0.0}
+      - DEBUG=${DEBUG:-false}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+
+      # Server Configuration
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-8000}
+
+      # Database (for future use)
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./data/support.db}
+
+      # Vector Store
+      - CHROMA_PERSIST_DIR=./data/chroma_db
+      - COLLECTION_NAME=${COLLECTION_NAME:-faq_knowledge_base}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+
+      # Knowledge Base
+      - KNOWLEDGE_BASE_PATH=./data/knowledge_base
+      - CHUNK_SIZE=${CHUNK_SIZE:-500}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
+      - TOP_K_RESULTS=${TOP_K_RESULTS:-3}
+
+      # Memory Configuration
+      - MEMORY_TYPE=${MEMORY_TYPE:-sqlite}
+      - MAX_CONVERSATION_HISTORY=${MAX_CONVERSATION_HISTORY:-20}
+      - SESSION_TIMEOUT_HOURS=${SESSION_TIMEOUT_HOURS:-24}
+
+      # Sentiment Analysis
+      - SENTIMENT_THRESHOLD=${SENTIMENT_THRESHOLD:-0.3}
+      - HANDOFF_THRESHOLD=${HANDOFF_THRESHOLD:--0.5}
+      - MAX_AI_TURNS=${MAX_AI_TURNS:-10}
+
+      # Rate Limiting
+      - MAX_REQUESTS_PER_MINUTE=${MAX_REQUESTS_PER_MINUTE:-60}
+      - MAX_WS_CONNECTIONS_PER_USER=${MAX_WS_CONNECTIONS_PER_USER:-5}
+
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+    volumes:
+      # Persist data across container restarts
+      - ./data:/app/data
+    restart: unless-stopped
+    networks:
+      - support-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Nginx Reverse Proxy (Optional)
+  nginx:
+    image: nginx:alpine
+    container_name: support-nginx
+    ports:
+      - "${NGINX_PORT:-80}:80"
+      - "${NGINX_SSL_PORT:-443}:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+    networks:
+      - support-network
+    profiles:
+      - with-nginx
+
+  # PostgreSQL Database (Optional - for production use)
+  postgres:
+    image: postgres:15-alpine
+    container_name: support-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-support}
+      - POSTGRES_USER=${POSTGRES_USER:-support_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-support_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    restart: unless-stopped
+    networks:
+      - support-network
+    profiles:
+      - with-database
+
+  # Redis Cache (Optional - for performance)
+  redis:
+    image: redis:7-alpine
+    container_name: support-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    restart: unless-stopped
+    networks:
+      - support-network
+    profiles:
+      - with-redis
+
+networks:
+  support-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
