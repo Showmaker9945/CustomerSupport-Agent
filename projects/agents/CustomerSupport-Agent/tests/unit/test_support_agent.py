@@ -74,14 +74,14 @@ class TestSupportAgent:
         """Create a support agent for testing."""
         # Use a smaller model for faster testing
         return SupportAgent(
-            model_name="gpt-3.5-turbo",
+            model_name="qwen-plus",
             enable_memory=True,
             enable_sentiment=True
         )
 
     def test_init(self, agent):
         """Test agent initialization."""
-        assert agent.model_name == "gpt-3.5-turbo"
+        assert agent.model_name == "qwen-plus"
         assert agent.enable_memory is True
         assert agent.enable_sentiment is True
         assert agent.llm is not None
@@ -92,7 +92,7 @@ class TestSupportAgent:
     def test_init_without_sentiment(self):
         """Test initialization without sentiment analysis."""
         agent = SupportAgent(
-            model_name="gpt-3.5-turbo",
+            model_name="qwen-plus",
             enable_sentiment=False
         )
 
@@ -390,7 +390,7 @@ class TestConversationFlow:
 
     @pytest.fixture
     def agent(self):
-        return SupportAgent(model_name="gpt-3.5-turbo")
+        return SupportAgent(model_name="qwen-plus")
 
     def test_happy_customer_flow(self, agent):
         """Test flow with a happy customer."""
@@ -452,7 +452,7 @@ class TestEdgeCases:
 
     @pytest.fixture
     def agent(self):
-        return SupportAgent(model_name="gpt-3.5-turbo")
+        return SupportAgent(model_name="qwen-plus")
 
     def test_empty_message(self, agent):
         """Test handling empty message."""

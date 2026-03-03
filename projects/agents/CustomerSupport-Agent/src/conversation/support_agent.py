@@ -17,7 +17,6 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
-from langgraph.graph.state import CompiledStateGraph
 
 from ..config import settings
 from ..knowledge.faq_store import FAQStore, create_faq_store
@@ -120,10 +119,32 @@ When responding:
 3. Offer additional help
 4. Be concise but thorough"""
 
+    QUESTION_PREFIXES = (
+        "how", "what", "why", "where", "when", "which",
+        "can", "could", "do", "does", "is", "are", "will",
+    )
+
+    REQUEST_HINTS = (
+        "create", "open", "update", "check", "status", "lookup",
+        "cancel", "change", "reset", "help me", "please",
+    )
+
+    COMPLAINT_HINTS = (
+        "not working", "doesn't work", "broken", "issue", "problem",
+        "terrible", "awful", "frustrated", "angry", "unacceptable",
+    )
+
+    GREETING_HINTS = (
+        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+        "bye", "goodbye",
+    )
+
+    FEEDBACK_HINTS = ("thanks", "thank you", "great", "love", "amazing")
+
     def __init__(
         self,
-        model_name: str = "gpt-4o-mini",
-        temperature: float = 0.7,
+        model_name: Optional[str] = None,
+        temperature: Optional[float] = None,
         enable_memory: bool = True,
         enable_sentiment: bool = True
     ):
@@ -131,23 +152,32 @@ When responding:
         Initialize the support agent.
 
         Args:
-            model_name: OpenAI model to use
+            model_name: LLM model to use
             temperature: Response randomness (0-1)
             enable_memory: Whether to use conversation memory
             enable_sentiment: Whether to use sentiment analysis
         """
-        self.model_name = model_name
-        self.temperature = temperature
+        self.model_name = model_name or settings.llm_model
+        self.temperature = temperature if temperature is not None else settings.llm_temperature
         self.enable_memory = enable_memory
         self.enable_sentiment = enable_sentiment
+        self.llm_enabled = settings.has_valid_llm_api_key
 
         # Initialize LLM
-        self.llm = ChatOpenAI(
-            model=model_name,
-            temperature=temperature,
-            api_key=settings.openai_api_key,
-            request_timeout=30.0
-        )
+        llm_kwargs = {
+            "model": self.model_name,
+            "temperature": self.temperature,
+            "api_key": settings.resolved_llm_api_key,
+            "request_timeout": 30.0,
+        }
+        if settings.llm_base_url:
+            llm_kwargs["base_url"] = settings.llm_base_url
+        self.llm = ChatOpenAI(**llm_kwargs)
+        if not self.llm_enabled:
+            logger.warning(
+                "No valid LLM API key configured. Falling back to rule-based intent "
+                "and template responses until LLM_API_KEY is set."
+            )
 
         # Initialize components
         self.faq_store = create_faq_store()
@@ -169,7 +199,62 @@ When responding:
         # Build conversation graph
         self.graph = self._build_graph()
 
-        logger.info(f"Initialized SupportAgent with model: {model_name}")
+        logger.info(f"Initialized SupportAgent with model: {self.model_name}")
+
+    def _infer_intent_without_llm(self, message: str) -> str:
+        """Heuristic fallback for intent classification when LLM is unavailable."""
+        text = message.lower().strip()
+
+        if not text:
+            return "other"
+
+        if any(hint in text for hint in self.GREETING_HINTS):
+            return "greeting"
+
+        if any(hint in text for hint in self.FEEDBACK_HINTS):
+            return "feedback"
+
+        if any(hint in text for hint in self.COMPLAINT_HINTS):
+            return "complaint"
+
+        if text.endswith("?") or text.split(" ", 1)[0] in self.QUESTION_PREFIXES:
+            return "question"
+
+        if any(hint in text for hint in self.REQUEST_HINTS):
+            return "request"
+
+        return "other"
+
+    def _build_non_llm_response(self, state: ConversationState) -> str:
+        """Build deterministic fallback response when LLM is unavailable."""
+        faq_results = state.get("faq_results") or []
+        tool_result = state.get("tool_result")
+        escalated = state.get("escalated", False)
+        sentiment = state.get("sentiment")
+
+        intro = ""
+        if sentiment and sentiment.frustration_score >= 0.5:
+            intro = "I understand this is frustrating. "
+
+        if faq_results and faq_results[0]:
+            faq_text = faq_results[0]
+            if "No FAQs found for:" not in faq_text and "Error searching FAQ:" not in faq_text:
+                return (
+                    f"{intro}Based on our knowledge base, here is what I found:\n\n"
+                    f"{faq_text}\n\n"
+                    "If this doesn't fully solve it, I can create a support ticket for you."
+                )
+
+        if tool_result:
+            return f"{intro}{tool_result}"
+
+        if escalated:
+            return f"{intro}{settings.human_handoff_message}"
+
+        return (
+            f"{intro}I can help with account, billing, technical, and ticket issues. "
+            "Please share more details so I can assist you better."
+        )
 
     def _get_user_state_path(self, user_id: str) -> Path:
         """Get the file path for a user's active conversation state."""
@@ -225,7 +310,7 @@ When responding:
                 )
             return self.memory[user_id]
 
-    def _build_graph(self) -> CompiledStateGraph:
+    def _build_graph(self) -> Any:
         """
         Build the LangGraph conversation flow.
 
@@ -293,9 +378,16 @@ When responding:
         if self.sentiment_analyzer:
             sentiment = self.sentiment_analyzer.analyze(message)
 
-        # Classify intent using LLM
-        intent_prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""Classify the customer's intent into one of these categories:
+        # Fast-path for strong frustration: avoid LLM dependency for complaint routing.
+        if sentiment and sentiment.frustration_score >= 0.7:
+            intent = "complaint"
+        else:
+            intent = None
+
+        # Classify intent using LLM (or heuristics when unavailable)
+        if intent is None and self.llm_enabled and self.llm is not None:
+            intent_prompt = ChatPromptTemplate.from_messages([
+                SystemMessage(content="""Classify the customer's intent into one of these categories:
 
 - question: Asking for information, how-to, explanation
 - complaint: Expressing dissatisfaction, reporting a problem
@@ -305,18 +397,20 @@ When responding:
 - other: Doesn't fit other categories
 
 Return only the category name."""),
-            HumanMessage(content=message)
-        ])
+                HumanMessage(content=message)
+            ])
 
-        try:
-            intent_response = self.llm.invoke(intent_prompt.format_messages())
-            intent = intent_response.content.strip().lower()
-            # Ensure valid intent
-            valid_intents = ["question", "complaint", "request", "feedback", "greeting", "other"]
-            intent = intent if intent in valid_intents else "other"
-        except Exception as e:
-            logger.error(f"Intent classification error: {e}")
-            intent = "other"
+            try:
+                intent_response = self.llm.invoke(intent_prompt.format_messages())
+                intent = intent_response.content.strip().lower()
+                # Ensure valid intent
+                valid_intents = ["question", "complaint", "request", "feedback", "greeting", "other"]
+                intent = intent if intent in valid_intents else "other"
+            except Exception as e:
+                logger.error(f"Intent classification error: {e}")
+                intent = self._infer_intent_without_llm(message)
+        elif intent is None:
+            intent = self._infer_intent_without_llm(message)
 
         # Get user context
         context = None
@@ -534,19 +628,24 @@ Return only the category name."""),
             HumanMessage(content="Please provide a helpful response to the customer.")
         ])
 
-        try:
-            # Generate response
-            response = self.llm.invoke(response_prompt.format_messages())
-            ai_message = response.content.strip()
+        if escalated and sentiment and sentiment.frustration_score >= 0.8:
+            ai_message = self._build_non_llm_response(state)
+        elif self.llm_enabled and self.llm is not None:
+            try:
+                # Generate response
+                response = self.llm.invoke(response_prompt.format_messages())
+                ai_message = response.content.strip()
 
-            # If escalated, add escalation note
-            if escalated:
-                ticket_info = f"\n\n[Reference: {state.get('ticket_id', 'N/A')}]"
-                ai_message += ticket_info
+                # If escalated, add escalation note
+                if escalated:
+                    ticket_info = f"\n\n[Reference: {state.get('ticket_id', 'N/A')}]"
+                    ai_message += ticket_info
 
-        except Exception as e:
-            logger.error(f"Response generation error: {e}")
-            ai_message = "I apologize, but I'm having trouble generating a response. A human agent will be with you shortly."
+            except Exception as e:
+                logger.error(f"Response generation error: {e}")
+                ai_message = self._build_non_llm_response(state)
+        else:
+            ai_message = self._build_non_llm_response(state)
 
         return {
             "response": ai_message

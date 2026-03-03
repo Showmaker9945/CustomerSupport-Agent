@@ -22,7 +22,7 @@ class TestEndToEndConversation:
     def agent(self):
         """Create support agent for testing."""
         return SupportAgent(
-            model_name="gpt-3.5-turbo",
+            model_name="qwen-plus",
             enable_memory=True,
             enable_sentiment=True
         )
@@ -140,7 +140,7 @@ class TestToolIntegration:
 
     @pytest.fixture
     def agent(self):
-        return SupportAgent(model_name="gpt-3.5-turbo")
+        return SupportAgent(model_name="qwen-plus")
 
     def test_faq_tool_integration(self, agent):
         """Test FAQ search through agent."""
@@ -301,7 +301,7 @@ class TestErrorHandling:
 
     @pytest.fixture
     def agent(self):
-        return SupportAgent(model_name="gpt-3.5-turbo")
+        return SupportAgent(model_name="qwen-plus")
 
     def test_empty_message_handling(self, agent):
         """Test handling of empty messages."""
@@ -349,7 +349,7 @@ class TestConcurrency:
 
     def test_multiple_users_simultaneous(self):
         """Test handling multiple users simultaneously."""
-        agent = SupportAgent(model_name="gpt-3.5-turbo")
+        agent = SupportAgent(model_name="qwen-plus")
 
         async def chat_user(user_num: int):
             user_id = f"concurrent_user_{user_num}"
@@ -377,7 +377,7 @@ class TestPerformance:
     def test_response_time_acceptable(self):
         """Test that response times are acceptable."""
         import time
-        agent = SupportAgent(model_name="gpt-3.5-turbo")
+        agent = SupportAgent(model_name="qwen-plus")
 
         start = time.time()
         response = agent.chat("perf_test", "Hello!")
@@ -390,7 +390,7 @@ class TestPerformance:
 
     def test_memory_efficiency(self):
         """Test memory doesn't grow unbounded."""
-        agent = SupportAgent(model_name="gpt-3.5-turbo")
+        agent = SupportAgent(model_name="qwen-plus")
         user_id = "memory_efficiency"
 
         # Send many messages
@@ -408,7 +408,7 @@ class TestEdgeCases:
 
     @pytest.fixture
     def agent(self):
-        return SupportAgent(model_name="gpt-3.5-turbo")
+        return SupportAgent(model_name="qwen-plus")
 
     def test_unicode_messages(self, agent):
         """Test handling of unicode characters."""

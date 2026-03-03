@@ -50,6 +50,7 @@ class TestChatEndpoint:
         response = client.post(
             "/chat",
             json={
+                "user_id": "test_user_001",
                 "content": "Hello, how are you?",
                 "session_id": "test_session_123"
             }
@@ -61,6 +62,9 @@ class TestChatEndpoint:
         assert "message" in data
         assert "intent" in data
         assert "sentiment" in data
+        assert "sentiment_polarity" in data
+        assert "frustration_score" in data
+        assert "escalated" in data
         assert "timestamp" in data
 
     def test_chat_empty_message(self, client):
@@ -68,6 +72,7 @@ class TestChatEndpoint:
         response = client.post(
             "/chat",
             json={
+                "user_id": "test_user_001",
                 "content": "",
                 "session_id": "test"
             }
@@ -82,6 +87,7 @@ class TestChatEndpoint:
         response = client.post(
             "/chat",
             json={
+                "user_id": "test_user_001",
                 "content": long_message,
                 "session_id": "test"
             }

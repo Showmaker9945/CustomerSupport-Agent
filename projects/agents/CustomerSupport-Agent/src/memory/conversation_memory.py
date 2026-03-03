@@ -42,9 +42,10 @@ class ConversationMemory:
         self.user_id = user_id
         self.max_messages = max_messages
         self.llm = llm or ChatOpenAI(
-            model="gpt-3.5-turbo",
+            model=settings.llm_model,
             temperature=0.3,
-            api_key=settings.openai_api_key,
+            api_key=settings.resolved_llm_api_key,
+            base_url=settings.llm_base_url,
             request_timeout=30.0
         )
 
