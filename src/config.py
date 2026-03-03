@@ -32,8 +32,16 @@ class Settings(BaseSettings):
     port: int = 8000
     ws_port: int = 8001
 
-    # API Keys
-    openai_api_key: str = Field(default="test-key")
+    # LLM Configuration
+    llm_provider: str = "qwen"
+    llm_model: str = "qwen-plus"
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    llm_temperature: float = 0.7
+
+    # API Keys (keep OPENAI_API_KEY for backward compatibility)
+    llm_api_key: str = Field(default="test-key")
+    dashscope_api_key: str = Field(default="")
+    openai_api_key: str = Field(default="")
 
     # CORS
     cors_origins: List[str] = Field(
@@ -92,6 +100,29 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Check if running in development."""
         return self.environment.lower() == "development"
+
+    @property
+    def resolved_llm_api_key(self) -> str:
+        """Resolve API key with backward-compatible fallbacks."""
+        if self.llm_api_key and self.llm_api_key != "test-key":
+            return self.llm_api_key
+        if self.dashscope_api_key:
+            return self.dashscope_api_key
+        if self.openai_api_key:
+            return self.openai_api_key
+        return self.llm_api_key
+
+    @property
+    def has_valid_llm_api_key(self) -> bool:
+        """Whether an actually usable LLM API key is configured."""
+        key = (self.resolved_llm_api_key or "").strip()
+        invalid_values = {
+            "",
+            "test-key",
+            "your_qwen_api_key_here",
+            "your_openai_api_key_here",
+        }
+        return key not in invalid_values
 
 
 @lru_cache

@@ -19,6 +19,10 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+# Suppress noisy telemetry errors from older Chroma/PostHog combinations.
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
+logging.getLogger("posthog").setLevel(logging.CRITICAL)
+
 
 @dataclass
 class FAQResult:
