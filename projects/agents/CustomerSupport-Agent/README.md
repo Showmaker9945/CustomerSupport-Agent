@@ -40,6 +40,21 @@ This project showcases practical AI agent implementation using modern frameworks
 
 ---
 
+## 🚀 V2 Upgrade Highlights
+
+- **LangChain/LangGraph v1 APIs**: migrated to `create_agent` + middleware hooks.
+- **Multi-agent core**: `Supervisor`, `Knowledge`, `Action`, `Escalation`.
+- **Human-in-the-loop (HITL)**: high-risk tools pause runs and require `approve/edit/reject`.
+- **Hybrid RAG**: vector retrieval + BM25 fusion + optional reranker.
+- **Persistent memory**: thread checkpoint + long-term user memory store.
+- **New APIs**:
+  - `POST /chat` (supports `thread_id`, returns `run_status`, `interrupts`, `citations`)
+  - `POST /runs/{thread_id}/resume`
+  - `GET /chat/stream` (SSE events)
+  - `POST /knowledge/reindex`
+
+---
+
 ## 💼 Use Case
 
 ### Problem Solved

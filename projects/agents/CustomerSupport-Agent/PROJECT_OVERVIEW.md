@@ -14,6 +14,14 @@ This project demonstrates a complete customer support system featuring:
 - **Real-time Chat** via WebSocket
 - **REST API** for integrations
 
+### V2 Architecture Upgrade
+
+- Migrated to **LangChain/LangGraph v1** agent APIs (`create_agent` + middleware).
+- Introduced **multi-agent orchestration** (`Supervisor`, `Knowledge`, `Action`, `Escalation`).
+- Added **HITL run interruption + resume** (`POST /runs/{thread_id}/resume`).
+- Upgraded retrieval to **hybrid RAG** (vector + BM25 + optional reranker).
+- Added **SSE stream endpoint** (`GET /chat/stream`) and **knowledge reindex API**.
+
 ## 📁 Project Structure
 
 ```

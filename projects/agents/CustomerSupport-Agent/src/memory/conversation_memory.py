@@ -41,13 +41,19 @@ class ConversationMemory:
         """
         self.user_id = user_id
         self.max_messages = max_messages
-        self.llm = llm or ChatOpenAI(
-            model=settings.llm_model,
-            temperature=0.3,
-            api_key=settings.resolved_llm_api_key,
-            base_url=settings.llm_base_url,
-            request_timeout=30.0
-        )
+        disable_llm_env = os.getenv("DISABLE_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
+        if llm is not None:
+            self.llm = llm
+        elif settings.has_valid_llm_api_key and not disable_llm_env:
+            self.llm = ChatOpenAI(
+                model=settings.llm_model,
+                temperature=0.3,
+                api_key=settings.resolved_llm_api_key,
+                base_url=settings.llm_base_url,
+                request_timeout=12.0
+            )
+        else:
+            self.llm = None
 
         self.messages: List[Dict[str, str]] = []
         self.summary: Optional[str] = None
@@ -161,6 +167,11 @@ class ConversationMemory:
                 return None
 
             try:
+                if self.llm is None:
+                    keep_count = self.max_messages // 2
+                    self.messages = self.messages[-keep_count:] if keep_count > 0 else []
+                    return None
+
                 # Build conversation text for summarization
                 conversation_text = "\n".join([
                     f"{msg['role']}: {msg['content']}"

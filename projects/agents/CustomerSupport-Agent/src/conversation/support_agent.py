@@ -1,844 +1,1537 @@
 """
-Customer support conversation agent using LangGraph.
+基于 LangGraph 条件边编排的多 Agent 客服核心。
 
-Integrates memory, knowledge base, tools, and sentiment analysis
-for intelligent multi-turn conversations.
+能力说明：
+- 显式条件边流程：分析 -> 检索/执行/升级 -> 回答
+- middleware（before_model / dynamic_prompt / wrap_model_call / wrap_tool_call / after_model）
+- 高风险工具 HITL 中断与恢复
+- 线程级持久化（checkpointer）+ 用户级长期记忆（store）
+- 中文优先输出
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
 import logging
+import os
+import re
 import threading
+import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, TypedDict
 
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    HumanInTheLoopMiddleware,
+    ModelRequest,
+    ModelResponse,
+    ToolCallRequest,
+    after_model,
+    before_model,
+    dynamic_prompt,
+    wrap_model_call,
+    wrap_tool_call,
+)
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.graph import END, StateGraph
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.postgres import PostgresStore
+from langgraph.types import Command
 
 from ..config import settings
-from ..knowledge.faq_store import FAQStore, create_faq_store
-from ..memory.conversation_memory import ConversationMemory, UserMemoryStore
-from ..sentiment.analyzer import SentimentAnalyzer, SentimentResult, get_sentiment_analyzer
+from ..sentiment.analyzer import SentimentResult, get_sentiment_analyzer
 from ..tools.support_tools import (
-    ALL_TOOLS,
     create_ticket,
+    escalate_to_human,
     get_ticket_status,
-    update_ticket,
     get_user_tickets,
     lookup_account,
-    escalate_to_human,
+    reindex_knowledge_base,
     search_faq,
+    update_ticket,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# DATA MODELS
-# ============================================================================
-
 class ConversationState(TypedDict):
-    """State for conversation graph."""
+    """对外兼容的会话状态定义。"""
+
     user_id: str
+    thread_id: str
     messages: List[Dict[str, str]]
     current_message: str
     intent: Optional[str]
-    sentiment: Optional[SentimentResult]
-    faq_results: Optional[List[str]]
-    tool_result: Optional[str]
+    risk: Optional[str]
     response: Optional[str]
-    escalated: bool
+    active_agent: Optional[str]
+    citations: Optional[List[str]]
+    run_status: Optional[str]
+
+
+class OrchestrationState(TypedDict, total=False):
+    """LangGraph 编排状态。"""
+
+    user_id: str
+    thread_id: str
+    current_message: str
+    intent: str
+    risk: str
+    sentiment_label: str
+    frustration_score: float
+    selected_agent: str
+    active_agent: str
+    needs_knowledge: bool
+    needs_action: bool
+    needs_action_after_knowledge: bool
+    needs_escalation: bool
+    retrieval_text: str
+    tool_text: str
+    final_message: str
+    citations: List[str]
+    run_status: Literal["completed", "interrupted", "error"]
+    interrupts: List[Dict[str, Any]]
     ticket_id: Optional[str]
-    context: Optional[str]
+    escalated: bool
+
+
+@dataclass
+class AgentRuntimeContext:
+    """LangGraph runtime context（注入 middleware）。"""
+
+    user_id: str
+    thread_id: str
+    active_agent: str
+    intent: str = "other"
+    risk: str = "low"
+    locale: str = settings.default_response_language
 
 
 @dataclass
 class SupportResponse:
-    """Response from the support agent."""
+    """统一客服返回结构（兼容旧字段 + 新字段）。"""
+
     message: str
     intent: str
     sentiment: SentimentResult
     sources: List[str] = field(default_factory=list)
     escalated: bool = False
     ticket_created: Optional[str] = None
+    thread_id: Optional[str] = None
+    run_status: Literal["completed", "interrupted", "error"] = "completed"
+    interrupts: List[Dict[str, Any]] = field(default_factory=list)
+    citations: List[str] = field(default_factory=list)
+    active_agent: str = "supervisor"
+    trace_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
+        """转换为 API 友好字典。"""
         return {
             "message": self.message,
             "intent": self.intent,
             "sentiment": {
                 "label": self.sentiment.label,
                 "polarity": self.sentiment.polarity,
-                "frustration_score": self.sentiment.frustration_score
+                "frustration_score": self.sentiment.frustration_score,
             },
             "sources": self.sources,
             "escalated": self.escalated,
-            "ticket_created": self.ticket_created
+            "ticket_created": self.ticket_created,
+            "thread_id": self.thread_id,
+            "run_status": self.run_status,
+            "interrupts": self.interrupts,
+            "citations": self.citations,
+            "active_agent": self.active_agent,
+            "trace_id": self.trace_id,
         }
 
 
-# ============================================================================
-# SUPPORT AGENT
-# ============================================================================
+class LangGraphPersistence:
+    """封装 checkpointer/store 初始化与资源释放。"""
+
+    def __init__(self) -> None:
+        self.checkpointer: Any = None
+        self.store: Any = None
+        self._checkpointer_cm: Any = None
+        self._store_cm: Any = None
+        self.backend = "memory"
+        self._init_backend()
+
+    def _init_backend(self) -> None:
+        """优先使用 Postgres，不可用时回退内存实现。"""
+        if settings.use_postgres_langgraph:
+            try:
+                self._store_cm = PostgresStore.from_conn_string(settings.postgres_uri)
+                self._checkpointer_cm = PostgresSaver.from_conn_string(settings.postgres_uri)
+                self.store = self._store_cm.__enter__()
+                self.checkpointer = self._checkpointer_cm.__enter__()
+
+                if settings.auto_setup_postgres:
+                    with suppress(Exception):
+                        self.store.setup()
+                    with suppress(Exception):
+                        self.checkpointer.setup()
+
+                self.backend = "postgres"
+                logger.info("LangGraph persistence backend: postgres")
+                return
+            except Exception as error:
+                logger.warning(f"Postgres backend unavailable, fallback to memory: {error}")
+                with suppress(Exception):
+                    if self._store_cm:
+                        self._store_cm.__exit__(None, None, None)
+                with suppress(Exception):
+                    if self._checkpointer_cm:
+                        self._checkpointer_cm.__exit__(None, None, None)
+
+        self.checkpointer = InMemorySaver()
+        self.store = InMemoryStore()
+        self.backend = "memory"
+        logger.info("LangGraph persistence backend: memory")
+
+    def close(self) -> None:
+        """释放资源。"""
+        with suppress(Exception):
+            if self._store_cm:
+                self._store_cm.__exit__(None, None, None)
+        with suppress(Exception):
+            if self._checkpointer_cm:
+                self._checkpointer_cm.__exit__(None, None, None)
+
 
 class SupportAgent:
     """
-    Customer support conversational agent.
+    多 Agent 客服调度器（LangGraph 条件边编排）。
 
-    Uses LangGraph for conversation flow with sentiment-aware routing,
-    knowledge base search, and tool execution.
+    流程：
+    - analyze: LLM/回退规则做意图、风险、情绪与路由规划
+    - knowledge/action/escalation: 执行子代理任务
+    - respond: 回答代理统一收敛输出
     """
 
-    # System prompt for the agent
-    SYSTEM_PROMPT = """You are a helpful, empathetic customer support agent for a SaaS company.
-
-Your role is to assist customers with:
-- Answering questions about the product/service
-- Resolving technical issues
-- Handling billing and account inquiries
-- Creating support tickets when needed
-- Escalating to human agents when appropriate
-
-Guidelines:
-- Be friendly, professional, and empathetic
-- Acknowledge the customer's feelings, especially if they're frustrated
-- Use the customer's name when available
-- Provide clear, actionable answers
-- If you don't know something, admit it and offer to find out
-- Always maintain a calm, helpful tone even with upset customers
-- Create tickets for issues that need follow-up
-- Escalate immediately for very angry or frustrated customers
-
-When responding:
-1. Address the customer's immediate concern
-2. Provide relevant information from your knowledge base
-3. Offer additional help
-4. Be concise but thorough"""
-
-    QUESTION_PREFIXES = (
-        "how", "what", "why", "where", "when", "which",
-        "can", "could", "do", "does", "is", "are", "will",
+    QUESTION_HINTS = (
+        "怎么", "如何", "为什么", "what", "how", "why", "?", "？", "说明", "教程", "帮助文档"
     )
-
     REQUEST_HINTS = (
-        "create", "open", "update", "check", "status", "lookup",
-        "cancel", "change", "reset", "help me", "please",
+        "创建", "新建", "工单", "ticket", "状态", "进度", "查询", "更新", "账户", "账号", "账单"
     )
-
-    COMPLAINT_HINTS = (
-        "not working", "doesn't work", "broken", "issue", "problem",
-        "terrible", "awful", "frustrated", "angry", "unacceptable",
+    ESCALATION_HINTS = (
+        "人工", "投诉", "经理", "马上处理", "退款", "起诉", "furious", "unacceptable", "sue"
     )
-
-    GREETING_HINTS = (
-        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
-        "bye", "goodbye",
-    )
-
-    FEEDBACK_HINTS = ("thanks", "thank you", "great", "love", "amazing")
+    ACCOUNT_HINTS = ("账户", "账号", "账单", "member", "plan", "invoice", "account")
+    TICKET_HINTS = ("工单", "ticket", "状态", "进度", "升级", "催单")
 
     def __init__(
         self,
         model_name: Optional[str] = None,
         temperature: Optional[float] = None,
         enable_memory: bool = True,
-        enable_sentiment: bool = True
-    ):
-        """
-        Initialize the support agent.
-
-        Args:
-            model_name: LLM model to use
-            temperature: Response randomness (0-1)
-            enable_memory: Whether to use conversation memory
-            enable_sentiment: Whether to use sentiment analysis
-        """
+        enable_sentiment: bool = True,
+    ) -> None:
         self.model_name = model_name or settings.llm_model
-        self.temperature = temperature if temperature is not None else settings.llm_temperature
+        self.temperature = settings.llm_temperature if temperature is None else temperature
         self.enable_memory = enable_memory
         self.enable_sentiment = enable_sentiment
-        self.llm_enabled = settings.has_valid_llm_api_key
+        disable_llm = os.getenv("DISABLE_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.llm_enabled = settings.has_valid_llm_api_key and not disable_llm
+        self.persistence = LangGraphPersistence()
+        self.sentiment_analyzer = get_sentiment_analyzer() if enable_sentiment else None
 
-        # Initialize LLM
-        llm_kwargs = {
-            "model": self.model_name,
-            "temperature": self.temperature,
+        self._lock = threading.Lock()
+        self._history: Dict[str, List[Dict[str, str]]] = {}
+        self._thread_user: Dict[str, str] = {}
+        self._pending_role: Dict[str, str] = {}
+        self._pending_state: Dict[str, OrchestrationState] = {}
+        self._trace_by_thread: Dict[str, str] = {}
+
+        self.basic_model: Optional[ChatOpenAI] = None
+        self.advanced_model: Optional[ChatOpenAI] = None
+        self.role_agents: Dict[str, Any] = {}
+
+        if self.llm_enabled:
+            self.basic_model = self._create_model(self.model_name, self.temperature)
+            self.advanced_model = self._create_model(settings.llm_high_quality_model, 0.2)
+            self._build_role_agents()
+        else:
+            logger.warning("LLM 未可用：将使用规则路由与模板回复。")
+
+        self.orchestration_graph = self._build_orchestration_graph()
+
+    def close(self) -> None:
+        """释放底层资源。"""
+        self.persistence.close()
+
+    def _create_model(self, model_name: str, temperature: float) -> ChatOpenAI:
+        kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "temperature": temperature,
             "api_key": settings.resolved_llm_api_key,
-            "request_timeout": 30.0,
+            "request_timeout": 45.0,
         }
         if settings.llm_base_url:
-            llm_kwargs["base_url"] = settings.llm_base_url
-        self.llm = ChatOpenAI(**llm_kwargs)
-        if not self.llm_enabled:
-            logger.warning(
-                "No valid LLM API key configured. Falling back to rule-based intent "
-                "and template responses until LLM_API_KEY is set."
+            kwargs["base_url"] = settings.llm_base_url
+        return ChatOpenAI(**kwargs)
+
+    def _memory_namespace(self, user_id: str) -> Tuple[str, str]:
+        return (settings.long_term_memory_namespace, user_id)
+
+    def _save_memory_item(self, user_id: str, payload: Dict[str, Any]) -> None:
+        if not self.enable_memory or self.persistence.store is None:
+            return
+        digest = hashlib.md5(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        self.persistence.store.put(self._memory_namespace(user_id), digest, payload)
+
+    def _search_memory(self, user_id: str, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        if not self.enable_memory or self.persistence.store is None:
+            return []
+        try:
+            items = self.persistence.store.search(
+                self._memory_namespace(user_id),
+                query=query,
+                limit=limit,
+            )
+            return [item.value for item in items]
+        except Exception as error:
+            logger.warning(f"Memory search failed: {error}")
+            return []
+
+    def _build_role_agents(self) -> None:
+        """创建角色 Agent。"""
+        self.role_agents = {
+            "supervisor": self._create_role_agent(
+                role="supervisor",
+                tools=[search_faq, lookup_account, get_ticket_status],
+                enable_hitl=False,
+            ),
+            "knowledge": self._create_role_agent(
+                role="knowledge",
+                tools=[search_faq],
+                enable_hitl=False,
+            ),
+            "action": self._create_role_agent(
+                role="action",
+                tools=[
+                    search_faq,
+                    create_ticket,
+                    update_ticket,
+                    get_ticket_status,
+                    get_user_tickets,
+                    lookup_account,
+                    escalate_to_human,
+                ],
+                enable_hitl=True,
+            ),
+            "escalation": self._create_role_agent(
+                role="escalation",
+                tools=[escalate_to_human, create_ticket, get_ticket_status],
+                enable_hitl=True,
+            ),
+            "responder": self._create_role_agent(
+                role="responder",
+                tools=[],
+                enable_hitl=False,
+            ),
+        }
+
+    def _create_role_agent(self, role: str, tools: List[Any], enable_hitl: bool) -> Any:
+        """按角色创建 create_agent 实例。"""
+
+        @dynamic_prompt
+        def role_prompt(request: ModelRequest) -> str:
+            context = getattr(request.runtime, "context", None)
+            user_id = getattr(context, "user_id", "unknown_user")
+            latest_user = ""
+            for message in reversed(request.state.get("messages", [])):
+                if isinstance(message, HumanMessage):
+                    latest_user = str(message.content)
+                    break
+
+            memory_items = self._search_memory(user_id=user_id, query=latest_user, limit=4)
+            memory_text = "\n".join(
+                f"- {item.get('fact', item.get('message', ''))}"
+                for item in memory_items
+                if item
+            )
+            memory_block = f"\n用户长期记忆：\n{memory_text}" if memory_text else "\n用户长期记忆：暂无"
+
+            role_rules = {
+                "supervisor": "你是客服总调度，负责判断问题类型并给出决策建议。",
+                "knowledge": "你是知识检索专家，优先调用 search_faq，严格基于证据回复。",
+                "action": "你是客服执行专家，负责工单与账户类动作，必要时调用工具。",
+                "escalation": "你是升级专员，负责人工介入、风险沟通与交接摘要。",
+                "responder": "你是最终回答代理，负责融合证据与工具结果，生成最终答复。",
+            }
+            return (
+                f"{role_rules.get(role, '你是客服助手。')}\n"
+                "输出必须为中文，语气专业、简洁、可执行。\n"
+                "若信息不足，明确说明并提出下一步收集项。\n"
+                "回答尽量包含来源与依据，不编造事实。"
+                f"{memory_block}"
             )
 
-        # Initialize components
-        self.faq_store = create_faq_store()
-        self.sentiment_analyzer = get_sentiment_analyzer() if enable_sentiment else None
-        self.user_memory_store = UserMemoryStore()
+        @before_model
+        def trim_history(state: Dict[str, Any], _runtime: Any) -> Dict[str, Any] | None:
+            messages = state.get("messages", [])
+            max_keep = max(8, settings.max_conversation_history)
+            if len(messages) <= max_keep:
+                return None
+            removals = [
+                RemoveMessage(id=msg.id) for msg in messages[:-max_keep] if getattr(msg, "id", None)
+            ]
+            if removals:
+                return {"messages": removals}
+            return None
 
-        # State persistence path
-        self.state_path = Path("./data/conversation_state")
-        self.state_path.mkdir(parents=True, exist_ok=True)
+        @wrap_model_call
+        def dynamic_model_selector(
+            request: ModelRequest, handler: Any
+        ) -> ModelResponse:
+            if self.advanced_model is None:
+                return handler(request)
+            message_count = len(request.state.get("messages", []))
+            context = getattr(request.runtime, "context", None)
+            risk = getattr(context, "risk", "low")
+            if message_count > 12 or risk == "high":
+                return handler(request.override(model=self.advanced_model))
+            return handler(request)
 
-        # Conversation memory per user (with thread-safe lock)
-        self.memory: Dict[str, ConversationMemory] = {}
-        self._memory_lock = threading.Lock()
+        @wrap_tool_call
+        def safe_tool_wrapper(request: ToolCallRequest, handler: Any) -> Any:
+            tool_name = request.tool_call.get("name", "unknown_tool")
+            args = request.tool_call.get("args", {})
+            logger.info(f"[tool_call] role={role} tool={tool_name} args={args}")
 
-        # Load previous state if enabled
-        if enable_memory:
-            self._load_state()
-
-        # Build conversation graph
-        self.graph = self._build_graph()
-
-        logger.info(f"Initialized SupportAgent with model: {self.model_name}")
-
-    def _infer_intent_without_llm(self, message: str) -> str:
-        """Heuristic fallback for intent classification when LLM is unavailable."""
-        text = message.lower().strip()
-
-        if not text:
-            return "other"
-
-        if any(hint in text for hint in self.GREETING_HINTS):
-            return "greeting"
-
-        if any(hint in text for hint in self.FEEDBACK_HINTS):
-            return "feedback"
-
-        if any(hint in text for hint in self.COMPLAINT_HINTS):
-            return "complaint"
-
-        if text.endswith("?") or text.split(" ", 1)[0] in self.QUESTION_PREFIXES:
-            return "question"
-
-        if any(hint in text for hint in self.REQUEST_HINTS):
-            return "request"
-
-        return "other"
-
-    def _build_non_llm_response(self, state: ConversationState) -> str:
-        """Build deterministic fallback response when LLM is unavailable."""
-        faq_results = state.get("faq_results") or []
-        tool_result = state.get("tool_result")
-        escalated = state.get("escalated", False)
-        sentiment = state.get("sentiment")
-
-        intro = ""
-        if sentiment and sentiment.frustration_score >= 0.5:
-            intro = "I understand this is frustrating. "
-
-        if faq_results and faq_results[0]:
-            faq_text = faq_results[0]
-            if "No FAQs found for:" not in faq_text and "Error searching FAQ:" not in faq_text:
-                return (
-                    f"{intro}Based on our knowledge base, here is what I found:\n\n"
-                    f"{faq_text}\n\n"
-                    "If this doesn't fully solve it, I can create a support ticket for you."
-                )
-
-        if tool_result:
-            return f"{intro}{tool_result}"
-
-        if escalated:
-            return f"{intro}{settings.human_handoff_message}"
-
-        return (
-            f"{intro}I can help with account, billing, technical, and ticket issues. "
-            "Please share more details so I can assist you better."
-        )
-
-    def _get_user_state_path(self, user_id: str) -> Path:
-        """Get the file path for a user's active conversation state."""
-        return self.state_path / f"{user_id}_active.json"
-
-    def _save_state(self) -> None:
-        """Save active conversation states to disk."""
-        try:
-            state_data = {}
-            for user_id, memory in self.memory.items():
-                state_data[user_id] = {
-                    "memory": memory.to_dict(),
-                    "saved_at": datetime.now(timezone.utc).isoformat()
-                }
-
-            state_file = self.state_path / "active_conversations.json"
-            with open(state_file, 'w', encoding='utf-8') as f:
-                json.dump(state_data, f, indent=2, ensure_ascii=False)
-
-            logger.debug(f"Saved state for {len(self.memory)} active users")
-
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-
-    def _load_state(self) -> None:
-        """Load active conversation states from disk."""
-        state_file = self.state_path / "active_conversations.json"
-        if not state_file.exists():
-            return
-
-        try:
-            with open(state_file, 'r', encoding='utf-8') as f:
-                state_data = json.load(f)
-
-            for user_id, data in state_data.items():
-                memory_data = data.get("memory", {})
-                if memory_data:
-                    memory = ConversationMemory.from_dict(memory_data, llm=self.llm)
-                    self.memory[user_id] = memory
-
-            logger.info(f"Loaded state for {len(self.memory)} active users")
-
-        except Exception as e:
-            logger.error(f"Failed to load state: {e}")
-
-    def _get_or_create_memory(self, user_id: str) -> ConversationMemory:
-        """Get or create conversation memory for user (thread-safe)."""
-        with self._memory_lock:
-            if user_id not in self.memory:
-                self.memory[user_id] = ConversationMemory(
-                    user_id=user_id,
-                    llm=self.llm
-                )
-            return self.memory[user_id]
-
-    def _build_graph(self) -> Any:
-        """
-        Build the LangGraph conversation flow.
-
-        Flow:
-        1. understand_intent - Classify user's intent
-        2. check_escalation - Check if immediate escalation needed
-        3. search_knowledge - Search FAQ for questions
-        4. use_tool - Execute relevant tools
-        5. generate_response - Create final response
-        """
-        # Create graph
-        workflow = StateGraph(ConversationState)
-
-        # Add nodes
-        workflow.add_node("understand_intent", self._understand_intent)
-        workflow.add_node("check_escalation", self._check_escalation)
-        workflow.add_node("search_knowledge", self._search_knowledge)
-        workflow.add_node("use_tool", self._use_tool)
-        workflow.add_node("generate_response", self._generate_response)
-
-        # Set entry point
-        workflow.set_entry_point("understand_intent")
-
-        # Add conditional edges
-        workflow.add_conditional_edges(
-            "understand_intent",
-            self._route_after_intent,
-            {
-                "escalate": "check_escalation",
-                "search": "search_knowledge",
-                "tool": "use_tool",
-                "respond": "generate_response"
-            }
-        )
-
-        workflow.add_conditional_edges(
-            "check_escalation",
-            self._route_after_escalation_check,
-            {
-                "escalate": "generate_response",
-                "continue": "search_knowledge"
-            }
-        )
-
-        # Knowledge and tool both lead to response
-        workflow.add_edge("search_knowledge", "generate_response")
-        workflow.add_edge("use_tool", "generate_response")
-
-        # Response is the end
-        workflow.add_edge("generate_response", END)
-
-        return workflow.compile()
-
-    def _understand_intent(self, state: ConversationState) -> dict:
-        """
-        Classify user intent and sentiment.
-
-        Returns:
-            Updated state with intent and sentiment
-        """
-        message = state["current_message"]
-
-        # Analyze sentiment
-        sentiment = None
-        if self.sentiment_analyzer:
-            sentiment = self.sentiment_analyzer.analyze(message)
-
-        # Fast-path for strong frustration: avoid LLM dependency for complaint routing.
-        if sentiment and sentiment.frustration_score >= 0.7:
-            intent = "complaint"
-        else:
-            intent = None
-
-        # Classify intent using LLM (or heuristics when unavailable)
-        if intent is None and self.llm_enabled and self.llm is not None:
-            intent_prompt = ChatPromptTemplate.from_messages([
-                SystemMessage(content="""Classify the customer's intent into one of these categories:
-
-- question: Asking for information, how-to, explanation
-- complaint: Expressing dissatisfaction, reporting a problem
-- request: Asking for action (create ticket, update account, etc.)
-- feedback: Providing opinions or suggestions
-- greeting: Saying hello, thanks, goodbye
-- other: Doesn't fit other categories
-
-Return only the category name."""),
-                HumanMessage(content=message)
-            ])
+            context = getattr(request.runtime, "context", None)
+            user_id = getattr(context, "user_id", "unknown_user")
+            thread_id = getattr(context, "thread_id", "unknown_thread")
+            self._save_memory_item(
+                user_id=user_id,
+                payload={
+                    "kind": "tool_call",
+                    "role": role,
+                    "thread_id": thread_id,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
 
             try:
-                intent_response = self.llm.invoke(intent_prompt.format_messages())
-                intent = intent_response.content.strip().lower()
-                # Ensure valid intent
-                valid_intents = ["question", "complaint", "request", "feedback", "greeting", "other"]
-                intent = intent if intent in valid_intents else "other"
-            except Exception as e:
-                logger.error(f"Intent classification error: {e}")
-                intent = self._infer_intent_without_llm(message)
-        elif intent is None:
-            intent = self._infer_intent_without_llm(message)
+                return handler(request)
+            except Exception as error:
+                logger.error(f"Tool execution failed: {tool_name}, error={error}")
+                return ToolMessage(
+                    content=f"工具 `{tool_name}` 执行失败：{str(error)}",
+                    tool_call_id=request.tool_call.get("id", "unknown_id"),
+                    name=tool_name,
+                    status="error",
+                )
 
-        # Get user context
-        context = None
-        if self.enable_memory:
-            user_context = self.user_memory_store.get_user_context(state["user_id"])
-            if user_context:
-                memory = self._get_or_create_memory(state["user_id"])
-                context = f"{user_context}\n\n{memory.get_context(max_tokens=1000)}"
+        @after_model
+        def output_guard(state: Dict[str, Any], _runtime: Any) -> Dict[str, Any] | None:
+            messages = state.get("messages", [])
+            last_ai: Optional[AIMessage] = next(
+                (msg for msg in reversed(messages) if isinstance(msg, AIMessage)),
+                None,
+            )
+            if last_ai is None:
+                return None
+
+            raw_content = str(last_ai.content or "")
+            guarded = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "[REDACTED]", raw_content)
+            if not re.search(r"[\u4e00-\u9fff]", guarded):
+                guarded = "以下为中文回复：\n" + guarded
+
+            if guarded == raw_content:
+                return None
+            if getattr(last_ai, "id", None):
+                return {"messages": [RemoveMessage(id=last_ai.id), AIMessage(content=guarded)]}
+            return None
+
+        middleware: List[Any] = [
+            role_prompt,
+            trim_history,
+            dynamic_model_selector,
+            safe_tool_wrapper,
+            output_guard,
+        ]
+
+        if enable_hitl:
+            interrupt_on = {tool: True for tool in settings.hitl_high_risk_tools}
+            middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+
+        return create_agent(
+            model=self.basic_model,
+            tools=tools,
+            middleware=middleware,
+            context_schema=AgentRuntimeContext,
+            checkpointer=self.persistence.checkpointer,
+            store=self.persistence.store,
+            name=f"{role}_agent",
+        )
+
+    def _build_orchestration_graph(self) -> Any:
+        """构建 LangGraph 条件边编排流程。"""
+        workflow = StateGraph(OrchestrationState)
+
+        workflow.add_node("analyze", self._node_analyze)
+        workflow.add_node("knowledge", self._node_knowledge)
+        workflow.add_node("action", self._node_action)
+        workflow.add_node("escalation", self._node_escalation)
+        workflow.add_node("respond", self._node_respond)
+
+        workflow.set_entry_point("analyze")
+
+        workflow.add_conditional_edges(
+            "analyze",
+            self._route_after_analyze,
+            {
+                "knowledge": "knowledge",
+                "action": "action",
+                "escalation": "escalation",
+                "respond": "respond",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "knowledge",
+            self._route_after_knowledge,
+            {
+                "action": "action",
+                "respond": "respond",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "action",
+            self._route_after_execution,
+            {
+                "respond": "respond",
+                "end": END,
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "escalation",
+            self._route_after_execution,
+            {
+                "respond": "respond",
+                "end": END,
+            },
+        )
+
+        workflow.add_edge("respond", END)
+        return workflow.compile()
+
+    def _infer_intent(self, message: str) -> str:
+        lowered = message.lower().strip()
+        if not lowered:
+            return "other"
+        if any(token in lowered for token in self.ESCALATION_HINTS):
+            return "complaint"
+        if any(token in lowered for token in self.REQUEST_HINTS):
+            return "request"
+        if any(token in lowered for token in self.QUESTION_HINTS):
+            return "question"
+        if any(token in lowered for token in ("hello", "hi", "你好", "感谢", "谢谢", "thanks")):
+            return "greeting"
+        return "other"
+
+    def _infer_risk(self, message: str, sentiment: Optional[SentimentResult]) -> str:
+        lowered = message.lower()
+        if any(token in lowered for token in self.ESCALATION_HINTS):
+            return "high"
+        if sentiment and sentiment.frustration_score >= 0.75:
+            return "high"
+        if sentiment and sentiment.frustration_score >= 0.45:
+            return "medium"
+        return "low"
+
+    def _normalize_intent(self, value: Any) -> str:
+        valid = {"question", "complaint", "request", "feedback", "greeting", "other"}
+        text = str(value or "").strip().lower()
+        return text if text in valid else "other"
+
+    def _normalize_risk(self, value: Any) -> str:
+        valid = {"low", "medium", "high"}
+        text = str(value or "").strip().lower()
+        return text if text in valid else "low"
+
+    def _normalize_sentiment_label(self, value: Any) -> str:
+        valid = {"positive", "neutral", "negative"}
+        text = str(value or "").strip().lower()
+        return text if text in valid else "neutral"
+
+    def _as_bool(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+        return False
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            result = float(value)
+            return max(0.0, min(1.0, result))
+        except Exception:
+            return default
+
+    def _extract_json_payload(self, text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        candidates: List[str] = [text.strip()]
+        fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+        candidates.extend(fenced)
+        brace_match = re.search(r"\{[\s\S]*\}", text)
+        if brace_match:
+            candidates.append(brace_match.group(0))
+
+        for candidate in candidates:
+            with suppress(Exception):
+                payload = json.loads(candidate)
+                if isinstance(payload, dict):
+                    return payload
+        return None
+
+    def _llm_analyze_message(
+        self,
+        message: str,
+        baseline_intent: str,
+        baseline_risk: str,
+        baseline_sentiment: SentimentResult,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.llm_enabled or self.basic_model is None:
+            return None
+
+        system_prompt = (
+            "你是客服路由决策器。"
+            "请严格返回 JSON，不要输出任何额外解释。"
+            "字段："
+            "intent(question|complaint|request|feedback|greeting|other),"
+            "risk(low|medium|high),"
+            "sentiment_label(positive|neutral|negative),"
+            "frustration_score(0到1),"
+            "needs_knowledge(boolean),"
+            "needs_action(boolean),"
+            "needs_escalation(boolean),"
+            "reason(字符串)。"
+        )
+        user_prompt = (
+            f"用户消息：{message}\n"
+            f"基线意图：{baseline_intent}\n"
+            f"基线风险：{baseline_risk}\n"
+            f"基线情绪：{baseline_sentiment.label}\n"
+            f"基线挫败分：{baseline_sentiment.frustration_score:.2f}"
+        )
+
+        try:
+            response = self.basic_model.invoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            )
+            payload = self._extract_json_payload(str(response.content))
+            if not payload:
+                return None
+            return {
+                "intent": self._normalize_intent(payload.get("intent")),
+                "risk": self._normalize_risk(payload.get("risk")),
+                "sentiment_label": self._normalize_sentiment_label(payload.get("sentiment_label")),
+                "frustration_score": self._safe_float(
+                    payload.get("frustration_score"),
+                    default=baseline_sentiment.frustration_score,
+                ),
+                "needs_knowledge": self._as_bool(payload.get("needs_knowledge")),
+                "needs_action": self._as_bool(payload.get("needs_action")),
+                "needs_escalation": self._as_bool(payload.get("needs_escalation")),
+                "reason": str(payload.get("reason", "")).strip(),
+            }
+        except Exception as error:
+            logger.warning(f"LLM analysis failed, fallback to heuristic routing: {error}")
+            return None
+
+    def _plan_route(
+        self,
+        intent: str,
+        risk: str,
+        needs_knowledge: bool,
+        needs_action: bool,
+        needs_escalation: bool,
+    ) -> Tuple[str, bool]:
+        if risk == "high":
+            needs_escalation = True
+        if needs_escalation:
+            return "escalation", False
+        if needs_knowledge:
+            return "knowledge", needs_action
+        if needs_action:
+            return "action", False
+        if intent in {"question", "complaint"}:
+            return "knowledge", False
+        if intent == "request":
+            return "action", False
+        return "supervisor", False
+
+    def _merge_unique(self, left: List[str], right: List[str]) -> List[str]:
+        merged = list(left)
+        for item in right:
+            cleaned = str(item).strip()
+            if cleaned and cleaned not in merged:
+                merged.append(cleaned)
+        return merged
+
+    def _ticket_id_from_text(self, text: str) -> Optional[str]:
+        match = re.search(r"TKT-\d{8,14}-\d{3,6}", text, re.IGNORECASE)
+        return match.group(0).upper() if match else None
+
+    def _extract_citations(self, text: str) -> List[str]:
+        citations = re.findall(r"来源：([^\n]+)", text)
+        unique: List[str] = []
+        for cite in citations:
+            cleaned = cite.strip()
+            if cleaned and cleaned not in unique:
+                unique.append(cleaned)
+        return unique
+
+    def _agent_thread_id(self, thread_id: str, role: str) -> str:
+        return f"{settings.langgraph_thread_prefix}:{role}:{thread_id}"
+
+    def _extract_interrupts(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_interrupts = result.get("__interrupt__", []) if isinstance(result, dict) else []
+        payloads: List[Dict[str, Any]] = []
+        for item in raw_interrupts:
+            payloads.append(
+                {
+                    "id": getattr(item, "id", None),
+                    "value": getattr(item, "value", item),
+                }
+            )
+        return payloads
+
+    def _extract_ai_text(self, result: Dict[str, Any]) -> str:
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        for message in reversed(messages):
+            if isinstance(message, AIMessage) and message.content:
+                return str(message.content)
+        return "抱歉，我暂时无法给出有效回复。"
+
+    def _fallback_response(
+        self,
+        role: str,
+        user_id: str,
+        message: str,
+        sentiment: Optional[SentimentResult],
+        retrieval_text: str = "",
+        tool_text: str = "",
+    ) -> str:
+        intro = ""
+        if sentiment and sentiment.frustration_score >= 0.45:
+            intro = "我理解你现在比较着急，我们先快速定位问题。"
+
+        lowered = message.lower()
+        if role == "knowledge":
+            try:
+                return intro + search_faq.invoke({"query": message, "category": None})
+            except Exception as error:
+                return intro + f"知识检索失败：{error}"
+
+        if role == "action":
+            if "工单" in message and any(token in lowered for token in ("创建", "create", "open", "new")):
+                return intro + create_ticket.invoke(
+                    {
+                        "user_id": user_id,
+                        "subject": message[:80],
+                        "description": message,
+                        "priority": "medium",
+                    }
+                )
+            if "状态" in message or "status" in lowered:
+                ticket_id = self._ticket_id_from_text(message)
+                if ticket_id:
+                    return intro + get_ticket_status.invoke({"ticket_id": ticket_id})
+                return intro + get_user_tickets.invoke({"user_id": user_id, "status": None})
+            if "账户" in message or "account" in lowered:
+                return intro + lookup_account.invoke({"user_id": user_id})
+            return intro + "请提供更具体的执行信息（例如工单号、账户ID、操作目标）。"
+
+        if role == "escalation":
+            return intro + escalate_to_human.invoke(
+                {
+                    "user_id": user_id,
+                    "reason": "高风险或高情绪场景",
+                    "conversation_summary": message[:400],
+                }
+            )
+
+        if role == "responder":
+            response_parts: List[str] = []
+            if retrieval_text:
+                response_parts.append(retrieval_text)
+            if tool_text:
+                response_parts.append(tool_text)
+            if response_parts:
+                return intro + "\n\n".join(response_parts)
+            return (
+                intro
+                + "我可以帮助你处理产品使用、账单账户、技术排障与工单问题。"
+                "请告诉我你遇到的具体现象（操作步骤、报错信息、期望结果）。"
+            )
+
+        return (
+            intro
+            + "我可以帮助你处理产品使用、账单账户、技术排障与工单问题。"
+            "请告诉我你遇到的具体现象（操作步骤、报错信息、期望结果）。"
+        )
+
+    def _record_history(self, user_id: str, role: str, content: str) -> None:
+        with self._lock:
+            self._history.setdefault(user_id, []).append(
+                {
+                    "role": role,
+                    "content": content,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            max_items = max(settings.max_conversation_history * 4, 40)
+            if len(self._history[user_id]) > max_items:
+                self._history[user_id] = self._history[user_id][-max_items:]
+
+    def _save_turn_memory(
+        self,
+        user_id: str,
+        thread_id: str,
+        intent: str,
+        active_agent: str,
+        user_message: str,
+        assistant_message: str,
+        sentiment: Optional[SentimentResult],
+    ) -> None:
+        if not self.enable_memory:
+            return
+        payload = {
+            "kind": "conversation_turn",
+            "thread_id": thread_id,
+            "intent": intent,
+            "active_agent": active_agent,
+            "message": user_message,
+            "response": assistant_message,
+            "sentiment": sentiment.label if sentiment else "neutral",
+            "frustration_score": sentiment.frustration_score if sentiment else 0.0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_memory_item(user_id=user_id, payload=payload)
+
+        for pattern in (r"我叫([^\s，。,.!?？!]+)", r"my name is ([a-zA-Z]+)"):
+            match = re.search(pattern, user_message, re.IGNORECASE)
+            if match:
+                self._save_memory_item(
+                    user_id=user_id,
+                    payload={
+                        "kind": "user_fact",
+                        "fact": f"用户姓名可能是：{match.group(1)}",
+                        "thread_id": thread_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
+    def _call_role_agent(
+        self,
+        role: str,
+        user_id: str,
+        thread_id: str,
+        intent: str,
+        risk: str,
+        message: str,
+    ) -> Dict[str, Any]:
+        """调用指定角色 Agent。"""
+        if not self.llm_enabled or role not in self.role_agents:
+            fallback = self._fallback_response(role, user_id, message, None)
+            return {"messages": [AIMessage(content=fallback)]}
+
+        agent = self.role_agents[role]
+        config = {"configurable": {"thread_id": self._agent_thread_id(thread_id, role)}}
+        context = AgentRuntimeContext(
+            user_id=user_id,
+            thread_id=thread_id,
+            active_agent=role,
+            intent=intent,
+            risk=risk,
+        )
+        return agent.invoke(
+            {"messages": [HumanMessage(content=message)]},
+            config=config,
+            context=context,
+        )
+
+    def _route_after_analyze(self, state: OrchestrationState) -> str:
+        selected = state.get("selected_agent", "supervisor")
+        if selected == "escalation":
+            return "escalation"
+        if selected == "knowledge":
+            return "knowledge"
+        if selected == "action":
+            return "action"
+        return "respond"
+
+    def _route_after_knowledge(self, state: OrchestrationState) -> str:
+        if state.get("needs_action_after_knowledge"):
+            return "action"
+        return "respond"
+
+    def _route_after_execution(self, state: OrchestrationState) -> str:
+        if state.get("run_status") == "interrupted":
+            return "end"
+        return "respond"
+
+    def _compose_knowledge_prompt(self, state: OrchestrationState) -> str:
+        return (
+            f"用户问题：{state.get('current_message', '')}\n"
+            "任务：调用知识检索工具，输出关键结论，并附上来源行（格式：来源：xxx）。"
+        )
+
+    def _compose_action_prompt(self, state: OrchestrationState) -> str:
+        retrieval = state.get("retrieval_text", "")
+        retrieval_block = f"\n可用检索证据：\n{retrieval}\n" if retrieval else ""
+        return (
+            f"用户请求：{state.get('current_message', '')}\n"
+            f"{retrieval_block}"
+            "任务：判断是否需要调用工单/账户类工具，必要时执行，输出执行结果。"
+        )
+
+    def _compose_escalation_prompt(self, state: OrchestrationState) -> str:
+        retrieval = state.get("retrieval_text", "")
+        retrieval_block = f"\n可用检索证据：\n{retrieval}\n" if retrieval else ""
+        return (
+            f"用户消息：{state.get('current_message', '')}\n"
+            f"{retrieval_block}"
+            "任务：按升级策略处理，高风险场景优先人工升级并给出交接摘要。"
+        )
+
+    def _compose_responder_prompt(self, state: OrchestrationState) -> str:
+        retrieval = state.get("retrieval_text", "")
+        tool_text = state.get("tool_text", "")
+        ticket_id = state.get("ticket_id")
+        escalation_note = "是" if state.get("escalated") else "否"
+        return (
+            "请基于以下结构化上下文生成最终客服答复：\n"
+            f"- 用户问题：{state.get('current_message', '')}\n"
+            f"- 识别意图：{state.get('intent', 'other')}\n"
+            f"- 风险等级：{state.get('risk', 'low')}\n"
+            f"- 情绪标签：{state.get('sentiment_label', 'neutral')}\n"
+            f"- 挫败分：{state.get('frustration_score', 0.0):.2f}\n"
+            f"- 是否人工升级：{escalation_note}\n"
+            f"- 工单号：{ticket_id or '无'}\n"
+            f"- 检索证据：\n{retrieval or '无'}\n"
+            f"- 工具执行结果：\n{tool_text or '无'}\n"
+            "要求：中文输出；先结论后步骤；若有来源请保留“来源：xxx”；"
+            "如果证据不足，要明确告知并给出下一步建议。"
+        )
+
+    def _node_analyze(self, state: OrchestrationState) -> Dict[str, Any]:
+        message = state.get("current_message", "")
+        baseline_sentiment = SentimentResult(
+            polarity=0.0,
+            subjectivity=0.0,
+            label=self._normalize_sentiment_label(state.get("sentiment_label")),
+            frustration_score=self._safe_float(state.get("frustration_score"), 0.0),
+            keywords=[],
+        )
+        baseline_intent = self._infer_intent(message)
+        baseline_risk = self._infer_risk(message, baseline_sentiment)
+
+        needs_knowledge = baseline_intent in {"question", "complaint"}
+        needs_action = baseline_intent == "request" or any(
+            token in message.lower() for token in self.TICKET_HINTS + self.ACCOUNT_HINTS
+        )
+        needs_escalation = baseline_risk == "high"
+
+        llm_analysis = self._llm_analyze_message(
+            message=message,
+            baseline_intent=baseline_intent,
+            baseline_risk=baseline_risk,
+            baseline_sentiment=baseline_sentiment,
+        )
+
+        intent = baseline_intent
+        risk = baseline_risk
+        sentiment_label = baseline_sentiment.label
+        frustration_score = baseline_sentiment.frustration_score
+        reason = "heuristic"
+
+        if llm_analysis:
+            intent = llm_analysis["intent"]
+            risk = llm_analysis["risk"]
+            sentiment_label = llm_analysis["sentiment_label"]
+            frustration_score = llm_analysis["frustration_score"]
+            needs_knowledge = llm_analysis["needs_knowledge"] or needs_knowledge
+            needs_action = llm_analysis["needs_action"] or needs_action
+            needs_escalation = llm_analysis["needs_escalation"] or (risk == "high")
+            reason = llm_analysis.get("reason", "") or "llm"
+        elif intent == "request" and "怎么" in message:
+            needs_knowledge = True
+
+        selected_agent, needs_action_after_knowledge = self._plan_route(
+            intent=intent,
+            risk=risk,
+            needs_knowledge=needs_knowledge,
+            needs_action=needs_action,
+            needs_escalation=needs_escalation,
+        )
+
+        user_id = state.get("user_id", "unknown_user")
+        thread_id = state.get("thread_id", "unknown_thread")
+        self._save_memory_item(
+            user_id=user_id,
+            payload={
+                "kind": "routing_decision",
+                "thread_id": thread_id,
+                "message": message,
+                "intent": intent,
+                "risk": risk,
+                "selected_agent": selected_agent,
+                "needs_knowledge": needs_knowledge,
+                "needs_action": needs_action,
+                "needs_action_after_knowledge": needs_action_after_knowledge,
+                "needs_escalation": needs_escalation,
+                "reason": reason,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
         return {
             "intent": intent,
-            "sentiment": sentiment,
-            "context": context
+            "risk": risk,
+            "sentiment_label": sentiment_label,
+            "frustration_score": frustration_score,
+            "selected_agent": selected_agent,
+            "active_agent": selected_agent,
+            "needs_knowledge": needs_knowledge,
+            "needs_action": needs_action,
+            "needs_action_after_knowledge": needs_action_after_knowledge,
+            "needs_escalation": needs_escalation,
+            "run_status": "completed",
+            "interrupts": [],
         }
 
-    def _check_escalation(self, state: ConversationState) -> dict:
-        """
-        Check if conversation should be escalated to human.
+    def _node_knowledge(self, state: OrchestrationState) -> Dict[str, Any]:
+        user_id = state.get("user_id", "unknown_user")
+        thread_id = state.get("thread_id", "unknown_thread")
+        intent = state.get("intent", "question")
+        risk = state.get("risk", "low")
 
-        Returns:
-            Updated state with escalation flag
-        """
-        sentiment = state.get("sentiment")
-        user_id = state["user_id"]
+        if self.llm_enabled:
+            result = self._call_role_agent(
+                role="knowledge",
+                user_id=user_id,
+                thread_id=thread_id,
+                intent=intent,
+                risk=risk,
+                message=self._compose_knowledge_prompt(state),
+            )
+            retrieval_text = self._extract_ai_text(result)
+            interrupts = self._extract_interrupts(result)
+            if interrupts:
+                return {
+                    "active_agent": "knowledge",
+                    "run_status": "interrupted",
+                    "interrupts": interrupts,
+                }
+        else:
+            retrieval_text = self._fallback_response("knowledge", user_id, state.get("current_message", ""), None)
 
-        escalated = False
-        reason = None
+        citations = self._merge_unique(state.get("citations", []), self._extract_citations(retrieval_text))
+        return {
+            "active_agent": "knowledge",
+            "retrieval_text": retrieval_text,
+            "citations": citations,
+        }
 
-        if sentiment and sentiment.frustration_score >= 0.8:
-            escalated = True
-            reason = f"High frustration detected (score: {sentiment.frustration_score:.2f})"
+    def _node_action(self, state: OrchestrationState) -> Dict[str, Any]:
+        user_id = state.get("user_id", "unknown_user")
+        thread_id = state.get("thread_id", "unknown_thread")
+        intent = state.get("intent", "request")
+        risk = state.get("risk", "medium")
 
-        # Check conversation history for escalation pattern
-        if not escalated and self.enable_memory:
-            memory = self._get_or_create_memory(user_id)
-            recent_messages = memory.get_recent_messages(count=5)
+        if self.llm_enabled:
+            result = self._call_role_agent(
+                role="action",
+                user_id=user_id,
+                thread_id=thread_id,
+                intent=intent,
+                risk=risk,
+                message=self._compose_action_prompt(state),
+            )
+            interrupts = self._extract_interrupts(result)
+            if interrupts:
+                return {
+                    "active_agent": "action",
+                    "run_status": "interrupted",
+                    "interrupts": interrupts,
+                }
+            tool_text = self._extract_ai_text(result)
+        else:
+            tool_text = self._fallback_response("action", user_id, state.get("current_message", ""), None)
 
-            # Count negative sentiment messages
-            if self.sentiment_analyzer and recent_messages:
-                negative_count = 0
-                for msg in recent_messages:
-                    if msg["role"] == "user":
-                        result = self.sentiment_analyzer.analyze(msg["content"])
-                        if result.label == "negative" or result.frustration_score > 0.5:
-                            negative_count += 1
+        ticket_id = self._ticket_id_from_text(tool_text) or state.get("ticket_id")
+        citations = self._merge_unique(state.get("citations", []), self._extract_citations(tool_text))
+        return {
+            "active_agent": "action",
+            "tool_text": tool_text,
+            "ticket_id": ticket_id,
+            "run_status": "completed",
+            "interrupts": [],
+            "citations": citations,
+        }
 
-                if negative_count >= 3:
-                    escalated = True
-                    reason = f"Multiple frustrated messages ({negative_count} out of {len(recent_messages)})"
+    def _node_escalation(self, state: OrchestrationState) -> Dict[str, Any]:
+        user_id = state.get("user_id", "unknown_user")
+        thread_id = state.get("thread_id", "unknown_thread")
+        intent = state.get("intent", "complaint")
 
-        # Create escalation ticket if needed
-        ticket_id = None
-        if escalated:
-            memory = self._get_or_create_memory(user_id)
-            summary = memory.get_context(max_tokens=500)
+        if self.llm_enabled:
+            result = self._call_role_agent(
+                role="escalation",
+                user_id=user_id,
+                thread_id=thread_id,
+                intent=intent,
+                risk="high",
+                message=self._compose_escalation_prompt(state),
+            )
+            interrupts = self._extract_interrupts(result)
+            if interrupts:
+                return {
+                    "active_agent": "escalation",
+                    "run_status": "interrupted",
+                    "interrupts": interrupts,
+                    "escalated": True,
+                }
+            tool_text = self._extract_ai_text(result)
+        else:
+            tool_text = self._fallback_response("escalation", user_id, state.get("current_message", ""), None)
 
-            try:
-                result = escalate_to_human.invoke({
-                    "user_id": user_id,
-                    "reason": reason or "High customer frustration",
-                    "conversation_summary": summary
-                })
-                # Extract ticket ID from result
-                if "TKT-" in result:
-                    ticket_id = result.split("TKT-")[1].split("\n")[0].strip()
-            except Exception as e:
-                logger.error(f"Escalation error: {e}")
+        ticket_id = self._ticket_id_from_text(tool_text) or state.get("ticket_id")
+        citations = self._merge_unique(state.get("citations", []), self._extract_citations(tool_text))
+        return {
+            "active_agent": "escalation",
+            "tool_text": tool_text,
+            "ticket_id": ticket_id,
+            "escalated": True,
+            "run_status": "completed",
+            "interrupts": [],
+            "citations": citations,
+        }
+
+    def _node_respond(self, state: OrchestrationState) -> Dict[str, Any]:
+        if state.get("run_status") == "interrupted":
+            return {}
+
+        user_id = state.get("user_id", "unknown_user")
+        thread_id = state.get("thread_id", "unknown_thread")
+        intent = state.get("intent", "other")
+        risk = state.get("risk", "low")
+
+        if self.llm_enabled:
+            result = self._call_role_agent(
+                role="responder",
+                user_id=user_id,
+                thread_id=thread_id,
+                intent=intent,
+                risk=risk,
+                message=self._compose_responder_prompt(state),
+            )
+            final_message = self._extract_ai_text(result)
+        else:
+            final_message = self._fallback_response(
+                role="responder",
+                user_id=user_id,
+                message=state.get("current_message", ""),
+                sentiment=None,
+                retrieval_text=state.get("retrieval_text", ""),
+                tool_text=state.get("tool_text", ""),
+            )
+
+        citations = self._merge_unique(state.get("citations", []), self._extract_citations(final_message))
+        ticket_id = state.get("ticket_id") or self._ticket_id_from_text(final_message)
+        escalated = bool(
+            state.get("escalated")
+            or state.get("selected_agent") == "escalation"
+            or ("人工" in final_message and ticket_id)
+        )
 
         return {
+            "final_message": final_message,
+            "ticket_id": ticket_id,
             "escalated": escalated,
-            "ticket_id": ticket_id
+            "citations": citations,
+            "run_status": "completed",
         }
 
-    def _search_knowledge(self, state: ConversationState) -> dict:
-        """
-        Search FAQ knowledge base.
+    def _build_sentiment_result(
+        self,
+        baseline: SentimentResult,
+        state: OrchestrationState,
+    ) -> SentimentResult:
+        return SentimentResult(
+            polarity=baseline.polarity,
+            subjectivity=baseline.subjectivity,
+            label=self._normalize_sentiment_label(state.get("sentiment_label", baseline.label)),
+            frustration_score=self._safe_float(
+                state.get("frustration_score"),
+                default=baseline.frustration_score,
+            ),
+            keywords=baseline.keywords,
+        )
 
-        Returns:
-            Updated state with FAQ results
-        """
-        message = state["current_message"]
-        intent = state.get("intent", "other")
-
-        # Search FAQ
-        try:
-            faq_result = search_faq.invoke({
-                "query": message,
-                "category": None
-            })
-        except Exception as e:
-            logger.error(f"FAQ search error: {e}")
-            faq_result = "No FAQ results available."
-
-        return {
-            "faq_results": [faq_result]
-        }
-
-    def _use_tool(self, state: ConversationState) -> dict:
-        """
-        Execute appropriate tool based on intent.
-
-        Returns:
-            Updated state with tool result
-        """
-        message = state["current_message"]
-        intent = state.get("intent", "other")
-        user_id = state["user_id"]
-
-        tool_result = None
-        ticket_id = None
-
-        try:
-            if intent == "request":
-                # Determine what kind of request
-                message_lower = message.lower()
-
-                if "ticket" in message_lower and ("status" in message_lower or "check" in message_lower):
-                    # Check ticket status
-                    # Try to extract ticket ID
-                    import re
-                    ticket_match = re.search(r'TKT-\d+-\d+', message, re.IGNORECASE)
-                    if ticket_match:
-                        tool_result = get_ticket_status.invoke({"ticket_id": ticket_match.group()})
-                    else:
-                        tool_result = get_user_tickets.invoke({"user_id": user_id, "status": None})
-
-                elif "create" in message_lower or "new" in message_lower or "open" in message_lower:
-                    # Create new ticket
-                    # Extract subject and description from message
-                    subject = message[:100]
-                    description = message
-                    tool_result = create_ticket.invoke({
-                        "user_id": user_id,
-                        "subject": subject,
-                        "description": description,
-                        "priority": "medium"
-                    })
-                    # Extract ticket ID
-                    if "TKT-" in tool_result:
-                        ticket_id = tool_result.split("TKT-")[1].split("\n")[0].strip()
-
-                elif "account" in message_lower or "profile" in message_lower:
-                    # Lookup account
-                    tool_result = lookup_account.invoke({"user_id": user_id})
-
-                else:
-                    # Generic response for other requests
-                    tool_result = "I understand you need assistance. Could you provide more details about what you'd like me to help you with?"
-
-            else:
-                # For other intents, provide helpful response
-                tool_result = "I'm here to help. Could you please provide more details about your inquiry?"
-
-        except Exception as e:
-            logger.error(f"Tool execution error: {e}")
-            tool_result = "I apologize, but I encountered an error while trying to help you. Let me connect you with a human agent."
-
-        return {
-            "tool_result": tool_result,
-            "ticket_id": ticket_id or state.get("ticket_id")
-        }
-
-    def _generate_response(self, state: ConversationState) -> dict:
-        """
-        Generate final response using LLM.
-
-        Returns:
-            Updated state with response message
-        """
-        user_id = state["user_id"]
-        message = state["current_message"]
-        intent = state.get("intent", "other")
-        sentiment = state.get("sentiment")
-        escalated = state.get("escalated", False)
-        faq_results = state.get("faq_results", [])
-        tool_result = state.get("tool_result")
-        context = state.get("context")
-
-        # Build response prompt
-        response_parts = [self.SYSTEM_PROMPT]
-
-        # Add user context
-        if context:
-            response_parts.append(f"\nCustomer Context:\n{context}")
-
-        # Add conversation history
-        if self.enable_memory:
-            memory = self._get_or_create_memory(user_id)
-            recent_context = memory.get_context(max_tokens=1500)
-            if recent_context:
-                response_parts.append(f"\nRecent Conversation:\n{recent_context}")
-
-        # Add FAQ results if available
-        if faq_results and faq_results[0]:
-            response_parts.append(f"\nRelevant Information from Knowledge Base:\n{faq_results[0]}")
-
-        # Add tool result if available
-        if tool_result:
-            response_parts.append(f"\nTool Results:\n{tool_result}")
-
-        # Add sentiment info
-        if sentiment:
-            response_parts.append(f"\nCustomer Sentiment: {sentiment.label} (frustration: {sentiment.frustration_score:.2f})")
-
-        # Add escalation info
-        if escalated:
-            response_parts.append("\nNOTE: This conversation has been escalated to a human agent.")
-
-        # Add current message
-        response_parts.append(f"\nCustomer's Message: {message}")
-
-        # Create prompt
-        response_prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="\n".join(response_parts)),
-            HumanMessage(content="Please provide a helpful response to the customer.")
-        ])
-
-        if escalated and sentiment and sentiment.frustration_score >= 0.8:
-            ai_message = self._build_non_llm_response(state)
-        elif self.llm_enabled and self.llm is not None:
-            try:
-                # Generate response
-                response = self.llm.invoke(response_prompt.format_messages())
-                ai_message = response.content.strip()
-
-                # If escalated, add escalation note
-                if escalated:
-                    ticket_info = f"\n\n[Reference: {state.get('ticket_id', 'N/A')}]"
-                    ai_message += ticket_info
-
-            except Exception as e:
-                logger.error(f"Response generation error: {e}")
-                ai_message = self._build_non_llm_response(state)
+    def _resolve_sources(self, state: OrchestrationState) -> List[str]:
+        sources: List[str] = []
+        if state.get("retrieval_text"):
+            sources.extend(["Hybrid RAG", "FAQ Knowledge Base"])
+        if state.get("tool_text"):
+            sources.append("Support Tools")
+        if state.get("selected_agent") == "escalation" or state.get("escalated"):
+            sources.append("Human Handoff")
+        if self.llm_enabled:
+            sources.append("Responder Agent")
         else:
-            ai_message = self._build_non_llm_response(state)
-
-        return {
-            "response": ai_message
-        }
-
-    def _route_after_intent(self, state: ConversationState) -> str:
-        """
-        Determine next step after intent classification.
-
-        Returns:
-            Next node name
-        """
-        intent = state.get("intent", "other")
-        sentiment = state.get("sentiment")
-
-        # Immediate escalation for high frustration
-        if sentiment and sentiment.frustration_score >= 0.8:
-            return "escalate"
-
-        # Route based on intent
-        if intent == "question":
-            return "search"
-        elif intent == "request":
-            return "tool"
-        elif intent == "complaint":
-            # Complaints might need FAQ search or escalation
-            if sentiment and sentiment.frustration_score >= 0.5:
-                return "escalate"
-            return "search"
-        elif intent in ["greeting", "feedback"]:
-            return "respond"
-        else:
-            return "respond"
-
-    def _route_after_escalation_check(self, state: ConversationState) -> str:
-        """
-        Determine next step after escalation check.
-
-        Returns:
-            Next node name
-        """
-        if state.get("escalated", False):
-            return "escalate"
-        return "continue"
+            sources.append("Fallback Policy")
+        return self._merge_unique([], sources)
 
     def chat(
         self,
         user_id: str,
-        message: str
+        message: str,
+        thread_id: Optional[str] = None,
     ) -> SupportResponse:
-        """
-        Process a user message and return response.
+        """处理用户消息。"""
+        thread = thread_id or str(uuid.uuid4())
+        trace_id = str(uuid.uuid4())
+        self._thread_user[thread] = user_id
+        self._trace_by_thread[thread] = trace_id
 
-        Args:
-            user_id: User identifier
-            message: User's message
+        baseline_sentiment = (
+            self.sentiment_analyzer.analyze(message)
+            if self.sentiment_analyzer
+            else SentimentResult(
+                polarity=0.0,
+                subjectivity=0.0,
+                label="neutral",
+                frustration_score=0.0,
+                keywords=[],
+            )
+        )
 
-        Returns:
-            SupportResponse with message and metadata
-        """
-        logger.info(f"Processing message from user {user_id}: {message[:50]}...")
+        self._record_history(user_id, "user", message)
 
-        # Update conversation memory
-        if self.enable_memory:
-            memory = self._get_or_create_memory(user_id)
-            memory.add_message("user", message)
-
-        # Prepare initial state
-        initial_state: ConversationState = {
+        initial_state: OrchestrationState = {
             "user_id": user_id,
-            "messages": [],
+            "thread_id": thread,
             "current_message": message,
-            "intent": None,
-            "sentiment": None,
-            "faq_results": None,
-            "tool_result": None,
-            "response": None,
-            "escalated": False,
+            "intent": self._infer_intent(message),
+            "risk": self._infer_risk(message, baseline_sentiment),
+            "sentiment_label": baseline_sentiment.label,
+            "frustration_score": baseline_sentiment.frustration_score,
+            "selected_agent": "supervisor",
+            "active_agent": "supervisor",
+            "needs_knowledge": False,
+            "needs_action": False,
+            "needs_action_after_knowledge": False,
+            "needs_escalation": False,
+            "retrieval_text": "",
+            "tool_text": "",
+            "final_message": "",
+            "citations": [],
+            "run_status": "completed",
+            "interrupts": [],
             "ticket_id": None,
-            "context": None
+            "escalated": False,
         }
 
-        # Run conversation graph
         try:
-            final_state = self.graph.invoke(initial_state)
-        except Exception as e:
-            logger.error(f"Conversation graph error: {e}")
-            # Fallback response
+            final_state = self.orchestration_graph.invoke(initial_state)
+        except Exception as error:
+            logger.error(f"Graph invocation failed, fallback to template: {error}")
+            fallback = self._fallback_response(
+                role="supervisor",
+                user_id=user_id,
+                message=message,
+                sentiment=baseline_sentiment,
+            )
+            self._record_history(user_id, "assistant", fallback)
             return SupportResponse(
-                message="I apologize, but I encountered an error. A human agent will assist you shortly.",
-                intent="error",
-                sentiment=SentimentResult(
-                    polarity=0.0,
-                    subjectivity=0.0,
-                    label="neutral",
-                    frustration_score=0.0,
-                    keywords=[]
-                ),
-                escalated=True
+                message=fallback,
+                intent=initial_state["intent"],
+                sentiment=baseline_sentiment,
+                sources=["Fallback Policy"],
+                escalated=False,
+                ticket_created=self._ticket_id_from_text(fallback),
+                thread_id=thread,
+                run_status="completed",
+                interrupts=[],
+                citations=self._extract_citations(fallback),
+                active_agent=initial_state["selected_agent"],
+                trace_id=trace_id,
             )
 
-        # Extract results
-        response_message = final_state.get("response", "I'm sorry, I couldn't generate a response.")
-        intent = final_state.get("intent", "other")
-        sentiment = final_state.get("sentiment") or SentimentResult(
+        if final_state.get("run_status") == "interrupted":
+            pending_role = final_state.get("active_agent", final_state.get("selected_agent", "action"))
+            self._pending_role[thread] = pending_role
+            self._pending_state[thread] = dict(final_state)
+            wait_message = "检测到高风险动作，已暂停执行，等待人工审批（approve/edit/reject）。"
+            self._record_history(user_id, "assistant", wait_message)
+            sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
+            return SupportResponse(
+                message=wait_message,
+                intent=final_state.get("intent", "other"),
+                sentiment=sentiment,
+                sources=["HITL Middleware"],
+                escalated=pending_role == "escalation",
+                ticket_created=None,
+                thread_id=thread,
+                run_status="interrupted",
+                interrupts=final_state.get("interrupts", []),
+                citations=final_state.get("citations", []),
+                active_agent=pending_role,
+                trace_id=trace_id,
+            )
+
+        response_message = final_state.get("final_message") or final_state.get("tool_text") or final_state.get(
+            "retrieval_text"
+        ) or "抱歉，我暂时无法给出有效回复。"
+        citations = final_state.get("citations", [])
+        ticket_id = final_state.get("ticket_id") or self._ticket_id_from_text(response_message)
+        active_agent = final_state.get("selected_agent", "supervisor")
+        sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
+        sources = self._resolve_sources(final_state)
+
+        self._record_history(user_id, "assistant", response_message)
+        self._save_turn_memory(
+            user_id=user_id,
+            thread_id=thread,
+            intent=final_state.get("intent", "other"),
+            active_agent=active_agent,
+            user_message=message,
+            assistant_message=response_message,
+            sentiment=sentiment,
+        )
+
+        return SupportResponse(
+            message=response_message,
+            intent=final_state.get("intent", "other"),
+            sentiment=sentiment,
+            sources=sources,
+            escalated=bool(final_state.get("escalated")),
+            ticket_created=ticket_id,
+            thread_id=thread,
+            run_status="completed",
+            interrupts=[],
+            citations=citations,
+            active_agent=active_agent,
+            trace_id=trace_id,
+        )
+
+    def resume(
+        self,
+        thread_id: str,
+        decisions: List[Dict[str, Any]],
+    ) -> SupportResponse:
+        """恢复 HITL 中断会话。"""
+        user_id = self._thread_user.get(thread_id, "unknown_user")
+        trace_id = self._trace_by_thread.get(thread_id, str(uuid.uuid4()))
+        role = self._pending_role.get(thread_id)
+        pending_state = self._pending_state.get(thread_id, {})
+
+        neutral_sentiment = SentimentResult(
             polarity=0.0,
             subjectivity=0.0,
             label="neutral",
             frustration_score=0.0,
-            keywords=[]
+            keywords=[],
         )
-        escalated = final_state.get("escalated", False)
-        ticket_id = final_state.get("ticket_id")
 
-        # Gather sources
-        sources = []
-        if final_state.get("faq_results"):
-            sources.append("FAQ Knowledge Base")
-        if final_state.get("tool_result"):
-            sources.append("Support Tools")
+        if role is None:
+            return SupportResponse(
+                message="未找到待审批线程，无法恢复。",
+                intent="resume",
+                sentiment=neutral_sentiment,
+                sources=["HITL Middleware"],
+                thread_id=thread_id,
+                run_status="error",
+                active_agent="unknown",
+                trace_id=trace_id,
+            )
 
-        # Update memory with AI response
-        if self.enable_memory:
-            memory = self._get_or_create_memory(user_id)
-            memory.add_message("assistant", response_message)
+        if not self.llm_enabled or role not in self.role_agents:
+            self._pending_role.pop(thread_id, None)
+            self._pending_state.pop(thread_id, None)
+            return SupportResponse(
+                message="当前处于无 LLM 模式，已跳过审批并结束流程。",
+                intent="resume",
+                sentiment=neutral_sentiment,
+                sources=["Fallback Policy"],
+                thread_id=thread_id,
+                run_status="completed",
+                active_agent=role,
+                trace_id=trace_id,
+            )
 
-            # Update user sentiment tracking
-            if self.sentiment_analyzer:
-                self.user_memory_store.update_sentiment_tracking(
-                    user_id,
-                    sentiment.label
-                )
+        agent = self.role_agents[role]
+        config = {"configurable": {"thread_id": self._agent_thread_id(thread_id, role)}}
+        context = AgentRuntimeContext(
+            user_id=user_id,
+            thread_id=thread_id,
+            active_agent=role,
+            intent=pending_state.get("intent", "resume"),
+            risk=pending_state.get("risk", "medium"),
+        )
 
-            # Periodically summarize if conversation is long
-            if len(memory.messages) >= memory.max_messages:
-                memory.summarize_if_needed()
+        try:
+            result = agent.invoke(
+                Command(resume={"decisions": decisions}),
+                config=config,
+                context=context,
+            )
+        except Exception as error:
+            logger.error(f"Resume failed: {error}")
+            return SupportResponse(
+                message=f"恢复会话失败：{error}",
+                intent="resume",
+                sentiment=neutral_sentiment,
+                sources=["HITL Middleware"],
+                thread_id=thread_id,
+                run_status="error",
+                active_agent=role,
+                trace_id=trace_id,
+            )
 
-        # Create response
-        support_response = SupportResponse(
+        interrupts = self._extract_interrupts(result)
+        if interrupts:
+            return SupportResponse(
+                message="仍有待审批动作，请继续提交决策。",
+                intent="resume",
+                sentiment=neutral_sentiment,
+                sources=["HITL Middleware"],
+                thread_id=thread_id,
+                run_status="interrupted",
+                interrupts=interrupts,
+                active_agent=role,
+                trace_id=trace_id,
+            )
+
+        resumed_text = self._extract_ai_text(result)
+        merged_state: OrchestrationState = dict(pending_state)
+        merged_state["active_agent"] = role
+        merged_state["run_status"] = "completed"
+        merged_state["interrupts"] = []
+        merged_state["citations"] = self._merge_unique(
+            merged_state.get("citations", []),
+            self._extract_citations(resumed_text),
+        )
+
+        if role in {"action", "escalation"}:
+            merged_state["tool_text"] = resumed_text
+            merged_state["ticket_id"] = merged_state.get("ticket_id") or self._ticket_id_from_text(resumed_text)
+        if role == "escalation":
+            merged_state["escalated"] = True
+
+        responder_updates = self._node_respond(merged_state)
+        merged_state.update(responder_updates)
+        response_message = merged_state.get("final_message", resumed_text)
+
+        self._pending_role.pop(thread_id, None)
+        self._pending_state.pop(thread_id, None)
+        self._record_history(user_id, "assistant", response_message)
+        self._save_turn_memory(
+            user_id=user_id,
+            thread_id=thread_id,
+            intent=merged_state.get("intent", "resume"),
+            active_agent=merged_state.get("selected_agent", role),
+            user_message="[resume]",
+            assistant_message=response_message,
+            sentiment=neutral_sentiment,
+        )
+
+        return SupportResponse(
             message=response_message,
-            intent=intent,
-            sentiment=sentiment,
-            sources=sources,
-            escalated=escalated,
-            ticket_created=ticket_id
+            intent=merged_state.get("intent", "resume"),
+            sentiment=neutral_sentiment,
+            sources=self._resolve_sources(merged_state),
+            escalated=bool(merged_state.get("escalated")),
+            ticket_created=merged_state.get("ticket_id"),
+            thread_id=thread_id,
+            run_status="completed",
+            citations=merged_state.get("citations", []),
+            active_agent=merged_state.get("selected_agent", role),
+            trace_id=trace_id,
         )
 
-        logger.info(
-            f"Response generated for user {user_id}: "
-            f"intent={intent}, sentiment={sentiment.label}, "
-            f"escalated={escalated}"
-        )
-
-        return support_response
-
-    def reset_conversation(self, user_id: str) -> None:
-        """
-        Reset conversation for a user.
-
-        Args:
-            user_id: User identifier
-        """
-        with self._memory_lock:
-            if user_id in self.memory:
-                self.memory[user_id].clear()
-                logger.info(f"Reset conversation for user {user_id}")
-
-    def get_conversation_history(
+    def stream_chat(
         self,
         user_id: str,
-        limit: int = 10
-    ) -> List[Dict[str, str]]:
-        """
-        Get conversation history for a user.
+        message: str,
+        thread_id: Optional[str] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """将聊天结果包装为可流式事件。"""
+        response = self.chat(user_id=user_id, message=message, thread_id=thread_id)
+        yield {
+            "type": "node",
+            "thread_id": response.thread_id,
+            "active_agent": response.active_agent,
+            "trace_id": response.trace_id,
+        }
+        if response.run_status == "interrupted":
+            yield {
+                "type": "interrupt",
+                "thread_id": response.thread_id,
+                "interrupts": response.interrupts,
+            }
+            yield {"type": "done", "payload": response.to_dict()}
+            return
 
-        Args:
-            user_id: User identifier
-            limit: Maximum messages to return
+        for token in response.message.split():
+            yield {"type": "token", "content": token}
+        yield {"type": "done", "payload": response.to_dict()}
 
-        Returns:
-            List of messages
-        """
-        memory = self._get_or_create_memory(user_id)
-        return memory.get_recent_messages(count=limit)
+    def reindex_knowledge(self, clear_existing: bool = False) -> str:
+        """重建知识库索引。"""
+        return reindex_knowledge_base.invoke({"clear_existing": clear_existing})
+
+    def reset_conversation(self, user_id: str) -> None:
+        """重置本地会话历史。"""
+        with self._lock:
+            self._history[user_id] = []
+            to_remove = [thread for thread, owner in self._thread_user.items() if owner == user_id]
+            for thread in to_remove:
+                self._pending_role.pop(thread, None)
+                self._pending_state.pop(thread, None)
+                self._thread_user.pop(thread, None)
+                self._trace_by_thread.pop(thread, None)
+
+    def get_conversation_history(self, user_id: str, limit: int = 10) -> List[Dict[str, str]]:
+        """读取本地会话历史（用于 API 展示）。"""
+        with self._lock:
+            history = self._history.get(user_id, [])
+            return history[-max(1, limit):]
 
 
-# Global agent instance
-_support_agent: SupportAgent = None
+_support_agent: Optional[SupportAgent] = None
 _agent_lock = threading.Lock()
 
 
+def peek_support_agent() -> Optional[SupportAgent]:
+    """仅查看全局实例，不触发初始化。"""
+    return _support_agent
+
+
 def get_support_agent() -> SupportAgent:
-    """Get or create global support agent instance."""
+    """获取全局 SupportAgent 实例。"""
     global _support_agent
     with _agent_lock:
         if _support_agent is None:
