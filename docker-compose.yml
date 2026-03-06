@@ -23,11 +23,20 @@ services:
 
       # Database (for future use)
       - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./data/support.db}
+      - POSTGRES_URI=${POSTGRES_URI:-postgresql://support_user:support_pass@postgres:5432/support?sslmode=disable}
+      - LANGGRAPH_PERSISTENCE_BACKEND=${LANGGRAPH_PERSISTENCE_BACKEND:-memory}
+      - LANGGRAPH_USE_POSTGRES=${LANGGRAPH_USE_POSTGRES:-false}
+      - AUTO_SETUP_POSTGRES=${AUTO_SETUP_POSTGRES:-true}
 
       # Vector Store
       - CHROMA_PERSIST_DIR=./data/chroma_db
       - COLLECTION_NAME=${COLLECTION_NAME:-faq_knowledge_base}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - ENABLE_RERANKER=${ENABLE_RERANKER:-false}
+      - RAG_TOP_K=${RAG_TOP_K:-4}
+      - RAG_FUSION_K=${RAG_FUSION_K:-60}
+      - RAG_VECTOR_WEIGHT=${RAG_VECTOR_WEIGHT:-0.6}
+      - RAG_KEYWORD_WEIGHT=${RAG_KEYWORD_WEIGHT:-0.4}
 
       # Knowledge Base
       - KNOWLEDGE_BASE_PATH=./data/knowledge_base
@@ -83,9 +92,9 @@ services:
     profiles:
       - with-nginx
 
-  # PostgreSQL Database (Optional - for production use)
+  # PostgreSQL + pgvector (for LangGraph persistence and memory)
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg16
     container_name: support-postgres
     environment:
       - POSTGRES_DB=${POSTGRES_DB:-support}
@@ -98,8 +107,6 @@ services:
     restart: unless-stopped
     networks:
       - support-network
-    profiles:
-      - with-database
 
   # Redis Cache (Optional - for performance)
   redis:

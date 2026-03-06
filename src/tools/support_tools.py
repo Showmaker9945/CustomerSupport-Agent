@@ -1,4 +1,4 @@
-"""
+﻿"""
 Support tools for customer service agent.
 
 Provides ticket management, account lookup, and FAQ search tools
@@ -32,8 +32,36 @@ def _load_mock_accounts() -> Dict[str, Any]:
                 return json.load(f)
     except Exception as e:
         logger.warning(f"Failed to load mock accounts from {mock_path}: {e}")
-    # Fallback to empty dict if file doesn't exist or fails to load
-    return {}
+    # Built-in fallback so tools and tests still work without external file.
+    return {
+        "user_001": {
+            "user_id": "user_001",
+            "name": "Alice Johnson",
+            "email": "alice.johnson@example.com",
+            "plan": "Pro",
+            "status": "active",
+            "member_since": "2023-01-15",
+            "company": "Acme Labs",
+            "usage": {
+                "storage_used": "42GB",
+                "storage_limit": "100GB",
+                "api_calls_this_month": 12840,
+                "api_limit": 50000,
+                "team_members": 8,
+                "team_limit": 20,
+            },
+            "billing": {
+                "invoice_amount": "$99.00",
+                "last_payment": "2026-02-01",
+                "payment_method": "Visa **** 4242",
+            },
+            "support_history": {
+                "total_tickets": 12,
+                "resolved_tickets": 11,
+                "avg_resolution_time": "6h",
+            },
+        }
+    }
 
 
 class TicketStatus(str, Enum):
@@ -108,7 +136,8 @@ class TicketStore:
         self._tickets: Dict[str, Ticket] = {}
         self._user_tickets: Dict[str, List[str]] = {}  # user_id -> [ticket_ids]
         self._ticket_counter = 0  # Counter for unique IDs
-        self._lock = threading.Lock()
+        # Re-entrant lock prevents deadlock when nested helper methods also lock.
+        self._lock = threading.RLock()
 
         # Load existing tickets if file exists
         self._load_from_disk()
@@ -366,38 +395,62 @@ def reset_ticket_store() -> None:
 @tool
 def search_faq(query: str, category: Optional[str] = None) -> str:
     """
-    Search the FAQ knowledge base for relevant answers.
+    查询/搜索知识库中的常见问题答案。
 
     Args:
-        query: The question or topic to search for
-        category: Optional category to filter by (billing, account, technical, etc.)
+        query: 用户问题或关键词
+        category: 可选分类过滤（billing/account/technical 等）
 
     Returns:
-        Formatted FAQ search results with confidence scores
+        带相关度的格式化检索结果
     """
     try:
         store = get_faq_store()
-        results = store.search(query, category=category, top_k=3)
+        results = store.search_hybrid(query, category=category, top_k=settings.rag_top_k)
 
         if not results:
-            return f"No FAQs found for: {query}"
+            return f"未找到与该问题相关的知识：{query}"
 
-        output_parts = [f"Found {len(results)} relevant FAQ(s):\n"]
+        output_parts = [f"找到 {len(results)} 条相关知识（混合检索+重排）：\n"]
 
         for i, result in enumerate(results, 1):
             output_parts.append(
-                f"\n{i}. **{result.question}**\n"
-                f"   {result.answer}\n"
-                f"   *Category: {result.category} | Relevance: {result.confidence:.0%}*"
+                f"\n{i}. {result.question}\n"
+                f"   答案：{result.answer}\n"
+                f"   分类：{result.category} | 相关度：{result.confidence:.0%}\n"
+                f"   来源：FAQ::{result.category}"
             )
 
         return "\n".join(output_parts)
 
     except Exception as e:
         logger.error(f"FAQ search error: {e}")
-        return f"Error searching FAQ: {str(e)}"
+        return f"知识检索失败：{str(e)}"
 
 
+@tool
+def reindex_knowledge_base(clear_existing: bool = False) -> str:
+    """
+    重建并更新 FAQ 知识库索引。
+
+    Args:
+        clear_existing: 是否先清空现有集合再重建
+
+    Returns:
+        重建结果摘要
+    """
+    try:
+        store = get_faq_store()
+        stats = store.reindex(clear_existing=clear_existing)
+        return (
+            f"知识库索引已刷新。\n"
+            f"FAQ 总量：{stats.get('total_faqs', 0)}\n"
+            f"分类数：{stats.get('category_count', 0)}\n"
+            f"集合：{stats.get('collection_name', settings.collection_name)}"
+        )
+    except Exception as e:
+        logger.error(f"Reindex knowledge base error: {e}")
+        return f"知识库重建失败：{str(e)}"
 @tool
 def create_ticket(
     user_id: str,
@@ -406,16 +459,16 @@ def create_ticket(
     priority: str = "medium"
 ) -> str:
     """
-    Create a new support ticket for the user.
+    为用户创建新的客服工单。
 
     Args:
-        user_id: The user's unique identifier
-        subject: Brief summary of the issue
-        description: Detailed description of the issue
-        priority: Priority level (low, medium, high, urgent)
+        user_id: 用户唯一标识
+        subject: 问题主题
+        description: 问题详情
+        priority: 优先级（low/medium/high/urgent）
 
     Returns:
-        Confirmation message with ticket ID
+        创建结果和工单号
     """
     try:
         store = get_ticket_store()
@@ -427,67 +480,63 @@ def create_ticket(
         )
 
         return (
-            f"✓ Support ticket created successfully!\n"
-            f"  Ticket ID: {ticket.ticket_id}\n"
-            f"  Status: {ticket.status.value}\n"
-            f"  Priority: {ticket.priority.value}\n"
-            f"  Created: {ticket.created_at}\n"
-            f"\n  You'll receive updates at your email address."
+            f"工单创建成功。\n"
+            f"工单号：{ticket.ticket_id}\n"
+            f"状态：{ticket.status.value}\n"
+            f"优先级：{ticket.priority.value}\n"
+            f"创建时间：{ticket.created_at}\n"
+            f"后续进展会通过邮件通知你。"
         )
 
     except Exception as e:
         logger.error(f"Create ticket error: {e}")
-        return f"Error creating ticket: {str(e)}"
-
-
+        return f"创建工单失败：{str(e)}"
 @tool
 def get_ticket_status(ticket_id: str) -> str:
     """
-    Get the current status of a support ticket.
+    查询工单当前状态。
 
     Args:
-        ticket_id: The ticket ID (e.g., TKT-20250131-001)
+        ticket_id: 工单号（如 TKT-20250131-0001）
 
     Returns:
-        Ticket status and details
+        工单详情文本
     """
     try:
         store = get_ticket_store()
         ticket = store.get_ticket(ticket_id)
 
         if not ticket:
-            return f"Ticket {ticket_id} not found. Please check the ticket ID."
+            return f"未找到工单 {ticket_id}，请检查工单号是否正确。"
 
         output = [
-            f"Ticket: {ticket.ticket_id}",
-            f"Subject: {ticket.subject}",
-            f"Status: {ticket.status.value}",
-            f"Priority: {ticket.priority.value}",
-            f"Created: {ticket.created_at}",
-            f"Updated: {ticket.updated_at}"
+            f"工单号：{ticket.ticket_id}",
+            f"主题：{ticket.subject}",
+            f"状态：{ticket.status.value}",
+            f"优先级：{ticket.priority.value}",
+            f"创建时间：{ticket.created_at}",
+            f"更新时间：{ticket.updated_at}"
         ]
 
         if ticket.assigned_to:
-            output.append(f"Assigned to: {ticket.assigned_to}")
+            output.append(f"处理人：{ticket.assigned_to}")
 
         if ticket.resolved_at:
-            output.append(f"Resolved: {ticket.resolved_at}")
+            output.append(f"解决时间：{ticket.resolved_at}")
 
         if ticket.tags:
-            output.append(f"Tags: {', '.join(ticket.tags)}")
+            output.append(f"标签：{', '.join(ticket.tags)}")
 
         if ticket.notes:
-            output.append("\nNotes:")
+            output.append("\n备注：")
             for note in ticket.notes:
-                output.append(f"  - {note}")
+                output.append(f"- {note}")
 
         return "\n".join(output)
 
     except Exception as e:
         logger.error(f"Get ticket status error: {e}")
-        return f"Error retrieving ticket: {str(e)}"
-
-
+        return f"查询工单失败：{str(e)}"
 @tool
 def update_ticket(
     ticket_id: str,
@@ -495,15 +544,15 @@ def update_ticket(
     notes: Optional[str] = None
 ) -> str:
     """
-    Update a support ticket's status or add notes.
+    更新工单状态或补充备注。
 
     Args:
-        ticket_id: The ticket ID
-        status: New status (open, in_progress, waiting_customer, resolved, closed)
-        notes: Additional notes to add to the ticket
+        ticket_id: 工单号
+        status: 新状态（open/in_progress/waiting_customer/resolved/closed）
+        notes: 备注内容
 
     Returns:
-        Confirmation of the update
+        更新结果
     """
     try:
         store = get_ticket_store()
@@ -514,188 +563,164 @@ def update_ticket(
         )
 
         if not ticket:
-            return f"Ticket {ticket_id} not found."
+            return f"未找到工单 {ticket_id}。"
 
-        result = f"✓ Ticket {ticket_id} updated successfully.\n"
-        result += f"  New status: {ticket.status.value}\n"
-        result += f"  Updated: {ticket.updated_at}"
+        result = f"工单 {ticket_id} 更新成功。\n"
+        result += f"新状态：{ticket.status.value}\n"
+        result += f"更新时间：{ticket.updated_at}"
 
         if notes:
-            result += f"\n  Note added: {notes}"
+            result += f"\n新增备注：{notes}"
 
         return result
 
     except Exception as e:
         logger.error(f"Update ticket error: {e}")
-        return f"Error updating ticket: {str(e)}"
-
-
+        return f"更新工单失败：{str(e)}"
 @tool
 def get_user_tickets(user_id: str, status: Optional[str] = None) -> str:
     """
-    Get all support tickets for a user.
+    查询用户的工单列表。
 
     Args:
-        user_id: The user's unique identifier
-        status: Optional filter by status (open, resolved, etc.)
+        user_id: 用户唯一标识
+        status: 可选状态过滤（open/resolved 等）
 
     Returns:
-        List of user's tickets with summaries
+        工单列表摘要
     """
     try:
         store = get_ticket_store()
         tickets = store.get_user_tickets(user_id, status=status)
 
         if not tickets:
-            return f"No tickets found for user {user_id}."
+            return f"用户 {user_id} 暂无工单记录。"
 
-        output = [f"Found {len(tickets)} ticket(s) for user {user_id}:\n"]
+        output = [f"用户 {user_id} 共找到 {len(tickets)} 条工单：\n"]
 
         for ticket in tickets:
-            status_emoji = {
-                "open": "🔵",
-                "in_progress": "🟡",
-                "waiting_customer": "⏸️",
-                "resolved": "✅",
-                "closed": "📁"
-            }.get(ticket.status.value, "⚪")
-
             output.append(
-                f"{status_emoji} **{ticket.ticket_id}** - {ticket.subject}\n"
-                f"   Status: {ticket.status.value} | "
-                f"Priority: {ticket.priority.value} | "
-                f"Created: {ticket.created_at[:10]}"
+                f"{ticket.ticket_id} - {ticket.subject}\n"
+                f"状态：{ticket.status.value} | "
+                f"优先级：{ticket.priority.value} | "
+                f"创建日期：{ticket.created_at[:10]}"
             )
 
         return "\n".join(output)
 
     except Exception as e:
         logger.error(f"Get user tickets error: {e}")
-        return f"Error retrieving tickets: {str(e)}"
-
-
+        return f"查询用户工单失败：{str(e)}"
 @tool
 def lookup_account(user_id: str) -> str:
     """
-    Look up user account information including plan, usage, and billing.
+    查询用户账户信息（套餐、使用量、账单等）。
 
     Args:
-        user_id: The user's unique identifier
+        user_id: 用户唯一标识
 
     Returns:
-        User account details
+        账户详情文本
     """
     try:
-        # In production, this would query a real database
         account = MOCK_ACCOUNTS.get(user_id)
 
         if not account:
-            return f"Account not found for user ID: {user_id}"
+            return f"未找到用户 {user_id} 的账户信息。"
 
         output = [
-            f"📋 Account Information for {account['name']}",
-            f"",
-            f"**User ID:** {account['user_id']}",
-            f"**Email:** {account['email']}",
-            f"**Plan:** {account['plan']}",
-            f"**Status:** {account['status'].replace('_', ' ').title()}",
-            f"**Member Since:** {account['member_since']}"
+            f"{account['name']} 的账户信息",
+            "",
+            f"用户ID：{account['user_id']}",
+            f"邮箱：{account['email']}",
+            f"套餐：{account['plan']}",
+            f"状态：{account['status'].replace('_', ' ').title()}",
+            f"注册时间：{account['member_since']}"
         ]
 
         if account.get('company'):
-            output.append(f"**Company:** {account['company']}")
+            output.append(f"公司：{account['company']}")
 
         output.extend([
-            f"",
-            f"**Usage:**",
-            f"  Storage: {account['usage']['storage_used']} / {account['usage']['storage_limit']}",
-            f"  API Calls: {account['usage']['api_calls_this_month']} / {account['usage']['api_limit']}",
-            f"  Team Members: {account['usage']['team_members']} / {account['usage']['team_limit']}"
+            "",
+            "使用情况：",
+            f"  存储：{account['usage']['storage_used']} / {account['usage']['storage_limit']}",
+            f"  API 调用：{account['usage']['api_calls_this_month']} / {account['usage']['api_limit']}",
+            f"  团队成员：{account['usage']['team_members']} / {account['usage']['team_limit']}"
         ])
 
         if account.get('billing'):
-            output.append(f"")
-            output.append(f"**Billing:**")
+            output.append("")
+            output.append("账单信息：")
             billing = account['billing']
-            output.append(f"  Invoice Amount: {billing['invoice_amount']}")
+            output.append(f"  本期账单：{billing['invoice_amount']}")
             if billing.get('last_payment'):
-                output.append(f"  Last Payment: {billing['last_payment']}")
+                output.append(f"  最近支付：{billing['last_payment']}")
             if billing.get('payment_method'):
-                output.append(f"  Payment Method: {billing['payment_method']}")
+                output.append(f"  支付方式：{billing['payment_method']}")
 
-        output.append(f"")
-        output.append(f"**Support History:**")
+        output.append("")
+        output.append("客服历史：")
         support = account['support_history']
-        output.append(f"  Total Tickets: {support['total_tickets']}")
-        output.append(f"  Resolved: {support['resolved_tickets']}")
-        output.append(f"  Avg Resolution Time: {support['avg_resolution_time']}")
+        output.append(f"  总工单数：{support['total_tickets']}")
+        output.append(f"  已解决：{support['resolved_tickets']}")
+        output.append(f"  平均解决时长：{support['avg_resolution_time']}")
 
         return "\n".join(output)
 
     except Exception as e:
         logger.error(f"Account lookup error: {e}")
-        return f"Error looking up account: {str(e)}"
-
-
+        return f"查询账户失败：{str(e)}"
 @tool
 def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> str:
     """
-    Escalate the conversation to a human support agent.
+    将对话升级给人工客服。
 
-    Use this when the issue is too complex, technical, or sensitive for AI,
-    or when the user explicitly requests human assistance.
+    当问题复杂、高风险，或用户明确要求人工处理时使用。
 
     Args:
-        user_id: The user's unique identifier
-        reason: Why escalation is needed
-        conversation_summary: Summary of the conversation so far
+        user_id: 用户唯一标识
+        reason: 升级原因
+        conversation_summary: 对话摘要
 
     Returns:
-        Escalation confirmation and ticket information
+        升级结果和工单信息
     """
     try:
         store = get_ticket_store()
 
-        # Create escalation ticket
         ticket = store.create_ticket(
             user_id=user_id,
-            subject=f"HANDOFF: {reason}",
+            subject=f"人工升级：{reason}",
             description=conversation_summary,
             priority="high",
             metadata={"escalated": True, "reason": reason}
         )
 
-        # Update ticket status
         store.update_ticket(
             ticket.ticket_id,
             status="in_progress",
-            notes=f"Escalated from AI assistant. Reason: {reason}"
+            notes=f"由AI升级，原因：{reason}"
         )
 
         account = MOCK_ACCOUNTS.get(user_id)
-        user_name = account['name'] if account else "User"
+        user_name = account['name'] if account else "用户"
 
         return (
-            f"⚠️ **Escalating to Human Support**\n\n"
-            f"I've connected you with our human support team for personalized assistance.\n\n"
-            f"**Ticket Created:** {ticket.ticket_id}\n"
-            f"**Priority:** High\n"
-            f"**Reason:** {reason}\n\n"
-            f"📧 {user_name}, you'll receive an email confirmation shortly. "
-            f"Our team typically responds within:\n"
-            f"  • Pro plans: 2-4 hours\n"
-            f"  • Enterprise plans: 1 hour or less\n\n"
-            f"Thank you for your patience. Is there anything else I can help with in the meantime?"
+            f"已升级到人工客服。\n\n"
+            f"已创建工单：{ticket.ticket_id}\n"
+            f"优先级：high\n"
+            f"升级原因：{reason}\n\n"
+            f"{user_name}，我们会尽快通过邮件与你联系。"
         )
 
     except Exception as e:
         logger.error(f"Escalation error: {e}")
-        return f"Error escalating to human: {str(e)}"
-
-
+        return f"升级人工客服失败：{str(e)}"
 # List of all tools for LangChain agent
 ALL_TOOLS = [
     search_faq,
+    reindex_knowledge_base,
     create_ticket,
     get_ticket_status,
     update_ticket,
@@ -744,3 +769,4 @@ if __name__ == "__main__":
     print(result[:300] + "...")
 
     print("\n" + "=" * 60)
+

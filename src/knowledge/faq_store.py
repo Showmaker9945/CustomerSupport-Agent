@@ -7,13 +7,15 @@ and confidence scoring.
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 
 from ..config import settings
 
@@ -257,6 +259,24 @@ class FAQStore:
 
             logger.info(f"ChromaDB initialized at {self.chroma_path}")
 
+            # Hybrid retrieval caches
+            self._bm25_index: Optional[BM25Okapi] = None
+            self._bm25_docs: List[str] = []
+            self._bm25_metadatas: List[Dict[str, Any]] = []
+            self._bm25_ids: List[str] = []
+            self._bm25_dirty: bool = True
+
+            # Optional reranker
+            self.reranker = None
+            if settings.enable_reranker:
+                try:
+                    from sentence_transformers import CrossEncoder  # local import to avoid hard fail
+                    self.reranker = CrossEncoder(settings.reranker_model)
+                    logger.info(f"Loaded reranker model: {settings.reranker_model}")
+                except Exception as rerank_error:
+                    self.reranker = None
+                    logger.warning(f"Reranker unavailable, fallback to fusion-only search: {rerank_error}")
+
             # Load sample FAQs if collection is empty
             if self.collection.count() == 0:
                 logger.info("Initializing with sample FAQs...")
@@ -280,6 +300,204 @@ class FAQStore:
                 metadata={"keywords": faq.get("keywords", [])}
             )
         logger.info(f"Loaded {len(self.SAMPLE_FAQS)} sample FAQs")
+
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        """Tokenize mixed Chinese/English text for lexical retrieval."""
+        if not text:
+            return []
+        lowered = text.lower()
+        english_tokens = re.findall(r"[a-z0-9_]+", lowered)
+        chinese_chars = [char for char in text if "\u4e00" <= char <= "\u9fff"]
+        return english_tokens + chinese_chars
+
+    def _refresh_keyword_index(self) -> None:
+        """Build or refresh BM25 index from current collection."""
+        if not self._bm25_dirty and self._bm25_index is not None:
+            return
+
+        all_data = self.collection.get(include=["documents", "metadatas"])
+        documents = all_data.get("documents", []) or []
+        metadatas = all_data.get("metadatas", []) or []
+        ids = all_data.get("ids", []) or []
+
+        tokenized = [self._tokenize_for_bm25(doc or "") for doc in documents]
+        tokenized = [tokens for tokens in tokenized if tokens]
+
+        if not documents or not tokenized:
+            self._bm25_index = None
+            self._bm25_docs = []
+            self._bm25_metadatas = []
+            self._bm25_ids = []
+            self._bm25_dirty = False
+            return
+
+        # Keep aligned references
+        aligned_docs: List[str] = []
+        aligned_meta: List[Dict[str, Any]] = []
+        aligned_ids: List[str] = []
+        aligned_tokens: List[List[str]] = []
+
+        for idx, doc in enumerate(documents):
+            tokens = self._tokenize_for_bm25(doc or "")
+            if not tokens:
+                continue
+            aligned_docs.append(doc)
+            aligned_meta.append(metadatas[idx] if idx < len(metadatas) else {})
+            aligned_ids.append(ids[idx] if idx < len(ids) else f"faq_{idx}")
+            aligned_tokens.append(tokens)
+
+        if not aligned_tokens:
+            self._bm25_index = None
+            self._bm25_docs = []
+            self._bm25_metadatas = []
+            self._bm25_ids = []
+            self._bm25_dirty = False
+            return
+
+        self._bm25_index = BM25Okapi(aligned_tokens)
+        self._bm25_docs = aligned_docs
+        self._bm25_metadatas = aligned_meta
+        self._bm25_ids = aligned_ids
+        self._bm25_dirty = False
+
+    def _keyword_search(
+        self,
+        query: str,
+        top_k: int = 6,
+        category: Optional[str] = None
+    ) -> List[FAQResult]:
+        """Run BM25 lexical search over FAQ corpus."""
+        self._refresh_keyword_index()
+        if self._bm25_index is None:
+            return []
+
+        query_tokens = self._tokenize_for_bm25(query)
+        if not query_tokens:
+            return []
+
+        scores = self._bm25_index.get_scores(query_tokens)
+        ranked_indices = sorted(
+            range(len(scores)),
+            key=lambda index: scores[index],
+            reverse=True,
+        )
+
+        max_score = max(scores) if len(scores) > 0 else 0.0
+        if max_score <= 0:
+            return []
+
+        results: List[FAQResult] = []
+        for idx in ranked_indices:
+            if len(results) >= top_k:
+                break
+            metadata = self._bm25_metadatas[idx]
+            doc = self._bm25_docs[idx]
+            result_category = metadata.get("category", "general")
+            if category and result_category != category:
+                continue
+
+            question = metadata.get("question", "")
+            if not question:
+                for line in doc.split("\n"):
+                    if line.startswith("Question:"):
+                        question = line.replace("Question:", "").strip()
+                        break
+
+            confidence = float(scores[idx] / max_score)
+            results.append(
+                FAQResult(
+                    question=question or "Unknown question",
+                    answer=metadata.get("answer", doc),
+                    category=result_category,
+                    confidence=max(0.0, min(1.0, confidence)),
+                    metadata={k: v for k, v in metadata.items() if k not in {"question", "answer", "category"}},
+                )
+            )
+        return results
+
+    def search_hybrid(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        top_k: Optional[int] = None,
+        min_confidence: float = 0.0
+    ) -> List[FAQResult]:
+        """
+        Hybrid retrieval: vector + BM25 + optional cross-encoder rerank.
+
+        This method keeps old `search` behavior intact while providing a stronger
+        retrieval strategy for multilingual customer support scenarios.
+        """
+        final_top_k = top_k or settings.rag_top_k
+        candidate_k = max(final_top_k * 3, 8)
+
+        vector_results = self.search(
+            query=query,
+            category=category,
+            top_k=candidate_k,
+            min_confidence=min_confidence,
+        )
+        keyword_results = self._keyword_search(
+            query=query,
+            top_k=candidate_k,
+            category=category,
+        )
+
+        if not vector_results and not keyword_results:
+            return []
+
+        vector_weight = settings.rag_vector_weight
+        keyword_weight = settings.rag_keyword_weight
+        fusion_k = max(1, settings.rag_fusion_k)
+
+        candidates: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        for rank, result in enumerate(vector_results, start=1):
+            key = (result.question, result.answer)
+            if key not in candidates:
+                candidates[key] = {"result": result, "score": 0.0}
+            candidates[key]["score"] += vector_weight * (1.0 / (fusion_k + rank))
+
+        for rank, result in enumerate(keyword_results, start=1):
+            key = (result.question, result.answer)
+            if key not in candidates:
+                candidates[key] = {"result": result, "score": 0.0}
+            candidates[key]["score"] += keyword_weight * (1.0 / (fusion_k + rank))
+
+        fused = sorted(
+            candidates.values(),
+            key=lambda item: item["score"],
+            reverse=True,
+        )
+
+        merged_results: List[FAQResult] = []
+        for item in fused[:candidate_k]:
+            result = item["result"]
+            result.confidence = max(result.confidence, min(1.0, float(item["score"] * fusion_k)))
+            merged_results.append(result)
+
+        # Optional reranking
+        if self.reranker and merged_results:
+            try:
+                pairs = [[query, f"{result.question}\n{result.answer}"] for result in merged_results]
+                rerank_scores = self.reranker.predict(pairs)
+                reranked = sorted(
+                    zip(merged_results, rerank_scores),
+                    key=lambda row: float(row[1]),
+                    reverse=True,
+                )
+                normalized_results: List[FAQResult] = []
+                max_rerank = float(max(rerank_scores)) if len(rerank_scores) > 0 else 0.0
+                for result, score in reranked:
+                    if max_rerank > 0:
+                        result.confidence = max(0.0, min(1.0, float(score / max_rerank)))
+                    normalized_results.append(result)
+                merged_results = normalized_results
+            except Exception as rerank_error:
+                logger.warning(f"Rerank failed, using fusion ranking only: {rerank_error}")
+
+        filtered = [result for result in merged_results if result.confidence >= min_confidence]
+        return filtered[:final_top_k]
 
     def add_faq(
         self,
@@ -328,6 +546,7 @@ class FAQStore:
                 metadatas=[faq_metadata],
                 ids=[f"faq_{hash(question + answer)}"]
             )
+            self._bm25_dirty = True
 
             logger.debug(f"Added FAQ: {question[:50]}...")
             return f"faq_{hash(question + answer)}"
@@ -556,6 +775,7 @@ class FAQStore:
 
             if matching_ids:
                 self.collection.delete(ids=matching_ids)
+                self._bm25_dirty = True
                 logger.info(f"Deleted {len(matching_ids)} FAQ(s): {question}")
                 return True
 
@@ -573,10 +793,28 @@ class FAQStore:
                 name=self.collection_name,
                 metadata={"description": "Customer support FAQ knowledge base"}
             )
+            self._bm25_dirty = True
             logger.info("Cleared all FAQs")
         except Exception as e:
             logger.error(f"Failed to clear FAQs: {e}")
             raise
+
+    def reindex(self, clear_existing: bool = False) -> Dict[str, Any]:
+        """
+        Rebuild retrieval indexes for the knowledge base.
+
+        Args:
+            clear_existing: Whether to clear and reload sample FAQs before reindex.
+
+        Returns:
+            Updated statistics.
+        """
+        if clear_existing:
+            self.clear_all()
+            self._load_sample_faqs()
+        self._bm25_dirty = True
+        self._refresh_keyword_index()
+        return self.get_stats()
 
 
 def create_faq_store(

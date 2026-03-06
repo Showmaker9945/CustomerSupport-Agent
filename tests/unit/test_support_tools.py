@@ -4,6 +4,7 @@ Unit tests for support tools.
 
 import pytest
 import tempfile
+import re
 
 from src.tools.support_tools import (
     Ticket,
@@ -239,15 +240,21 @@ class TestMockAccounts:
 class TestSupportTools:
     """Test LangChain tools."""
 
+    @staticmethod
+    def _extract_ticket_id(text: str) -> str:
+        match = re.search(r"TKT-\d{14}-\d{4}", text)
+        assert match is not None
+        return match.group(0)
+
     def test_search_faq(self):
         """Test FAQ search tool."""
         result = search_faq.invoke({"query": "password reset", "category": None})
-        assert "FAQ" in result or "found" in result.lower()
+        assert ("找到" in result) or ("未找到" in result)
 
     def test_search_faq_with_category(self):
         """Test FAQ search with category filter."""
         result = search_faq.invoke({"query": "payment", "category": "billing"})
-        assert "billing" in result.lower() or "FAQ" in result
+        assert ("billing" in result.lower()) or ("分类：" in result) or ("未找到" in result)
 
     def test_create_ticket_tool(self):
         """Test create ticket tool."""
@@ -258,7 +265,7 @@ class TestSupportTools:
             "priority": "medium"
         })
 
-        assert "created successfully" in result.lower()
+        assert "工单创建成功" in result
         assert "TKT-" in result
 
     def test_get_ticket_status_tool(self):
@@ -271,7 +278,7 @@ class TestSupportTools:
         })
 
         # Extract ticket ID from result
-        ticket_id = create_result.split("Ticket ID: ")[1].split("\n")[0].strip()
+        ticket_id = self._extract_ticket_id(create_result)
 
         # Get status
         status_result = get_ticket_status.invoke({"ticket_id": ticket_id})
@@ -281,7 +288,7 @@ class TestSupportTools:
     def test_get_ticket_status_not_found(self):
         """Test get ticket status with invalid ID."""
         result = get_ticket_status.invoke({"ticket_id": "TKT-INVALID"})
-        assert "not found" in result.lower()
+        assert "未找到工单" in result
 
     def test_update_ticket_tool(self):
         """Test update ticket tool."""
@@ -292,7 +299,7 @@ class TestSupportTools:
             "description": "Testing updates"
         })
 
-        ticket_id = create_result.split("Ticket ID: ")[1].split("\n")[0].strip()
+        ticket_id = self._extract_ticket_id(create_result)
 
         # Update status
         update_result = update_ticket.invoke({
@@ -301,7 +308,7 @@ class TestSupportTools:
             "notes": "Working on it"
         })
 
-        assert "updated successfully" in update_result.lower()
+        assert "更新成功" in update_result
         assert "in_progress" in update_result
 
     def test_get_user_tickets_tool(self):
@@ -325,7 +332,7 @@ class TestSupportTools:
         # Get all tickets - should have at least 2
         result = get_user_tickets.invoke({"user_id": user_id, "status": None})
         # Check for at least 2 tickets (might have more from previous runs)
-        assert "ticket" in result.lower()
+        assert ("工单" in result) or ("ticket" in result.lower())
         assert user_id in result
 
     def test_lookup_account_tool(self):
@@ -338,7 +345,7 @@ class TestSupportTools:
     def test_lookup_account_not_found(self):
         """Test account lookup with invalid user."""
         result = lookup_account.invoke({"user_id": "nonexistent_user"})
-        assert "not found" in result.lower()
+        assert "未找到用户" in result
 
     def test_escalate_to_human_tool(self):
         """Test escalation tool."""
@@ -348,7 +355,7 @@ class TestSupportTools:
             "conversation_summary": "User experiencing authentication problems"
         })
 
-        assert "escalating" in result.lower() or "escalated" in result.lower()
+        assert "已升级到人工客服" in result
         assert "TKT-" in result
 
     def test_all_tools_have_names(self):
@@ -370,4 +377,4 @@ class TestSupportTools:
             assert len(tool_obj.description) > 20
             # Should describe what it does
             assert any(word in tool_obj.description.lower()
-                      for word in ["search", "create", "get", "update", "look up", "escalate"])
+                      for word in ["search", "create", "get", "update", "look up", "escalate", "查询", "创建", "更新", "升级"])
