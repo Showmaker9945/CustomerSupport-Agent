@@ -1,8 +1,8 @@
 """
-Knowledge base for customer support FAQs.
+客服 FAQ 知识库。
 
-Provides vector-based FAQ search using ChromaDB with category filtering
-and confidence scoring.
+提供基于 ChromaDB 的语义检索、BM25 词法检索、结果融合与置信度评分，
+用于中文优先的客服问答场景。
 """
 
 import json
@@ -21,14 +21,14 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-# Suppress noisy telemetry errors from older Chroma/PostHog combinations.
+# 抑制旧版 Chroma / PostHog 组合产生的噪声日志。
 logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 logging.getLogger("posthog").setLevel(logging.CRITICAL)
 
 
 @dataclass
 class FAQResult:
-    """Result from FAQ search."""
+    """FAQ 检索结果。"""
     question: str
     answer: str
     category: str
@@ -36,182 +36,143 @@ class FAQResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __str__(self) -> str:
-        """String representation for display."""
+        """转为便于展示的字符串。"""
         return (
-            f"Q: {self.question}\n"
-            f"A: {self.answer}\n"
-            f"Category: {self.category} | Confidence: {self.confidence:.2%}"
+            f"问题：{self.question}\n"
+            f"答案：{self.answer}\n"
+            f"分类：{self.category} | 置信度：{self.confidence:.2%}"
         )
 
 
 class FAQStore:
     """
-    Knowledge base for customer support FAQs.
+    客服 FAQ 知识库。
 
-    Provides vector-based semantic search using ChromaDB and
-    sentence transformers for embeddings.
+    使用 ChromaDB + sentence-transformers 构建语义检索，
+    并结合 BM25 实现混合检索。
     """
 
-    # Sample FAQs for a generic SaaS product
+    # 面向通用 SaaS 场景的中文样本 FAQ
     SAMPLE_FAQS = [
         {
-            "question": "How do I reset my password?",
-            "answer": "Go to Settings > Security > Password and click 'Reset Password'. "
-                     "You'll receive an email with a secure link to create a new password. "
-                     "The link expires in 24 hours.",
+            "question": "如何重置密码？",
+            "answer": "进入“设置 > 安全中心 > 密码”，点击“重置密码”。系统会向你的注册邮箱发送重置链接，链接 24 小时内有效。",
             "category": "account",
-            "keywords": ["password", "reset", "login", "forgot"]
+            "keywords": ["密码", "重置密码", "登录", "忘记密码", "password", "reset", "login", "forgot"]
         },
         {
-            "question": "What payment methods do you accept?",
-            "answer": "We accept all major credit cards (Visa, MasterCard, American Express), "
-                     "PayPal, and wire transfers for annual plans. For enterprise customers, "
-                     "we also offer invoicing with NET-30 terms.",
+            "question": "支持哪些付款方式？",
+            "answer": "我们支持主流信用卡、PayPal，以及年付方案的对公转账。企业客户还支持账期发票结算。",
             "category": "billing",
-            "keywords": ["payment", "credit card", "paypal", "invoice"]
+            "keywords": ["支付", "付款", "信用卡", "PayPal", "发票", "payment", "credit card", "paypal", "invoice"]
         },
         {
-            "question": "How do I cancel my subscription?",
-            "answer": "You can cancel anytime from your account settings. Go to Settings > "
-                     "Billing > Subscription and click 'Cancel Plan'. Your access continues "
-                     "until the end of your current billing period. No refunds for partial months.",
+            "question": "如何取消订阅？",
+            "answer": "你可以在“设置 > 账单 > 订阅管理”中随时取消套餐。取消后服务会持续到当前计费周期结束，已使用周期不支持按天退款。",
             "category": "billing",
-            "keywords": ["cancel", "subscription", "refund", "delete"]
+            "keywords": ["取消订阅", "退订", "退款", "套餐", "cancel", "subscription", "refund", "delete"]
         },
         {
-            "question": "Can I upgrade or downgrade my plan?",
-            "answer": "Yes! You can change your plan at any time. Upgrades take effect immediately, "
-                     "and you'll be charged the prorated difference. Downgrades take effect at "
-                     "the next billing cycle.",
+            "question": "可以升级或降级套餐吗？",
+            "answer": "可以。升级会立即生效并按比例补差价；降级会在下一个计费周期开始时生效。",
             "category": "billing",
-            "keywords": ["upgrade", "downgrade", "plan", "change"]
+            "keywords": ["升级套餐", "降级套餐", "套餐变更", "plan", "upgrade", "downgrade", "change"]
         },
         {
-            "question": "How do I add team members?",
-            "answer": "Go to Settings > Team > Members and click 'Invite Member'. Enter their "
-                     "email address and select their role (Admin, Editor, or Viewer). They'll "
-                     "receive an invitation link to join your workspace.",
+            "question": "如何邀请团队成员？",
+            "answer": "进入“设置 > 团队 > 成员”，点击“邀请成员”，填写邮箱并选择角色（管理员、编辑者或访客），系统会自动发送邀请链接。",
             "category": "workspace",
-            "keywords": ["team", "member", "invite", "collaborator"]
+            "keywords": ["团队", "成员", "邀请", "协作", "team", "member", "invite", "collaborator"]
         },
         {
-            "question": "What's the difference between Viewer, Editor, and Admin?",
-            "answer": "Viewers can only view content. Editors can create and edit content but "
-                     "can't change settings. Admins have full access including billing, team "
-                     "management, and all settings.",
+            "question": "访客、编辑者和管理员有什么区别？",
+            "answer": "访客只能查看内容；编辑者可以创建和编辑内容，但不能修改系统设置；管理员拥有包括账单、成员管理和系统配置在内的全部权限。",
             "category": "workspace",
-            "keywords": ["role", "permission", "admin", "editor", "viewer"]
+            "keywords": ["角色", "权限", "管理员", "编辑者", "访客", "role", "permission", "admin", "editor", "viewer"]
         },
         {
-            "question": "Is my data secure?",
-            "answer": "Yes. We use AES-256 encryption for data at rest and TLS 1.3 for data "
-                     "in transit. We're SOC 2 Type II certified and GDPR compliant. We also "
-                     "offer optional two-factor authentication (2FA).",
+            "question": "我的数据安全吗？",
+            "answer": "是的。我们对静态数据使用 AES-256 加密，对传输链路使用 TLS 1.3，并支持双重身份验证（2FA）。",
             "category": "security",
-            "keywords": ["security", "encryption", "gdpr", "soc2", "privacy"]
+            "keywords": ["数据安全", "加密", "隐私", "双因子", "security", "encryption", "gdpr", "soc2", "privacy"]
         },
         {
-            "question": "Do you offer an API?",
-            "answer": "Yes! We offer a REST API with comprehensive documentation. You can generate "
-                     "API keys in Settings > Developer. API access is available on Pro and "
-                     "Enterprise plans.",
+            "question": "是否提供 API？",
+            "answer": "提供。我们支持 REST API，并提供完整文档。你可以在“设置 > 开发者”中创建 API Key。Pro 和 Enterprise 套餐可用。",
             "category": "technical",
-            "keywords": ["api", "integration", "developer", "webhook"]
+            "keywords": ["API", "接口", "开发者", "集成", "webhook", "integration", "developer"]
         },
         {
-            "question": "How do I export my data?",
-            "answer": "Go to Settings > Data > Export and choose your format (CSV, JSON, or PDF). "
-                     "For large datasets, we'll email you when the export is ready. You can also "
-                     "use our API for automated exports.",
+            "question": "如何导出数据？",
+            "answer": "进入“设置 > 数据 > 导出”，选择 CSV、JSON 或 PDF 格式即可。大数据量导出完成后，系统会通过邮件通知你。",
             "category": "technical",
-            "keywords": ["export", "download", "backup", "data"]
+            "keywords": ["导出", "下载", "备份", "数据", "export", "download", "backup", "data"]
         },
         {
-            "question": "What are your system requirements?",
-            "answer": "Our web app works on any modern browser (Chrome, Firefox, Safari, Edge). "
-                     "For mobile, we support iOS 14+ and Android 10+. We also offer desktop "
-                     "apps for macOS 11+ and Windows 10+.",
+            "question": "系统支持哪些设备和环境？",
+            "answer": "Web 端支持主流现代浏览器；移动端支持 iOS 14+ 与 Android 10+；桌面端支持 macOS 11+ 和 Windows 10+。",
             "category": "technical",
-            "keywords": ["requirements", "browser", "system", "compatible"]
+            "keywords": ["系统要求", "浏览器", "兼容环境", "requirements", "browser", "system", "compatible"]
         },
         {
-            "question": "How do I contact support?",
-            "answer": "You can reach us via live chat (bottom right of your screen), email at "
-                     "support@example.com, or by submitting a ticket through the Help Center. "
-                     "Pro and Enterprise customers get priority 24/7 support.",
+            "question": "如何联系客服？",
+            "answer": "你可以通过在线客服、帮助中心提交工单，或发送邮件联系我们。Pro 和 Enterprise 用户享受更高优先级支持。",
             "category": "support",
-            "keywords": ["contact", "help", "phone", "email", "chat"]
+            "keywords": ["联系客服", "帮助中心", "邮件", "在线客服", "contact", "help", "phone", "email", "chat"]
         },
         {
-            "question": "What is your response time for support tickets?",
-            "answer": "Free plan: 48 hours. Pro plan: 24 hours. Enterprise: 4 hours. Critical "
-                     "issues for Enterprise customers are handled within 1 hour. Live chat is "
-                     "available 24/7 for paid plans.",
+            "question": "客服工单的响应时效是多久？",
+            "answer": "免费版通常 48 小时内响应，Pro 版 24 小时内响应，Enterprise 版 4 小时内响应；紧急问题会进一步加速处理。",
             "category": "support",
-            "keywords": ["response", "time", "sla", "wait"]
+            "keywords": ["响应时间", "时效", "SLA", "等待", "response", "time", "sla", "wait"]
         },
         {
-            "question": "Can I try before I buy?",
-            "answer": "Absolutely! We offer a 14-day free trial of our Pro plan with full "
-                     "features. No credit card required. At the end of the trial, you can "
-                     "choose a plan or continue with our free tier.",
+            "question": "购买前可以试用吗？",
+            "answer": "可以。我们提供 14 天 Pro 套餐免费试用，无需绑定信用卡。试用结束后你可以选择付费或继续使用免费版。",
             "category": "billing",
-            "keywords": ["trial", "free", "demo", "test"]
+            "keywords": ["试用", "免费", "体验", "demo", "trial", "free", "test"]
         },
         {
-            "question": "Do you offer discounts for nonprofits or education?",
-            "answer": "Yes! We offer 50% off for registered nonprofits and educational institutions. "
-                     "Contact our sales team with proof of status to receive your discount code.",
+            "question": "教育机构或公益组织有优惠吗？",
+            "answer": "有。认证通过的教育机构和公益组织可申请专属折扣，联系销售团队并提交资质材料后即可获得优惠。",
             "category": "billing",
-            "keywords": ["discount", "nonprofit", "education", "student"]
+            "keywords": ["优惠", "教育", "公益", "学生", "discount", "nonprofit", "education", "student"]
         },
         {
-            "question": "How often do you release updates?",
-            "answer": "We release small updates weekly and major features quarterly. All updates "
-                     "are automatic with no downtime. You can view our roadmap and upcoming "
-                     "features at example.com/roadmap.",
+            "question": "产品多久更新一次？",
+            "answer": "我们通常每周发布小更新，每季度发布一次重要功能。绝大多数更新可无感完成，不影响正常使用。",
             "category": "product",
-            "keywords": ["update", "release", "new", "feature", "roadmap"]
+            "keywords": ["更新", "发布", "新功能", "路线图", "update", "release", "feature", "roadmap"]
         },
         {
-            "question": "Can I integrate with other tools?",
-            "answer": "We integrate with 100+ tools including Slack, Zapier, Google Workspace, "
-                     "Microsoft 365, Salesforce, and more. See our full list at example.com/integrations. "
-                     "Custom integrations available for Enterprise.",
+            "question": "可以集成其他工具吗？",
+            "answer": "可以。我们已支持 Slack、Zapier、Google Workspace、Microsoft 365、Salesforce 等常见工具，Enterprise 还支持定制集成。",
             "category": "technical",
-            "keywords": ["integration", "slack", "zapier", "connect", "sync"]
+            "keywords": ["集成", "连接", "同步", "Slack", "Zapier", "integration", "connect", "sync"]
         },
         {
-            "question": "What happens if I exceed my storage limit?",
-            "answer": "You'll receive a notification at 80% and 95% of your limit. If you exceed it, "
-                     "new uploads will be paused but existing data remains accessible. You can "
-                     "upgrade your plan or purchase additional storage ($5/GB/month).",
+            "question": "超出存储上限后会怎样？",
+            "answer": "当存储使用达到 80% 和 95% 时，系统会提醒你。若超过上限，新文件上传会被暂停，但已有数据仍可访问；你可以升级套餐或购买额外容量。",
             "category": "billing",
-            "keywords": ["storage", "limit", "quota", "upgrade"]
+            "keywords": ["存储", "容量上限", "配额", "升级", "storage", "limit", "quota", "upgrade"]
         },
         {
-            "question": "How do I enable two-factor authentication?",
-            "answer": "Go to Settings > Security > Two-Factor Authentication. Choose between an "
-                     "authenticator app (Google Authenticator, Authy) or SMS. Scan the QR code "
-                     "or enter your phone number to complete setup.",
+            "question": "如何开启双重身份验证？",
+            "answer": "进入“设置 > 安全中心 > 双重身份验证”，选择验证码 App 或短信方式，按提示完成绑定即可。",
             "category": "security",
-            "keywords": ["2fa", "two-factor", "authentication", "security"]
+            "keywords": ["双重身份验证", "2FA", "安全验证", "authentication", "two-factor", "security"]
         },
         {
-            "question": "Can I transfer my account to another owner?",
-            "answer": "Yes. Account transfers are available for Enterprise plans. Contact support "
-                     "to initiate the transfer. The new owner will receive an invitation, and "
-                     "both parties must confirm the transfer.",
+            "question": "可以把账户转移给其他负责人吗？",
+            "answer": "可以。Enterprise 套餐支持账户转移。联系客服发起流程后，新旧负责人都需要确认转移。",
             "category": "account",
-            "keywords": ["transfer", "ownership", "sell", "account"]
+            "keywords": ["账户转移", "所有权", "负责人", "account", "transfer", "ownership"]
         },
         {
-            "question": "Where are your servers located?",
-            "answer": "We have data centers in the US (East/West), EU (Frankfurt), and Asia "
-                     "(Singapore). You can choose your preferred region during signup or change "
-                     "it later in Settings > Data > Region.",
+            "question": "服务器部署在哪些地区？",
+            "answer": "我们在美国、欧洲和亚洲均设有数据中心。你可以在注册时选择区域，也可以后续在“设置 > 数据 > 区域”中调整。",
             "category": "technical",
-            "keywords": ["server", "location", "region", "data center"]
+            "keywords": ["服务器", "部署地区", "区域", "数据中心", "server", "location", "region", "data center"]
         }
     ]
 
@@ -222,7 +183,7 @@ class FAQStore:
         collection_name: str = "faq_knowledge_base"
     ):
         """
-        Initialize the FAQ store.
+        初始化 FAQ 知识库。
 
         Args:
             chroma_path: Path to persist ChromaDB data
@@ -277,7 +238,7 @@ class FAQStore:
                     self.reranker = None
                     logger.warning(f"Reranker unavailable, fallback to fusion-only search: {rerank_error}")
 
-            # Load sample FAQs if collection is empty
+            # 若集合为空，则自动写入中文样本 FAQ
             if self.collection.count() == 0:
                 logger.info("Initializing with sample FAQs...")
                 self._load_sample_faqs()
@@ -287,11 +248,11 @@ class FAQStore:
             raise
 
     def _create_embedding(self, text: str) -> List[float]:
-        """Create embedding for text."""
+        """为文本生成 embedding。"""
         return self.embedding_model.encode(text).tolist()
 
     def _load_sample_faqs(self) -> None:
-        """Load sample FAQs into the knowledge base."""
+        """将样本 FAQ 写入知识库。"""
         for faq in self.SAMPLE_FAQS:
             self.add_faq(
                 question=faq["question"],
@@ -302,7 +263,7 @@ class FAQStore:
         logger.info(f"Loaded {len(self.SAMPLE_FAQS)} sample FAQs")
 
     def _tokenize_for_bm25(self, text: str) -> List[str]:
-        """Tokenize mixed Chinese/English text for lexical retrieval."""
+        """为中英混合文本生成 BM25 检索 token。"""
         if not text:
             return []
         lowered = text.lower()
@@ -311,7 +272,7 @@ class FAQStore:
         return english_tokens + chinese_chars
 
     def _refresh_keyword_index(self) -> None:
-        """Build or refresh BM25 index from current collection."""
+        """构建或刷新 BM25 词法索引。"""
         if not self._bm25_dirty and self._bm25_index is not None:
             return
 
@@ -366,7 +327,7 @@ class FAQStore:
         top_k: int = 6,
         category: Optional[str] = None
     ) -> List[FAQResult]:
-        """Run BM25 lexical search over FAQ corpus."""
+        """基于 BM25 执行 FAQ 词法检索。"""
         self._refresh_keyword_index()
         if self._bm25_index is None:
             return []
@@ -431,7 +392,7 @@ class FAQStore:
         final_top_k = top_k or settings.rag_top_k
         candidate_k = max(final_top_k * 3, 8)
 
-        vector_results = self.search(
+        vector_results = self._vector_search(
             query=query,
             category=category,
             top_k=candidate_k,
@@ -507,7 +468,7 @@ class FAQStore:
         metadata: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Add a FAQ entry to the knowledge base.
+        向知识库新增一条 FAQ。
 
         Args:
             question: FAQ question
@@ -519,8 +480,18 @@ class FAQStore:
             FAQ ID
         """
         try:
-            # Combine question and answer for better search
+            # 将问题、答案和关键词一起写入检索文档，增强中英混合召回效果
+            keyword_text = ""
+            if metadata and metadata.get("keywords"):
+                raw_keywords = metadata.get("keywords", [])
+                if isinstance(raw_keywords, list):
+                    keyword_text = ", ".join(str(item) for item in raw_keywords)
+                else:
+                    keyword_text = str(raw_keywords)
+
             combined_text = f"Question: {question}\nAnswer: {answer}"
+            if keyword_text:
+                combined_text += f"\nKeywords: {keyword_text}"
 
             # Create embedding
             embedding = self._create_embedding(combined_text)
@@ -557,7 +528,7 @@ class FAQStore:
 
     def load_faqs_from_file(self, file_path: str) -> int:
         """
-        Bulk load FAQs from a file.
+        从文件批量导入 FAQ。
 
         Args:
             file_path: Path to JSON or CSV file
@@ -628,7 +599,7 @@ class FAQStore:
             logger.error(f"Failed to load FAQs from file: {e}")
             raise
 
-    def search(
+    def _vector_search(
         self,
         query: str,
         category: Optional[str] = None,
@@ -636,7 +607,7 @@ class FAQStore:
         min_confidence: float = 0.0
     ) -> List[FAQResult]:
         """
-        Search for relevant FAQs.
+        执行纯向量检索。
 
         Args:
             query: Search query
@@ -706,6 +677,25 @@ class FAQStore:
             logger.error(f"FAQ search failed: {e}")
             return []
 
+    def search(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        top_k: int = 3,
+        min_confidence: float = 0.0
+    ) -> List[FAQResult]:
+        """
+        检索相关 FAQ。
+
+        默认走混合检索，以提升中文场景下的召回与排序稳定性。
+        """
+        return self.search_hybrid(
+            query=query,
+            category=category,
+            top_k=top_k,
+            min_confidence=min_confidence,
+        )
+
     def get_categories(self) -> List[str]:
         """
         Get all unique FAQ categories.
@@ -731,7 +721,7 @@ class FAQStore:
 
     def get_stats(self) -> Dict[str, Any]:
         """
-        Get statistics about the FAQ store.
+        获取 FAQ 知识库统计信息。
 
         Returns:
             Dictionary with stats
@@ -786,7 +776,7 @@ class FAQStore:
             return False
 
     def clear_all(self) -> None:
-        """Clear all FAQs from the store."""
+        """清空知识库中的全部 FAQ。"""
         try:
             self.chroma_client.delete_collection(name=self.collection_name)
             self.collection = self.chroma_client.create_collection(
@@ -804,7 +794,7 @@ class FAQStore:
         Rebuild retrieval indexes for the knowledge base.
 
         Args:
-            clear_existing: Whether to clear and reload sample FAQs before reindex.
+            clear_existing: 是否先清空再重新加载样本 FAQ。
 
         Returns:
             Updated statistics.
@@ -822,11 +812,11 @@ def create_faq_store(
     load_samples: bool = True
 ) -> FAQStore:
     """
-    Factory function to create and initialize an FAQStore.
+    创建并初始化 FAQStore 的工厂函数。
 
     Args:
         chroma_path: Optional custom path for ChromaDB
-        load_samples: Whether to load sample FAQs
+        load_samples: 是否加载样本 FAQ
 
     Returns:
         Initialized FAQStore instance
@@ -844,9 +834,9 @@ def create_faq_store(
 # ============================================================================
 
 if __name__ == "__main__":
-    """Demonstrate FAQ store usage."""
+    """演示 FAQ 知识库的基础用法。"""
     print("=" * 60)
-    print("FAQ Store Demo")
+    print("FAQ 知识库演示")
     print("=" * 60)
 
     # Create FAQ store
@@ -854,24 +844,24 @@ if __name__ == "__main__":
 
     # Get stats
     stats = store.get_stats()
-    print(f"\nFAQ Store Stats:")
-    print(f"  Total FAQs: {stats['total_faqs']}")
-    print(f"  Categories: {', '.join(stats['categories'])}")
-    print(f"  Embedding Model: {stats['embedding_model']}")
+    print(f"\nFAQ 知识库统计：")
+    print(f"  FAQ 总数：{stats['total_faqs']}")
+    print(f"  分类列表：{', '.join(stats['categories'])}")
+    print(f"  Embedding 模型：{stats['embedding_model']}")
 
     # Search examples
     queries = [
-        "reset password",
-        "payment methods",
-        "cancel subscription"
+        "重置密码",
+        "付款方式",
+        "取消订阅",
     ]
 
-    print("\nSearch Results:")
+    print("\n检索结果：")
     for query in queries:
-        print(f"\n  Query: '{query}'")
+        print(f"\n  查询：'{query}'")
         results = store.search(query, top_k=2)
         for i, result in enumerate(results, 1):
             print(f"    {i}. {result.question}")
-            print(f"       Confidence: {result.confidence:.1%}")
+            print(f"       置信度：{result.confidence:.1%}")
 
     print("\n" + "=" * 60)

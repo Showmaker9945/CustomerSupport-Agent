@@ -248,12 +248,12 @@ class TestSupportTools:
 
     def test_search_faq(self):
         """Test FAQ search tool."""
-        result = search_faq.invoke({"query": "password reset", "category": None})
+        result = search_faq.invoke({"query": "如何重置密码", "category": None})
         assert ("找到" in result) or ("未找到" in result)
 
     def test_search_faq_with_category(self):
         """Test FAQ search with category filter."""
-        result = search_faq.invoke({"query": "payment", "category": "billing"})
+        result = search_faq.invoke({"query": "付款方式", "category": "billing"})
         assert ("billing" in result.lower()) or ("分类：" in result) or ("未找到" in result)
 
     def test_create_ticket_tool(self):
