@@ -1,6 +1,6 @@
 # CustomerSupport-Agent
 
-> An intelligent customer support AI agent with long-term memory, knowledge base, and real-time chat capabilities.
+> 一个中文优先的智能客服 Agent Demo，具备长期记忆、知识库检索与实时对话能力。
 
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![LangChain](https://img.shields.io/badge/LangChain-0.1+-green.svg)](https://langchain.com/)
@@ -9,7 +9,7 @@
 
 ---
 
-## 📋 Table of Contents
+## 📋 目录
 
 - [Overview](#overview)
 - [Use Case](#use-case)
@@ -26,62 +26,62 @@
 
 ## 🎯 Overview
 
-**CustomerSupport-Agent** is a production-ready conversational AI system that demonstrates advanced AI agent capabilities including:
+**CustomerSupport-Agent** 是一个偏工程化、可演示的客服 AI 系统，当前重点展示以下能力：
 
-- **Multi-turn conversations** with context awareness
-- **Long-term memory** across user sessions
-- **Knowledge base (RAG)** for intelligent FAQ answers
-- **Sentiment analysis** for customer routing
-- **Support tools** for ticket and account management
-- **Human handoff** when escalation is needed
-- **Real-time chat** via WebSocket + REST API
+- **多轮对话**：支持上下文感知与连续问答
+- **长期记忆**：支持跨会话保留用户事实与历史
+- **知识库检索（RAG）**：用于 FAQ 与说明类问题回答
+- **情绪识别**：辅助风险判断与升级策略
+- **客服工具链**：支持工单、账户查询、人工升级
+- **人工介入**：高风险动作触发 HITL 审批
+- **实时通信**：支持 WebSocket、REST 与 SSE
 
-This project showcases practical AI agent implementation using modern frameworks like **LangGraph**, **LangChain**, **FastAPI**, and **OpenAI**.
+项目基于 **LangGraph**、**LangChain**、**FastAPI** 与 **Qwen** 构建，适合作为实习、面试或作品集中的 Agent 工程 Demo。
 
 ---
 
 ## 🚀 V2 Upgrade Highlights
 
-- **LangChain/LangGraph v1 APIs**: migrated to `create_agent` + middleware hooks.
-- **Multi-agent core**: `Supervisor`, `Knowledge`, `Action`, `Escalation`.
-- **Human-in-the-loop (HITL)**: high-risk tools pause runs and require `approve/edit/reject`.
-- **Hybrid RAG**: vector retrieval + BM25 fusion + optional reranker.
-- **Persistent memory**: thread checkpoint + long-term user memory store.
-- **New APIs**:
-  - `POST /chat` (supports `thread_id`, returns `run_status`, `interrupts`, `citations`)
+- **LangChain/LangGraph v1 API**：迁移到 `create_agent` + middleware 体系。
+- **多 Agent 核心**：包含 `Supervisor`、`Knowledge`、`Action`、`Escalation`。
+- **人机协作（HITL）**：高风险工具调用会中断并等待 `approve/edit/reject`。
+- **混合检索 RAG**：向量检索 + BM25 融合 + 可选 reranker。
+- **持久化记忆**：支持线程级 checkpoint 与用户级长期记忆。
+- **新增接口**：
+  - `POST /chat`：支持 `thread_id`，返回 `run_status`、`interrupts`、`citations`
   - `POST /runs/{thread_id}/resume`
-  - `GET /chat/stream` (SSE events)
+  - `GET /chat/stream`：SSE 流式事件
   - `POST /knowledge/reindex`
 
 ---
 
 ## 💼 Use Case
 
-### Problem Solved
+### 要解决的问题
 
-Companies need efficient customer support that:
-- Provides instant responses 24/7
-- Remembers customer context across conversations
-- Answers common questions automatically
-- Recognizes when customers are frustrated
-- Escalates appropriately to human agents
-- Tracks support tickets and interactions
+企业客服系统往往需要同时满足这些诉求：
+- 7x24 小时即时响应
+- 记住用户历史上下文
+- 自动回答高频 FAQ
+- 识别用户是否焦虑或不满
+- 在合适时机升级给人工
+- 跟踪工单与服务过程
 
-### Solution
+### 解决方案
 
-An AI-powered support agent that:
-- ✅ Handles common inquiries instantly via knowledge base
-- ✅ Remembers user preferences and history
-- ✅ Detects frustration and sentiment
-- ✅ Creates and manages support tickets
-- ✅ Escalates complex issues to humans
-- ✅ Works via real-time chat or REST API
+这是一个客服 Agent Demo，它能够：
+- ✅ 用知识库快速回答常见问题
+- ✅ 保留用户偏好和关键历史
+- ✅ 识别情绪与挫败感
+- ✅ 创建、查询和更新工单
+- ✅ 将复杂或高风险场景升级给人工
+- ✅ 通过 REST / WebSocket / SSE 对外提供能力
 
-### Target Users
+### 目标使用者
 
-- **Support Teams**: Automate routine inquiries, focus on complex issues
-- **Customers**: Get instant answers, faster resolution
-- **Business**: Reduce support costs, improve satisfaction
+- **客服团队**：自动处理重复问题，把精力集中在复杂场景
+- **最终用户**：更快获得答案和处理结果
+- **业务团队**：降低客服成本，提升满意度
 
 ---
 

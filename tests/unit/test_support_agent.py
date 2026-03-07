@@ -3,6 +3,7 @@
 import os
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from src.conversation.support_agent import SupportAgent, SupportResponse
 
@@ -64,3 +65,45 @@ def test_resume_without_pending(agent):
     response = agent.resume(thread_id="missing-thread", decisions=[{"type": "approve"}])
     assert response.run_status == "error"
     assert "无法恢复" in response.message
+
+
+class _FakeRoleAgent:
+    def __init__(self, text: str):
+        self.text = text
+
+    def invoke(self, _payload, config=None, context=None):
+        return {"messages": [AIMessage(content=self.text)]}
+
+
+def test_resume_approve_does_not_false_escalate(agent):
+    agent.llm_enabled = True
+    agent.role_agents = {
+        "action": _FakeRoleAgent("工单创建成功。\n工单号：TKT-20260307-0001"),
+        "responder": _FakeRoleAgent(
+            "已为你创建工单，当前无需人工升级。\n来源：工具执行结果。"
+        ),
+    }
+
+    thread_id = "thread-approve"
+    agent._thread_user[thread_id] = "resume_user"
+    agent._trace_by_thread[thread_id] = "trace-approve"
+    agent._pending_role[thread_id] = "action"
+    agent._pending_state[thread_id] = {
+        "user_id": "resume_user",
+        "thread_id": thread_id,
+        "current_message": "请帮我创建工单",
+        "intent": "request",
+        "risk": "medium",
+        "selected_agent": "action",
+        "active_agent": "action",
+        "run_status": "interrupted",
+        "interrupts": [{"id": "interrupt-1", "value": {"tool": "create_ticket"}}],
+        "citations": [],
+    }
+
+    response = agent.resume(thread_id=thread_id, decisions=[{"type": "approve"}])
+
+    assert response.run_status == "completed"
+    assert response.active_agent == "action"
+    assert response.escalated is False
+    assert response.ticket_created == "TKT-20260307-0001"

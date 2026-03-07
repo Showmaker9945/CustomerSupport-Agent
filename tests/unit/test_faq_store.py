@@ -32,14 +32,14 @@ class TestFAQResult:
     def test_str_representation(self):
         """Test string representation."""
         result = FAQResult(
-            question="How do I reset?",
-            answer="Click reset button",
+            question="如何重置密码？",
+            answer="点击重置按钮",
             category="account",
             confidence=0.85
         )
 
         str_result = str(result)
-        assert "How do I reset?" in str_result
+        assert "如何重置密码？" in str_result
         assert "account" in str_result
         assert "85.00%" in str_result
 
@@ -80,19 +80,17 @@ class TestFAQStore:
 
     def test_search(self, temp_faq_store):
         """Test searching FAQs."""
-        results = temp_faq_store.search("password reset", top_k=3)
+        results = temp_faq_store.search("如何重置密码？", top_k=3)
 
         assert len(results) > 0
         assert isinstance(results[0], FAQResult)
         assert results[0].confidence > 0
-        # Most relevant result should be about password
-        assert "password" in results[0].question.lower() or \
-               "password" in results[0].answer.lower()
+        assert "密码" in results[0].question or "密码" in results[0].answer
 
     def test_search_with_category_filter(self, temp_faq_store):
         """Test searching with category filter."""
         results = temp_faq_store.search(
-            "how do I",
+            "取消订阅",
             category="billing",
             top_k=5
         )
@@ -246,7 +244,7 @@ Another CSV?,Another CSV answer,csv_test,csv"""
 
     def test_search_relevance_ranking(self, temp_faq_store):
         """Test that search results are ranked by relevance."""
-        results = temp_faq_store.search("payment", top_k=5)
+        results = temp_faq_store.search("付款方式", top_k=5)
 
         # Check that results are sorted by confidence
         if len(results) > 1:
@@ -256,21 +254,19 @@ Another CSV?,Another CSV answer,csv_test,csv"""
     def test_various_queries(self, temp_faq_store):
         """Test various search queries."""
         test_queries = [
-            ("how do I reset my password", "password"),
-            ("payment methods", "payment"),
-            ("cancel subscription", "cancel"),
-            ("add team member", "team"),
-            ("api access", "api"),
-            ("contact support", "support")
+            ("如何重置密码？", "密码"),
+            ("支持哪些付款方式？", "付款"),
+            ("如何取消订阅？", "订阅"),
+            ("如何邀请团队成员？", "成员"),
+            ("是否提供 API？", "API"),
+            ("如何联系客服？", "客服"),
         ]
 
         for query, expected_keyword in test_queries:
             results = temp_faq_store.search(query, top_k=2)
             assert len(results) > 0, f"No results for query: {query}"
-            # At least one result should contain the expected keyword
             assert any(
-                expected_keyword in r.question.lower() or
-                expected_keyword in r.answer.lower()
+                expected_keyword in r.question or expected_keyword in r.answer
                 for r in results
             ), f"Expected keyword '{expected_keyword}' not found in results for: {query}"
 

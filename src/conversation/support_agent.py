@@ -701,6 +701,18 @@ class SupportAgent:
                 unique.append(cleaned)
         return unique
 
+    def _is_positive_escalation_text(self, text: str) -> bool:
+        if not text:
+            return False
+        positive_patterns = (
+            r"已升级到人工",
+            r"已转人工",
+            r"转交人工",
+            r"人工客服已接手",
+            r"已提交人工",
+        )
+        return any(re.search(pattern, text) for pattern in positive_patterns)
+
     def _agent_thread_id(self, thread_id: str, role: str) -> str:
         return f"{settings.langgraph_thread_prefix}:{role}:{thread_id}"
 
@@ -1082,10 +1094,12 @@ class SupportAgent:
 
         ticket_id = self._ticket_id_from_text(tool_text) or state.get("ticket_id")
         citations = self._merge_unique(state.get("citations", []), self._extract_citations(tool_text))
+        escalated = bool(state.get("escalated")) or self._is_positive_escalation_text(tool_text)
         return {
             "active_agent": "action",
             "tool_text": tool_text,
             "ticket_id": ticket_id,
+            "escalated": escalated,
             "run_status": "completed",
             "interrupts": [],
             "citations": citations,
@@ -1160,11 +1174,7 @@ class SupportAgent:
 
         citations = self._merge_unique(state.get("citations", []), self._extract_citations(final_message))
         ticket_id = state.get("ticket_id") or self._ticket_id_from_text(final_message)
-        escalated = bool(
-            state.get("escalated")
-            or state.get("selected_agent") == "escalation"
-            or ("人工" in final_message and ticket_id)
-        )
+        escalated = bool(state.get("escalated") or state.get("selected_agent") == "escalation")
 
         return {
             "final_message": final_message,
@@ -1438,6 +1448,8 @@ class SupportAgent:
         if role in {"action", "escalation"}:
             merged_state["tool_text"] = resumed_text
             merged_state["ticket_id"] = merged_state.get("ticket_id") or self._ticket_id_from_text(resumed_text)
+            if role == "action" and self._is_positive_escalation_text(resumed_text):
+                merged_state["escalated"] = True
         if role == "escalation":
             merged_state["escalated"] = True
 
