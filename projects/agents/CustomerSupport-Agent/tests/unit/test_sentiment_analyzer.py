@@ -233,7 +233,7 @@ class TestSentimentAnalyzer:
 
         assert suggestion["route"] == "human"
         assert suggestion["priority"] == "high"
-        assert "escalate" in suggestion["suggested_action"].lower()
+        assert "转人工" in suggestion["suggested_action"]
 
     def test_get_routing_suggestion_moderate_frustration(self, analyzer):
         """Test routing suggestion for moderate frustration."""
@@ -293,7 +293,7 @@ class TestSentimentAnalyzer:
 
         str_result = str(conv)
         assert "declining" in str_result
-        assert "ESCALATION RECOMMENDED" in str_result
+        assert "建议升级人工" in str_result
 
     def test_frustration_keywords_exist(self):
         """Test that frustration keywords are defined."""
@@ -390,7 +390,7 @@ class TestRealWorldExamples:
         assert result.message_count == 7
         assert result.trend == "declining"
         assert result.escalation_recommended is True
-        assert "frustration" in result.reason.lower() or "declining" in result.reason.lower()
+        assert "挫败" in result.reason or "下降" in result.reason
 
     def test_resolved_issue_scenario(self, analyzer):
         """Test scenario where issue gets resolved."""
@@ -407,3 +407,30 @@ class TestRealWorldExamples:
         assert result.message_count == 5
         assert result.trend == "improving"
         assert result.escalation_recommended is False
+
+    def test_analyze_chinese_positive(self, analyzer):
+        result = analyzer.analyze("谢谢，已经解决了，辛苦了。")
+
+        assert result.label == "positive"
+        assert result.frustration_score < 0.2
+        assert result.polarity > 0
+
+    def test_analyze_chinese_negative(self, analyzer):
+        result = analyzer.analyze("这个问题一直没解决，太离谱了，我要投诉！")
+
+        assert result.label == "negative"
+        assert result.frustration_score > 0.7
+        assert any(keyword in " ".join(result.keywords) for keyword in ["离谱", "我要投诉", "一直没解决"])
+
+    def test_analyze_chinese_conversation_declining(self, analyzer):
+        messages = [
+            "你好，我想确认一下账单。",
+            "为什么还没处理？",
+            "这个问题一直没解决，太慢了，我要投诉。",
+        ]
+
+        result = analyzer.analyze_conversation(messages)
+
+        assert result.trend == "declining"
+        assert result.escalation_recommended is True
+        assert "挫败" in result.reason or "下降" in result.reason

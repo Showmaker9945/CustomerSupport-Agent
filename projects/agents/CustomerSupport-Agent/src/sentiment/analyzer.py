@@ -1,121 +1,161 @@
 """
-Sentiment analysis module for customer support.
+Chinese-first sentiment analysis for the customer support agent.
 
-Analyzes customer messages to detect sentiment, frustration levels,
-and recommend appropriate routing.
+The analyzer is optimized for Chinese customer-service language while still
+keeping reasonable English compatibility for mixed-language prompts and tests.
 """
 
-import logging
-from dataclasses import dataclass, field
-from typing import List, Literal
+from __future__ import annotations
 
-from textblob import TextBlob
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal, Tuple
 
 from ..config import settings
+
+try:
+    from textblob import TextBlob
+except Exception:  # pragma: no cover - dependency fallback
+    TextBlob = None
 
 logger = logging.getLogger(__name__)
 
 
-# Frustration keywords and their weights
-FRUSTRATION_KEYWORDS = {
-    # High frustration (0.8-1.0)
+FRUSTRATION_KEYWORDS: Dict[str, float] = {
+    # Chinese high frustration
+    "气死了": 1.0,
+    "离谱": 0.92,
+    "太坑了": 0.95,
+    "无法接受": 0.95,
+    "我要投诉": 0.95,
+    "投诉": 0.82,
+    "太差了": 0.9,
+    "糟糕": 0.82,
+    "太慢了": 0.72,
+    "一直没解决": 0.92,
+    "还没解决": 0.82,
+    "根本没用": 0.88,
+    "有毛病": 0.82,
+    "报错": 0.55,
+    "失败": 0.55,
+    "异常": 0.45,
+    "不行": 0.45,
+    "不对": 0.35,
+    "麻烦": 0.18,
+    "为什么会这样": 0.35,
+    "影响使用": 0.48,
+    "退款": 0.8,
+    "转人工": 0.7,
+    "人工处理": 0.62,
+    # English compatibility
     "furious": 1.0,
     "enraged": 1.0,
-    "hate": 1.0,
+    "hate": 0.92,
     "terrible": 0.9,
     "horrible": 0.9,
     "awful": 0.9,
-    "disgusting": 0.9,
-    "pathetic": 0.9,
-    "useless": 0.9,
-    "incompetent": 0.9,
-    "idiotic": 0.9,
-    "stupid": 0.9,
-    "moronic": 0.9,
-
-    # Medium-high frustration (0.6-0.8)
+    "disgusting": 0.88,
+    "useless": 0.88,
     "angry": 0.8,
-    "mad": 0.8,
-    "pissed": 0.8,
     "frustrated": 0.8,
-    "outraged": 0.8,
-    "unacceptable": 0.8,
-    "ridiculous": 0.75,
-    "absurd": 0.75,
-    "ridicule": 0.75,
-    "worst": 0.8,
-    "never buying": 0.8,
-    "cancel my subscription": 0.8,
-    "want my money back": 0.8,
-    "demanding refund": 0.8,
+    "unacceptable": 0.82,
+    "ridiculous": 0.78,
+    "worst": 0.82,
+    "cancel my subscription": 0.78,
+    "want my money back": 0.86,
     "sue": 0.9,
-
-    # Medium frustration (0.4-0.6)
     "annoying": 0.6,
     "annoyed": 0.6,
-    "irritated": 0.6,
-    "irritating": 0.6,
-    "frustrating": 0.6,
     "disappointed": 0.6,
-    "upset": 0.6,
-    "unhappy": 0.6,
+    "upset": 0.55,
     "not working": 0.5,
     "doesn't work": 0.5,
     "broken": 0.5,
-    "waste of time": 0.6,
-    "waste of money": 0.7,
-
-    # Low-medium frustration (0.2-0.4)
-    "confused": 0.3,
-    "unclear": 0.2,
-    "difficult": 0.3,
-    "complicated": 0.3,
-    "problem": 0.3,
-    "issue": 0.2,
-    "help": 0.1,
-    "support": 0.1,
-    "please": 0.0,
-    "thank": 0.0,
+    "problem": 0.25,
+    "issue": 0.18,
 }
 
-# Positive keywords to offset frustration
-POSITIVE_KEYWORDS = {
+POSITIVE_KEYWORDS: Dict[str, float] = {
+    # Chinese
+    "谢谢": -0.2,
+    "感谢": -0.2,
+    "辛苦了": -0.15,
+    "明白了": -0.14,
+    "可以了": -0.22,
+    "没事了": -0.22,
+    "已经解决": -0.32,
+    "解决了": -0.3,
+    "搞定了": -0.3,
+    "很好": -0.18,
+    "太好了": -0.25,
+    "满意": -0.2,
+    # English
     "great": -0.2,
     "good": -0.1,
-    "excellent": -0.3,
+    "excellent": -0.28,
     "helpful": -0.2,
-    "thanks": -0.1,
+    "thanks": -0.12,
     "thank you": -0.2,
-    "appreciate": -0.2,
+    "appreciate": -0.18,
     "resolved": -0.3,
-    "working": -0.2,
-    "fixed": -0.3,
+    "working": -0.15,
+    "fixed": -0.28,
     "love": -0.3,
     "amazing": -0.3,
     "perfect": -0.3,
 }
 
+INTENSIFIERS: Dict[str, float] = {
+    "非常": 0.1,
+    "特别": 0.08,
+    "真的": 0.05,
+    "太": 0.08,
+    "一直": 0.08,
+    "根本": 0.12,
+    "完全": 0.1,
+    "立刻": 0.08,
+    "马上": 0.08,
+    "超": 0.06,
+    "so": 0.06,
+    "very": 0.06,
+    "extremely": 0.1,
+}
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _contains_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _is_ascii_phrase(text: str) -> bool:
+    return bool(text) and all(ord(char) < 128 for char in text)
+
 
 @dataclass
 class SentimentResult:
     """Result of sentiment analysis on a single message."""
-    polarity: float  # -1 to 1 (negative to positive)
-    subjectivity: float  # 0 to 1 (objective to subjective)
+
+    polarity: float
+    subjectivity: float
     label: Literal["positive", "negative", "neutral"]
-    frustration_score: float  # 0 to 1
+    frustration_score: float
     keywords: List[str] = field(default_factory=list)
 
     def __str__(self) -> str:
-        """String representation for display."""
         return (
-            f"Sentiment: {self.label} (polarity: {self.polarity:.2f}, "
-            f"frustration: {self.frustration_score:.2f})"
+            f"情感：{self.label}（极性：{self.polarity:.2f}，"
+            f"挫败度：{self.frustration_score:.2f}）"
         )
 
 
 @dataclass
 class ConversationSentiment:
-    """Sentiment analysis over a conversation."""
+    """Conversation-level sentiment summary."""
+
     average_polarity: float
     trend: Literal["improving", "stable", "declining"]
     escalation_recommended: bool
@@ -124,185 +164,177 @@ class ConversationSentiment:
     frustration_peak: float
 
     def __str__(self) -> str:
-        """String representation for display."""
-        escalation = "⚠️ ESCALATION RECOMMENDED" if self.escalation_recommended else "✓ No escalation needed"
+        escalation = "建议升级人工" if self.escalation_recommended else "当前无需升级"
         return (
-            f"Conversation Sentiment:\n"
-            f"  Average Polarity: {self.average_polarity:.2f}\n"
-            f"  Trend: {self.trend}\n"
-            f"  Peak Frustration: {self.frustration_peak:.2f}\n"
-            f"  {escalation}\n"
-            f"  Reason: {self.reason}"
+            "对话情绪分析：\n"
+            f"  平均极性：{self.average_polarity:.2f}\n"
+            f"  趋势：{self.trend}\n"
+            f"  峰值挫败度：{self.frustration_peak:.2f}\n"
+            f"  结论：{escalation}\n"
+            f"  原因：{self.reason}"
         )
 
 
 class SentimentAnalyzer:
-    """
-    Analyze customer sentiment in support conversations.
-
-    Uses TextBlob for sentiment analysis and custom keyword
-    detection for frustration scoring.
-    """
+    """Chinese-first customer support sentiment analyzer."""
 
     def __init__(
         self,
-        frustration_keywords: dict = None,
-        positive_keywords: dict = None,
-        escalation_threshold: float = None
+        frustration_keywords: dict | None = None,
+        positive_keywords: dict | None = None,
+        escalation_threshold: float | None = None,
     ):
-        """
-        Initialize sentiment analyzer.
-
-        Args:
-            frustration_keywords: Custom frustration keyword weights
-            positive_keywords: Custom positive keyword weights
-            escalation_threshold: Frustration threshold for escalation (0-1)
-        """
         self.frustration_keywords = frustration_keywords or FRUSTRATION_KEYWORDS
         self.positive_keywords = positive_keywords or POSITIVE_KEYWORDS
         self.escalation_threshold = escalation_threshold or settings.handoff_threshold
-
-        # Normalize escalation threshold from -1 to 1 range
         if self.escalation_threshold < 0:
-            # Convert to positive 0-1 scale
             self.escalation_threshold = abs(self.escalation_threshold)
-
-        logger.info(f"Initialized SentimentAnalyzer with escalation threshold: {self.escalation_threshold}")
+        logger.info(
+            "Initialized SentimentAnalyzer with escalation threshold: %s",
+            self.escalation_threshold,
+        )
 
     def analyze(self, text: str) -> SentimentResult:
-        """
-        Analyze sentiment of a single message.
+        """Analyze a single user message."""
 
-        Args:
-            text: Message text to analyze
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return SentimentResult(
+                polarity=0.0,
+                subjectivity=0.0,
+                label="neutral",
+                frustration_score=0.0,
+                keywords=[],
+            )
 
-        Returns:
-            SentimentResult with polarity, label, and frustration score
-        """
         try:
-            # Use TextBlob for basic sentiment
-            blob = TextBlob(text)
-            polarity = blob.sentiment.polarity  # -1 to 1
-            subjectivity = blob.sentiment.subjectivity  # 0 to 1
+            frustration_score, keywords, keyword_polarity = self._calculate_frustration(cleaned)
+            blob_polarity, blob_subjectivity = self._blob_sentiment(cleaned)
 
-            # Determine label
-            if polarity > 0.1:
+            if _contains_chinese(cleaned):
+                polarity = (keyword_polarity * 0.85) + (blob_polarity * 0.15)
+            else:
+                polarity = (keyword_polarity * 0.55) + (blob_polarity * 0.45)
+
+            polarity = _clamp(polarity, -1.0, 1.0)
+            subjectivity = _clamp(
+                max(blob_subjectivity, min(1.0, 0.18 * len(keywords) + 0.15)),
+                0.0,
+                1.0,
+            )
+
+            if frustration_score >= 0.55 and polarity > -0.2:
+                polarity = min(polarity, -0.22)
+            if frustration_score >= 0.75:
+                polarity = min(polarity, -0.55)
+            if (
+                any(keyword.startswith("+") for keyword in keywords)
+                and frustration_score < 0.15
+                and polarity > 0.28
+            ):
+                polarity = _clamp(polarity + 0.08, -1.0, 1.0)
+
+            if polarity > 0.18 and frustration_score < 0.4:
                 label = "positive"
-            elif polarity < -0.1:
+            elif polarity < -0.18 or frustration_score >= 0.45:
                 label = "negative"
             else:
                 label = "neutral"
-
-            # Calculate frustration score
-            frustration_score, keywords = self._calculate_frustration(text)
-
-            # Adjust frustration based on polarity
-            # If text is very positive, reduce frustration score
-            if polarity > 0.3:
-                frustration_score = max(0, frustration_score - 0.3)
 
             return SentimentResult(
                 polarity=polarity,
                 subjectivity=subjectivity,
                 label=label,
                 frustration_score=frustration_score,
-                keywords=keywords
+                keywords=keywords,
             )
-
-        except Exception as e:
-            logger.error(f"Sentiment analysis error: {e}")
-            # Return neutral on error
+        except Exception as error:  # pragma: no cover - defensive fallback
+            logger.error(f"Sentiment analysis error: {error}")
             return SentimentResult(
                 polarity=0.0,
                 subjectivity=0.0,
                 label="neutral",
                 frustration_score=0.0,
-                keywords=[]
+                keywords=[],
             )
 
-    def _calculate_frustration(self, text: str) -> tuple[float, List[str]]:
-        """
-        Calculate frustration score from keywords.
+    def _blob_sentiment(self, text: str) -> Tuple[float, float]:
+        if TextBlob is None:
+            return 0.0, 0.0
+        try:
+            blob = TextBlob(text)
+            return float(blob.sentiment.polarity), float(blob.sentiment.subjectivity)
+        except Exception:
+            return 0.0, 0.0
 
-        Uses word boundary matching to avoid false matches like "sue" in "issue".
+    def _keyword_match(self, keyword: str, text: str, lowered: str) -> bool:
+        if _is_ascii_phrase(keyword):
+            pattern = r"\b" + re.escape(keyword.lower()) + r"\b"
+            return re.search(pattern, lowered) is not None
+        return keyword in text
 
-        Args:
-            text: Message text
+    def _calculate_frustration(self, text: str) -> Tuple[float, List[str], float]:
+        lowered = text.lower()
+        negative_score = 0.0
+        positive_score = 0.0
+        matched_keywords: List[str] = []
 
-        Returns:
-            Tuple of (frustration_score, matched_keywords)
-        """
-        import re
-        text_lower = text.lower()
-        total_score = 0.0
-        matched_keywords = []
-
-        # Check frustration keywords with word boundaries
         for keyword, weight in self.frustration_keywords.items():
-            # Use regex with word boundaries for exact word matching
-            pattern = r'\b' + re.escape(keyword) + r'\b'
-            if re.search(pattern, text_lower):
-                total_score += weight
+            if self._keyword_match(keyword, text, lowered):
+                negative_score += weight
                 matched_keywords.append(keyword)
 
-        # Apply positive keywords as offsets
         for keyword, offset in self.positive_keywords.items():
-            pattern = r'\b' + re.escape(keyword) + r'\b'
-            if re.search(pattern, text_lower):
-                total_score += offset  # offset is negative
+            if self._keyword_match(keyword, text, lowered):
+                positive_score += abs(offset)
                 matched_keywords.append(f"+{keyword}")
 
-        # Check for repeated punctuation (!!!, ???) indicating frustration
-        if "!!!" in text or "???" in text:
-            total_score += 0.2
+        intensity_bonus = 0.0
+        for keyword, weight in INTENSIFIERS.items():
+            if self._keyword_match(keyword, text, lowered):
+                intensity_bonus += weight
 
-        # Check for ALL CAPS words (indicates shouting/anger)
-        words = text.split()
-        caps_words = [w for w in words if len(w) > 2 and w.isupper() and w.isalpha()]
+        punctuation_bonus = 0.0
+        repeated_marks = (
+            text.count("!") + text.count("！") + text.count("?") + text.count("？")
+        )
+        if repeated_marks >= 3:
+            punctuation_bonus += 0.18
+        if "!!!" in text or "！！！" in text or "???" in text or "？？？" in text:
+            punctuation_bonus += 0.12
+
+        caps_bonus = 0.0
+        caps_words = [
+            token for token in re.findall(r"[A-Z]{3,}", text) if token.isalpha()
+        ]
         if caps_words:
-            total_score += min(0.3, len(caps_words) * 0.1)
+            caps_bonus = min(0.25, len(caps_words) * 0.08)
 
-        # Normalize to 0-1 range
-        frustration_score = max(0.0, min(1.0, total_score))
+        frustration_score = _clamp(
+            negative_score + intensity_bonus + punctuation_bonus + caps_bonus - (positive_score * 0.4),
+            0.0,
+            1.0,
+        )
+        keyword_polarity = _clamp((positive_score * 0.8) - (negative_score * 0.85), -1.0, 1.0)
+        return frustration_score, matched_keywords, keyword_polarity
 
-        return frustration_score, matched_keywords
+    def analyze_conversation(self, messages: List[str]) -> ConversationSentiment:
+        """Analyze multi-turn conversation sentiment."""
 
-    def analyze_conversation(
-        self,
-        messages: List[str]
-    ) -> ConversationSentiment:
-        """
-        Analyze sentiment trend over conversation.
-
-        Args:
-            messages: List of message texts in chronological order
-
-        Returns:
-            ConversationSentiment with trend analysis
-        """
         if not messages:
             return ConversationSentiment(
                 average_polarity=0.0,
                 trend="stable",
                 escalation_recommended=False,
-                reason="No messages to analyze",
+                reason="暂无可分析的对话。",
                 message_count=0,
-                frustration_peak=0.0
+                frustration_peak=0.0,
             )
 
-        # Analyze each message
-        results = [self.analyze(msg) for msg in messages]
-
-        # Calculate average polarity
-        avg_polarity = sum(r.polarity for r in results) / len(results)
-
-        # Calculate trend
+        results = [self.analyze(message) for message in messages]
+        avg_polarity = sum(item.polarity for item in results) / len(results)
         trend = self._calculate_trend(results)
-
-        # Find peak frustration
-        frustration_peak = max(r.frustration_score for r in results) if results else 0.0
-
-        # Determine escalation
+        frustration_peak = max(item.frustration_score for item in results) if results else 0.0
         escalation, reason = self._should_escalate_conversation(results, trend)
 
         return ConversationSentiment(
@@ -311,173 +343,109 @@ class SentimentAnalyzer:
             escalation_recommended=escalation,
             reason=reason,
             message_count=len(messages),
-            frustration_peak=frustration_peak
+            frustration_peak=frustration_peak,
         )
 
     def _calculate_trend(self, results: List[SentimentResult]) -> str:
-        """
-        Calculate sentiment trend over time.
-
-        Args:
-            results: List of sentiment results in chronological order
-
-        Returns:
-            Trend label: improving, stable, or declining
-        """
         if len(results) < 2:
             return "stable"
 
-        # Split into first half and second half
         mid = len(results) // 2
         first_half = results[:mid]
         second_half = results[mid:]
 
-        # Calculate average polarity for each half
-        first_avg = sum(r.polarity for r in first_half) / len(first_half) if first_half else 0
-        second_avg = sum(r.polarity for r in second_half) / len(second_half) if second_half else 0
-
-        # Calculate difference
+        first_avg = sum(item.polarity for item in first_half) / len(first_half) if first_half else 0.0
+        second_avg = sum(item.polarity for item in second_half) / len(second_half) if second_half else 0.0
         diff = second_avg - first_avg
 
-        # Determine trend
         if diff > 0.15:
             return "improving"
-        elif diff < -0.15:
+        if diff < -0.15:
             return "declining"
-        else:
-            return "stable"
+        return "stable"
 
     def _should_escalate_conversation(
         self,
         results: List[SentimentResult],
-        trend: str
-    ) -> tuple[bool, str]:
-        """
-        Determine if conversation should escalate to human.
-
-        Args:
-            results: List of sentiment results
-            trend: Conversation trend
-
-        Returns:
-            Tuple of (should_escalate, reason)
-        """
+        trend: str,
+    ) -> Tuple[bool, str]:
         if not results:
-            return False, "No data"
+            return False, "暂无数据。"
 
-        # Check for very high frustration in recent messages
         recent_results = results[-3:] if len(results) >= 3 else results
-        max_recent_frustration = max(r.frustration_score for r in recent_results)
-
+        max_recent_frustration = max(item.frustration_score for item in recent_results)
         if max_recent_frustration >= 0.8:
-            return True, f"High frustration detected (score: {max_recent_frustration:.2f})"
+            return True, f"最近消息中检测到高挫败情绪（分数：{max_recent_frustration:.2f}）。"
 
-        # Check for declining trend with negative sentiment
         if trend == "declining":
-            avg_polarity = sum(r.polarity for r in results) / len(results)
+            avg_polarity = sum(item.polarity for item in results) / len(results)
             if avg_polarity < -0.2:
-                return True, f"Declining sentiment with negative average ({avg_polarity:.2f})"
+                return True, f"对话情绪持续下降，且平均情感偏负面（{avg_polarity:.2f}）。"
 
-        # Check for persistent negative sentiment
-        negative_count = sum(1 for r in results if r.label == "negative")
+        negative_count = sum(1 for item in results if item.label == "negative")
         negative_ratio = negative_count / len(results)
-
         if negative_ratio > 0.6 and len(results) >= 3:
-            return True, f"Persistent negative sentiment ({negative_ratio*100:.0f}% of messages)"
+            return True, f"负向情绪持续出现（{negative_ratio * 100:.0f}% 消息为负向）。"
 
-        # Check if customer is getting more frustrated over time
         if len(results) >= 3:
-            early_frustration = sum(r.frustration_score for r in results[:3]) / 3
-            late_frustration = sum(r.frustration_score for r in results[-3:]) / 3
+            early = sum(item.frustration_score for item in results[:3]) / 3
+            late = sum(item.frustration_score for item in results[-3:]) / 3
+            if late - early > 0.3:
+                return True, f"挫败情绪持续升高（前段 {early:.2f}，最近 {late:.2f}）。"
 
-            if late_frustration - early_frustration > 0.3:
-                return True, f"Increasing frustration over time (early: {early_frustration:.2f}, recent: {late_frustration:.2f})"
-
-        return False, "Sentiment within acceptable range"
+        return False, "情绪整体可控。"
 
     def should_escalate(self, sentiment_history: List[SentimentResult]) -> bool:
-        """
-        Determine if conversation should escalate based on sentiment history.
-
-        Args:
-            sentiment_history: List of sentiment results from conversation
-
-        Returns:
-            True if escalation is recommended
-        """
         if not sentiment_history:
             return False
-
-        # Calculate conversation-level analysis
-        messages = [f"Message {i}" for i in range(len(sentiment_history))]
-        # We need to reconstruct or use the sentiment results directly
-
-        # Use the last few messages to determine recent state
         recent = sentiment_history[-3:] if len(sentiment_history) >= 3 else sentiment_history
-
-        # Check for high frustration
-        if any(r.frustration_score >= 0.7 for r in recent):
+        if any(item.frustration_score >= 0.7 for item in recent):
             return True
-
-        # Check for negative sentiment streak
-        if len(recent) >= 2 and all(r.label == "negative" for r in recent):
+        if len(recent) >= 2 and all(item.label == "negative" for item in recent):
             return True
-
         return False
 
     def get_routing_suggestion(self, sentiment: SentimentResult) -> dict:
-        """
-        Get routing suggestion based on sentiment.
-
-        Args:
-            sentiment: Sentiment analysis result
-
-        Returns:
-            Dictionary with routing recommendation
-        """
         if sentiment.frustration_score >= 0.7:
             return {
                 "route": "human",
                 "priority": "high",
-                "reason": f"High frustration detected (score: {sentiment.frustration_score:.2f})",
-                "suggested_action": "escalate immediately"
+                "reason": f"检测到高挫败情绪（分数：{sentiment.frustration_score:.2f}）。",
+                "suggested_action": "立即转人工并优先安抚用户",
             }
-        elif sentiment.frustration_score >= 0.5:
+        if sentiment.frustration_score >= 0.5:
             return {
                 "route": "senior_agent",
                 "priority": "medium",
-                "reason": f"Moderate frustration (score: {sentiment.frustration_score:.2f})",
-                "suggested_action": "handle with care, consider escalation if continues"
+                "reason": f"用户存在中度挫败情绪（分数：{sentiment.frustration_score:.2f}）。",
+                "suggested_action": "由高级客服跟进，并持续观察是否需要升级",
             }
-        elif sentiment.label == "negative":
+        if sentiment.label == "negative":
             return {
                 "route": "ai_with_supervision",
                 "priority": "normal",
-                "reason": "Negative sentiment detected",
-                "suggested_action": "monitor conversation, empathize with customer"
+                "reason": "检测到负向情绪。",
+                "suggested_action": "继续提供帮助，同时加强共情表达",
             }
-        elif sentiment.label == "positive":
+        if sentiment.label == "positive":
             return {
                 "route": "ai",
                 "priority": "low",
-                "reason": "Positive sentiment",
-                "suggested_action": "continue standard support"
+                "reason": "用户情绪积极。",
+                "suggested_action": "保持标准支持流程即可",
             }
-        else:
-            return {
-                "route": "ai",
-                "priority": "normal",
-                "reason": "Neutral sentiment",
-                "suggested_action": "continue standard support"
-            }
+        return {
+            "route": "ai",
+            "priority": "normal",
+            "reason": "用户情绪平稳。",
+            "suggested_action": "按标准客服流程继续处理",
+        }
 
 
-# Global sentiment analyzer instance
-_sentiment_analyzer: SentimentAnalyzer = None
+_sentiment_analyzer: SentimentAnalyzer | None = None
 
 
 def get_sentiment_analyzer() -> SentimentAnalyzer:
-    """Get or create global sentiment analyzer instance."""
     global _sentiment_analyzer
     if _sentiment_analyzer is None:
         _sentiment_analyzer = SentimentAnalyzer()
@@ -485,59 +453,21 @@ def get_sentiment_analyzer() -> SentimentAnalyzer:
 
 
 def reset_sentiment_analyzer() -> None:
-    """Reset the global sentiment analyzer instance (useful for testing)."""
     global _sentiment_analyzer
     _sentiment_analyzer = None
 
 
-# ============================================================================
-# MAIN DEMO
-# ============================================================================
-
-if __name__ == "__main__":
-    """Demonstrate sentiment analyzer usage."""
-    print("=" * 60)
-    print("Sentiment Analyzer Demo")
-    print("=" * 60)
-
+if __name__ == "__main__":  # pragma: no cover - manual demo helper
     analyzer = SentimentAnalyzer()
-
-    # Test different messages
-    test_messages = [
-        "I love your product! It's amazing!",
-        "This is terrible and I'm very frustrated!",
-        "I need help with my account settings.",
-        "THIS IS UNACCEPTABLE! I want a refund NOW!"
+    samples = [
+        "谢谢，已经解决了。",
+        "这个账单一直没解决，太离谱了，我要投诉！",
+        "I love your product! It's amazing.",
+        "THIS IS UNACCEPTABLE! I want my money back now!",
     ]
-
-    for msg in test_messages:
-        result = analyzer.analyze(msg)
-        routing = analyzer.get_routing_suggestion(result)
-        print(f"\nMessage: {msg}")
-        print(f"  Sentiment: {result.label}")
-        print(f"  Polarity: {result.polarity:.2f}")
-        print(f"  Frustration: {result.frustration_score:.2f}")
-        print(f"  Route: {routing['route']}")
-
-    # Test conversation analysis
-    print("\n" + "=" * 60)
-    print("Conversation Analysis Demo")
-    print("=" * 60)
-
-    conversation = [
-        "Hi, I'm having trouble with my account.",
-        "Sure, I can help with that. What's the issue?",
-        "I can't login. It keeps saying invalid credentials.",
-        "Have you tried resetting your password?",
-        "Yes, I did that three times already! This is ridiculous!",
-        "I understand your frustration. Let me check on that.",
-        "Well? This is taking forever! I'm about to cancel!"
-    ]
-
-    conv_result = analyzer.analyze_conversation(conversation)
-    print(f"\nConversation of {conv_result.message_count} messages")
-    print(f"  Trend: {conv_result.trend}")
-    print(f"  Escalation Recommended: {conv_result.escalation_recommended}")
-    print(f"  Reason: {conv_result.reason}")
-
-    print("\n" + "=" * 60)
+    for sample in samples:
+        result = analyzer.analyze(sample)
+        print(sample)
+        print(result)
+        print(analyzer.get_routing_suggestion(result))
+        print("-" * 40)

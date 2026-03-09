@@ -34,13 +34,19 @@ def create_role_agent(owner: Any, role: str, tools: List[Any], enable_hitl: bool
     def role_prompt(request: ModelRequest) -> str:
         context = getattr(request.runtime, "context", None)
         user_id = getattr(context, "user_id", "unknown_user")
+        thread_id = getattr(context, "thread_id", None)
         latest_user = ""
         for message in reversed(request.state.get("messages", [])):
             if isinstance(message, HumanMessage):
                 latest_user = str(message.content)
                 break
 
-        memory_items = owner._search_memory(user_id=user_id, query=latest_user, limit=4)
+        memory_items = owner._search_memory(
+            user_id=user_id,
+            query=latest_user,
+            limit=4,
+            thread_id=thread_id,
+        )
         return build_role_system_prompt(role=role, memory_items=memory_items)
 
     @before_model

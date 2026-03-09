@@ -1,53 +1,36 @@
-# Dockerfile for CustomerSupport-Agent
-# Multi-stage build for optimized production image
+﻿FROM python:3.11-slim
 
-FROM python:3.11-slim as base
-
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+RUN pip install --no-cache-dir uv==0.9.26
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
-# Download NLP data for TextBlob
-RUN python -c "from textblob import TextBlob; TextBlob('test')" || \
-    python -m textblob.download_corpora || echo "TextBlob corpora download skipped"
-
-# Copy application code
 COPY src/ ./src/
 COPY data/ ./data/
+COPY .env.example ./
 
-# Create necessary directories
-RUN mkdir -p data/knowledge_base data/chroma_db data/user_memory
+RUN mkdir -p data/knowledge_base data/chroma_db data/user_memory && \
+    (python -c "from textblob import TextBlob; TextBlob('test')" || python -m textblob.download_corpora || echo "TextBlob corpora download skipped")
 
-# Set proper permissions
-RUN chmod +x src/api/main.py 2>/dev/null || true
-
-# Create non-root user for security
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Expose port
 EXPOSE 8000
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8000/health')" || exit 1
+    CMD python -c "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()" || exit 1
 
-# Run the application
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

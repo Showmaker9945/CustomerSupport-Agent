@@ -1,220 +1,168 @@
-# CustomerSupport-Agent Examples
+﻿# Examples Guide
 
-This directory contains example clients for testing the CustomerSupport-Agent API.
+这个目录用于配合 Swagger Docs、SSE 和 WebSocket 做演示。
 
-## Prerequisites
+## 启动服务
 
-Make sure the server is running:
 ```bash
-cd CustomerSupport-Agent
-uvicorn src.api.main:app --reload
+uv run uvicorn src.api.main:app --reload --port 8000
 ```
 
-## WebSocket Client
+打开：
 
-Test real-time chat functionality using WebSockets.
+- Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
+- ReDoc: [http://localhost:8000/redoc](http://localhost:8000/redoc)
 
-### Running
+## 推荐验证顺序
+
+### 1. FAQ 问答
+
+`POST /chat`
+
+```json
+{
+  "user_id": "demo_user",
+  "content": "如何重置密码？",
+  "debug": true
+}
+```
+
+关注点：
+
+- `active_agent` 应为 `knowledge`
+- `run_status` 应为 `completed`
+- `debug.route_path` 应包含 `analyze -> knowledge -> validate -> respond`
+
+### 2. 真实业务查询
+
+```json
+{
+  "user_id": "user_001",
+  "content": "帮我查一下当前套餐和下次续费时间",
+  "debug": true
+}
+```
+
+关注点：
+
+- 走 `action` 路径
+- 返回订阅状态、续费时间、套餐权益
+
+### 3. 轻量 RAG 增强
+
+```json
+{
+  "user_id": "demo_user",
+  "content": "怎么取消套餐，取消后什么时候生效？",
+  "debug": true
+}
+```
+
+关注点：
+
+- 应返回取消订阅相关 FAQ
+- 如果 `DEBUG=true`，工具调试摘要里会展示检索策略
+- `debug.route_path` 仍然保持清晰，不会破坏主图结构
+
+### 4. HITL 中断
+
+```json
+{
+  "user_id": "user_001",
+  "content": "帮我创建一个账单异常工单",
+  "debug": true
+}
+```
+
+关注点：
+
+- `run_status = interrupted`
+- `thread_id` 非空
+- `approval.count` 表示需要提交几条审批决定
+- `approval.tools` 应明确列出待审批工具名称
+
+### 5. Resume 恢复
+
+`POST /runs/{thread_id}/resume`
+
+```json
+{
+  "decisions": [
+    { "type": "approve" }
+  ],
+  "debug": true
+}
+```
+
+关注点：
+
+- `thread_id` 使用上一步 `/chat` 响应中的顶层 `thread_id`
+- 如果 `approval.count > 1`，就必须传入同样数量的 `decisions`
+- 成功后应回到 `completed`
+
+### 6. 升级人工
+
+```json
+{
+  "user_id": "demo_user",
+  "content": "我要投诉，现在就转人工",
+  "debug": true
+}
+```
+
+关注点：
+
+- 走 `escalation` 路径
+- 高风险工具会进入审批
+
+## SSE 测试
+
 ```bash
-python examples/websocket_client.py
+curl "http://localhost:8000/chat/stream?user_id=demo_user&content=如何重置密码？"
 ```
 
-### What it tests:
-- Connection establishment
-- Message sending and receiving
-- Typing indicators
-- Concurrent sessions
-- Ping/pong keepalive
+常见事件：
 
-### Custom usage:
-```python
-import asyncio
-import websockets
-import json
+- `node`
+- `token`
+- `interrupt`
+- `done`
 
-async def chat():
-    uri = "ws://localhost:8000/ws/chat/your_user_id"
+## WebSocket 测试
 
-    async with websockets.connect(uri) as websocket:
-        # Wait for connection confirmation
-        await websocket.recv()
-
-        # Send message
-        await websocket.send(json.dumps({
-            "type": "message",
-            "content": "Your message here"
-        }))
-
-        # Receive response
-        response = await websocket.recv()
-        data = json.loads(response)
-        print(f"Agent: {data['content']}")
-
-asyncio.run(chat())
-```
-
-## REST Client
-
-Test the REST API endpoints.
-
-### Running
 ```bash
-python examples/rest_client.py
+uv run python examples/websocket_client.py
 ```
 
-### What it tests:
-- Health check endpoint
-- Chat endpoint
-- Ticket retrieval
-- Conversation history
-- Feedback submission
+如果你手动发消息，基础报文如下：
 
-### Custom usage:
-```python
-import asyncio
-import httpx
-
-async def main():
-    async with httpx.AsyncClient() as client:
-        # Send message
-        response = await client.post(
-            "http://localhost:8000/chat",
-            json={
-                "content": "Your message here",
-                "session_id": "session_123"
-            }
-        )
-
-        data = response.json()
-        print(f"Agent: {data['message']}")
-
-asyncio.run(main())
-```
-
-## API Endpoints
-
-### WebSocket
-- **URL**: `ws://localhost:8000/ws/chat/{user_id}`
-- **Description**: Real-time bidirectional chat
-
-### REST
-- **POST /chat** - Send message and get response
-- **GET /users/{user_id}/tickets** - Get user's tickets
-- **GET /users/{user_id}/history** - Get conversation history
-- **POST /feedback** - Submit feedback
-- **GET /health** - Health check
-- **GET /docs** - Interactive API documentation (Swagger UI)
-
-## Message Formats
-
-### WebSocket Message (Client → Server)
 ```json
 {
   "type": "message",
-  "content": "Your message here",
-  "session_id": "optional-session-id"
+  "content": "帮我创建一个账单异常工单",
+  "thread_id": "ws_demo_001"
 }
 ```
 
-### WebSocket Response (Server → Client)
+如果收到了中断结果，再发送：
+
 ```json
 {
-  "type": "response",
-  "content": "Agent response",
-  "metadata": {
-    "intent": "question",
-    "sentiment": {
-      "label": "neutral",
-      "polarity": 0.1,
-      "frustration_score": 0.2
-    },
-    "sources": ["FAQ Knowledge Base"],
-    "escalated": false,
-    "ticket_created": null
-  },
-  "timestamp": "2024-01-31T12:00:00Z"
+  "type": "resume",
+  "thread_id": "ws_demo_001",
+  "decisions": [
+    { "type": "approve" }
+  ]
 }
 ```
 
-### Typing Indicator
-```json
-{
-  "type": "typing",
-  "typing": true,
-  "timestamp": "2024-01-31T12:00:00Z"
-}
-```
+## 关键字段说明
 
-## Testing Tips
-
-1. **Start the server first:**
-   ```bash
-   uvicorn src.api.main:app --reload --port 8000
-   ```
-
-2. **Check health:**
-   ```bash
-   curl http://localhost:8000/health
-   ```
-
-3. **View API docs:**
-   - Swagger UI: http://localhost:8000/docs
-   - ReDoc: http://localhost:8000/redoc
-
-4. **Test with curl (REST):**
-   ```bash
-   curl -X POST http://localhost:8000/chat \
-     -H "Content-Type: application/json" \
-     -d '{"content": "Hello!"}'
-   ```
-
-5. **Monitor logs:**
-   The server logs all requests and responses, useful for debugging.
-
-## Troubleshooting
-
-### Connection refused
-- Make sure the server is running
-- Check the port (default: 8000)
-
-### WebSocket errors
-- Ensure WebSocket support is enabled
-- Check firewall settings
-
-### Slow responses
-- First message may be slow (model loading)
-- Subsequent messages will be faster
-
-## More Examples
-
-### JavaScript/Node.js WebSocket
-```javascript
-const WebSocket = require('ws');
-
-const ws = new WebSocket('ws://localhost:8000/ws/chat/user_123');
-
-ws.on('open', () => {
-  ws.send(JSON.stringify({
-    type: 'message',
-    content: 'Hello from Node.js!'
-  }));
-});
-
-ws.on('message', (data) => {
-  const response = JSON.parse(data);
-  console.log('Agent:', response.content);
-});
-```
-
-### Python Requests (REST)
-```python
-import requests
-
-response = requests.post(
-    'http://localhost:8000/chat',
-    json={'content': 'Hello from REST!'}
-)
-
-data = response.json()
-print(f"Agent: {data['message']}")
-```
+- `thread_id`: 本次线程的唯一标识，resume 时使用它
+- `run_status`: `completed` 或 `interrupted`
+- `active_agent`: 当前主要执行的 agent
+- `approval.count`: 当前还需要几条人工审批决定
+- `approval.tools`: 待审批工具摘要
+- `debug.route_path`: 实际执行过的图路径
+- `debug.trace_preview`: 最近几个节点事件摘要
+- `debug.validation_notes`: 校验节点补充的信息
