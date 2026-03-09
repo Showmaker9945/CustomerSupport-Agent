@@ -88,8 +88,9 @@ class Settings(BaseSettings):
     sentiment_threshold: float = 0.3
     frustration_keywords: List[str] = Field(
         default_factory=lambda: [
+            "生气", "愤怒", "投诉", "太差", "离谱",
             "angry", "frustrated", "terrible", "awful",
-            "hate", "stupid", "useless"
+            "hate", "stupid", "useless",
         ]
     )
 
@@ -97,7 +98,7 @@ class Settings(BaseSettings):
     handoff_threshold: float = -0.5
     max_ai_turns: int = 10
     human_handoff_message: str = (
-        "I'm connecting you with a human agent who can better assist you."
+        "我正在为你转接人工客服，请稍等。"
     )
     hitl_high_risk_tools: List[str] = Field(
         default_factory=lambda: ["create_ticket", "update_ticket", "escalate_to_human"]

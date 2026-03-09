@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -21,6 +22,10 @@ from ...sentiment.analyzer import SentimentResult, get_sentiment_analyzer
 from ...tools.support_tools import (
     create_ticket,
     escalate_to_human,
+    explain_invoice_charge,
+    get_latest_invoice,
+    get_latest_invoice_record,
+    get_subscription_status,
     get_ticket_status,
     get_user_tickets,
     lookup_account,
@@ -39,6 +44,7 @@ from .graph import (
     SupportAgentOrchestrator,
     SupportResponse,
     as_bool,
+    build_trace_event,
     build_execution_steps,
     build_neutral_sentiment,
     extract_citations,
@@ -49,6 +55,7 @@ from .graph import (
     normalize_intent,
     normalize_risk,
     normalize_sentiment_label,
+    normalize_execution_steps,
     safe_float,
     ticket_id_from_text,
     is_positive_escalation_text,
@@ -57,6 +64,27 @@ from .middleware import create_role_agent
 from .persistence import LangGraphPersistence
 
 logger = logging.getLogger(__name__)
+
+TOOL_LABELS: Dict[str, str] = {
+    "create_ticket": "创建工单",
+    "update_ticket": "更新工单",
+    "get_ticket_status": "查询工单状态",
+    "get_user_tickets": "查询用户工单",
+    "lookup_account": "查询账户信息",
+    "get_subscription_status": "查询订阅状态",
+    "get_latest_invoice": "查询最近账单",
+    "explain_invoice_charge": "解释账单扣费",
+    "search_faq": "检索知识库",
+    "escalate_to_human": "升级人工客服",
+    "reindex_knowledge_base": "重建知识库索引",
+}
+
+MEMORY_IMPORTANCE: Dict[str, float] = {
+    "profile": 0.95,
+    "preference": 0.85,
+    "open_issue": 1.0,
+    "resolved_issue": 0.55,
+}
 
 
 class SupportAgent:
@@ -97,6 +125,7 @@ class SupportAgent:
         self._pending_role: Dict[str, str] = {}
         self._pending_state: Dict[str, OrchestrationState] = {}
         self._trace_by_thread: Dict[str, str] = {}
+        self._memory_debug_by_thread: Dict[str, Dict[str, Any]] = {}
 
         self.basic_model: Optional[ChatOpenAI] = None
         self.advanced_model: Optional[ChatOpenAI] = None
@@ -127,8 +156,79 @@ class SupportAgent:
             kwargs["base_url"] = settings.llm_base_url
         return ChatOpenAI(**kwargs)
 
-    def _memory_namespace(self, user_id: str) -> Tuple[str, str]:
-        return (settings.long_term_memory_namespace, user_id)
+    def _telemetry_memory_namespace(self, user_id: str) -> Tuple[str, str, str]:
+        return (settings.long_term_memory_namespace, user_id, "telemetry")
+
+    def _structured_memory_namespace(self, user_id: str) -> Tuple[str, str, str]:
+        return (settings.long_term_memory_namespace, user_id, "structured")
+
+    def _reset_memory_debug(self, thread_id: str) -> None:
+        if not thread_id:
+            return
+        self._memory_debug_by_thread[thread_id] = {
+            "reads": [],
+            "writes": [],
+            "skips": [],
+        }
+
+    def _memory_debug_snapshot(self, thread_id: Optional[str]) -> Dict[str, Any]:
+        if not thread_id:
+            return {}
+        snapshot = self._memory_debug_by_thread.get(thread_id, {})
+        return {
+            "reads": list(snapshot.get("reads", [])),
+            "writes": list(snapshot.get("writes", [])),
+            "skips": list(snapshot.get("skips", [])),
+        }
+
+    def _memory_debug_entry(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        content = (
+            payload.get("content")
+            or payload.get("summary")
+            or payload.get("fact")
+            or payload.get("message")
+            or payload.get("response")
+            or ""
+        )
+        return {
+            "memory_id": payload.get("memory_id"),
+            "memory_type": payload.get("memory_type", payload.get("kind", "memory")),
+            "status": payload.get("status"),
+            "content": content[:120],
+            "importance": payload.get("importance"),
+        }
+
+    def _record_memory_skip(self, thread_id: Optional[str], reason: str, content: str = "") -> None:
+        if not thread_id or thread_id not in self._memory_debug_by_thread:
+            return
+        self._memory_debug_by_thread[thread_id]["skips"].append(
+            {
+                "reason": reason,
+                "content": content[:120],
+            }
+        )
+
+    def _record_memory_write(self, thread_id: Optional[str], action: str, payload: Dict[str, Any]) -> None:
+        if not thread_id or thread_id not in self._memory_debug_by_thread:
+            return
+        preview = self._memory_debug_entry(payload)
+        preview["action"] = action
+        self._memory_debug_by_thread[thread_id]["writes"].append(preview)
+
+    def _record_memory_hit(
+        self,
+        thread_id: Optional[str],
+        query: str,
+        payloads: List[Dict[str, Any]],
+    ) -> None:
+        if not thread_id or thread_id not in self._memory_debug_by_thread or not payloads:
+            return
+        self._memory_debug_by_thread[thread_id]["reads"].append(
+            {
+                "query": query[:120],
+                "items": [self._memory_debug_entry(payload) for payload in payloads[:4]],
+            }
+        )
 
     def _save_memory_item(self, user_id: str, payload: Dict[str, Any]) -> None:
         if not self.enable_memory or self.persistence.store is None:
@@ -136,21 +236,152 @@ class SupportAgent:
         digest = hashlib.md5(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
-        self.persistence.store.put(self._memory_namespace(user_id), digest, payload)
+        self.persistence.store.put(self._telemetry_memory_namespace(user_id), digest, payload)
 
-    def _search_memory(self, user_id: str, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def _list_structured_memory(self, user_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         if not self.enable_memory or self.persistence.store is None:
             return []
         try:
             items = self.persistence.store.search(
-                self._memory_namespace(user_id),
-                query=query,
-                limit=limit,
+                self._structured_memory_namespace(user_id),
+                query=None,
+                limit=limit or settings.max_memory_items_per_user,
             )
-            return [item.value for item in items]
         except Exception as error:
-            logger.warning(f"Memory search failed: {error}")
+            logger.warning(f"Memory list failed: {error}")
             return []
+
+        results: List[Dict[str, Any]] = []
+        for item in items:
+            payload = dict(item.value)
+            payload.setdefault("memory_id", item.key)
+            results.append(payload)
+        return results
+
+    def _upsert_structured_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        payload: Dict[str, Any],
+        thread_id: Optional[str] = None,
+    ) -> None:
+        if not self.enable_memory or self.persistence.store is None:
+            return
+        clean_payload = dict(payload)
+        clean_payload["memory_id"] = memory_id
+        clean_payload.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+        self.persistence.store.put(
+            self._structured_memory_namespace(user_id),
+            memory_id,
+            clean_payload,
+        )
+        self._record_memory_write(thread_id, "upsert", clean_payload)
+
+    def _delete_structured_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        thread_id: Optional[str] = None,
+        reason: str = "delete",
+    ) -> None:
+        if not self.enable_memory or self.persistence.store is None:
+            return
+        with suppress(Exception):
+            self.persistence.store.delete(self._structured_memory_namespace(user_id), memory_id)
+        self._record_memory_write(
+            thread_id,
+            reason,
+            {"memory_id": memory_id, "memory_type": "open_issue", "content": memory_id},
+        )
+
+    def _load_structured_memory_item(self, user_id: str, memory_id: str) -> Optional[Dict[str, Any]]:
+        if not self.enable_memory or self.persistence.store is None:
+            return None
+        try:
+            item = self.persistence.store.get(self._structured_memory_namespace(user_id), memory_id)
+            if item is None:
+                return None
+            payload = dict(item.value)
+            payload.setdefault("memory_id", memory_id)
+            return payload
+        except Exception as error:
+            logger.warning(f"Memory get failed: {error}")
+            return None
+
+    def _memory_tokens(self, text: str) -> List[str]:
+        lowered = str(text or "").lower()
+        english_tokens = re.findall(r"[a-z0-9_]+", lowered)
+        chinese_tokens = re.findall(r"[\u4e00-\u9fff]{1,4}", str(text or ""))
+        tokens: List[str] = []
+        for token in english_tokens + chinese_tokens:
+            cleaned = token.strip()
+            if cleaned and cleaned not in tokens:
+                tokens.append(cleaned)
+        return tokens
+
+    def _memory_text(self, payload: Dict[str, Any]) -> str:
+        parts = [
+            payload.get("content", ""),
+            payload.get("summary", ""),
+            payload.get("value", ""),
+            payload.get("category", ""),
+            payload.get("issue_code", ""),
+            " ".join(payload.get("tags", []) or []),
+        ]
+        return " ".join(str(part) for part in parts if part).lower()
+
+    def _memory_score(self, payload: Dict[str, Any], query: str) -> float:
+        importance = MEMORY_IMPORTANCE.get(payload.get("memory_type", ""), 0.3)
+        score = importance
+        query_tokens = self._memory_tokens(query)
+        memory_text = self._memory_text(payload)
+        overlap = 0
+        for token in query_tokens:
+            if token and token.lower() in memory_text:
+                overlap += 1
+        if overlap:
+            score += overlap * 0.22
+        elif payload.get("memory_type") in {"profile", "preference"}:
+            score += 0.05
+        else:
+            score -= 0.15
+
+        if payload.get("memory_type") == "open_issue":
+            score += 0.08
+        return score
+
+    def _search_memory(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 5,
+        thread_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self.enable_memory or self.persistence.store is None:
+            return []
+
+        items = self._list_structured_memory(user_id, limit=settings.max_memory_items_per_user)
+        if not items:
+            self._record_memory_skip(thread_id, "no_memory_available", query)
+            return []
+
+        ranked = sorted(
+            items,
+            key=lambda payload: (
+                self._memory_score(payload, query),
+                payload.get("updated_at", ""),
+            ),
+            reverse=True,
+        )
+        filtered = [payload for payload in ranked if self._memory_score(payload, query) > 0.12][:limit]
+        if not filtered:
+            self._record_memory_skip(thread_id, "no_relevant_memory", query)
+            return []
+
+        self._record_memory_hit(thread_id, query, filtered)
+        return filtered
 
     def _build_role_agents(self) -> None:
         self.role_agents = {
@@ -166,6 +397,9 @@ class SupportAgent:
                     get_ticket_status,
                     get_user_tickets,
                     lookup_account,
+                    get_subscription_status,
+                    get_latest_invoice,
+                    explain_invoice_charge,
                     escalate_to_human,
                 ],
                 enable_hitl=True,
@@ -202,6 +436,346 @@ class SupportAgent:
 
     def _extract_json_payload(self, text: str) -> Optional[Dict[str, Any]]:
         return extract_json_payload(text)
+
+    def _contains_any(self, message: str, tokens: Tuple[str, ...]) -> bool:
+        lowered = message.lower()
+        return any(token in lowered for token in tokens)
+
+    def _is_subscription_status_query(self, message: str) -> bool:
+        subscription_tokens = ("套餐", "订阅", "续费", "plan", "subscription", "renewal")
+        status_tokens = ("当前", "什么", "哪个", "哪种", "下次", "自动续费", "状态", "费用", "席位")
+        lowered = message.lower()
+        return any(token in lowered for token in subscription_tokens) and any(
+            token in lowered for token in status_tokens
+        )
+
+    def _is_subscription_policy_query(self, message: str) -> bool:
+        subscription_tokens = ("套餐", "订阅", "续费", "plan", "subscription")
+        policy_tokens = ("取消", "退订", "关闭自动续费", "升级", "降级", "变更", "切换", "取消套餐")
+        lowered = message.lower()
+        return any(token in lowered for token in subscription_tokens) and any(
+            token in lowered for token in policy_tokens
+        )
+
+    def _is_billing_ticket_request(self, message: str) -> bool:
+        lowered = message.lower()
+        billing_tokens = ("账单", "发票", "扣费", "扣款", "invoice", "billing", "charge")
+        ticket_tokens = ("工单", "创建", "新建", "异常", "申请", "ticket")
+        return any(token in lowered for token in billing_tokens) and any(
+            token in lowered for token in ticket_tokens
+        )
+
+    def _is_invoice_explanation_query(self, message: str) -> bool:
+        lowered = message.lower()
+        billing_tokens = ("账单", "发票", "扣费", "扣款", "金额", "invoice", "billing", "charge")
+        explain_tokens = ("为什么", "说明", "解释", "扣了", "构成", "why", "explain")
+        return any(token in lowered for token in billing_tokens) and any(
+            token in lowered for token in explain_tokens
+        )
+
+    def _is_invoice_lookup_query(self, message: str) -> bool:
+        lowered = message.lower()
+        billing_tokens = ("账单", "发票", "invoice", "billing")
+        lookup_tokens = ("查询", "最近", "最新", "查看", "给我", "看看", "多少", "金额", "记录")
+        return any(token in lowered for token in billing_tokens) and any(
+            token in lowered for token in lookup_tokens
+        )
+
+    def _run_structured_knowledge_lookup(self, message: str) -> Optional[str]:
+        if self._is_subscription_policy_query(message):
+            lowered = message.lower()
+            if any(token in lowered for token in ("升级", "降级", "变更", "切换")):
+                return (
+                    "套餐变更说明：\n"
+                    "你可以在“设置 > 账单 > 订阅管理”中升级或降级套餐。\n"
+                    "升级会立即生效并按比例补差价；降级会在下一个计费周期开始时生效。\n"
+                    "下一步：如果你告诉我想升级还是降级，我可以继续指导你操作。\n"
+                    "来源：FAQ::billing"
+                )
+            return (
+                "取消订阅说明：\n"
+                "你可以在“设置 > 账单 > 订阅管理”中取消套餐。\n"
+                "取消后服务会持续到当前计费周期结束，已使用周期通常不支持按天退款。\n"
+                "下一步：如果你想先确认当前套餐和续费时间，我也可以继续帮你查询。\n"
+                "来源：FAQ::billing"
+            )
+        return None
+
+    def _run_structured_business_action(
+        self,
+        *,
+        user_id: str,
+        message: str,
+    ) -> Optional[str]:
+        if self._is_subscription_status_query(message):
+            return get_subscription_status.invoke({"user_id": user_id})
+
+        if self._is_billing_ticket_request(message):
+            return create_ticket.invoke(
+                {
+                    "user_id": user_id,
+                    "subject": "账单异常核查",
+                    "description": message,
+                    "priority": "high",
+                    "category": "billing",
+                }
+            )
+
+        if self._is_invoice_explanation_query(message):
+            latest_invoice = get_latest_invoice_record(user_id)
+            if latest_invoice:
+                return explain_invoice_charge.invoke({"invoice_id": latest_invoice["invoice_id"]})
+            return get_latest_invoice.invoke({"user_id": user_id})
+
+        if self._is_invoice_lookup_query(message):
+            return get_latest_invoice.invoke({"user_id": user_id})
+
+        return None
+
+    def _issue_code_from_text(self, text: str) -> Optional[str]:
+        lowered = text.lower()
+        issue_patterns = (
+            ("billing_anomaly", ("账单", "发票", "扣费", "扣款", "billing", "invoice", "charge")),
+            ("subscription_issue", ("套餐", "订阅", "续费", "subscription", "plan", "renewal")),
+            ("login_issue", ("登录", "登陆", "login", "signin", "sign in")),
+            ("password_issue", ("密码", "password", "reset")),
+            ("ticket_followup", ("工单", "ticket", "催单", "进度", "状态")),
+            ("technical_error", ("报错", "错误", "故障", "异常", "接口", "api", "error")),
+            ("account_issue", ("账户", "账号", "account", "member")),
+        )
+        for issue_code, tokens in issue_patterns:
+            if any(token in lowered for token in tokens):
+                return issue_code
+        return None
+
+    def _issue_content(self, issue_code: str, text: str) -> str:
+        content_map = {
+            "billing_anomaly": "用户存在账单/扣费问题，仍需继续跟进。",
+            "subscription_issue": "用户关注套餐、订阅或续费问题，仍需继续跟进。",
+            "login_issue": "用户存在登录问题，仍需继续跟进。",
+            "password_issue": "用户存在密码或重置密码问题，仍需继续跟进。",
+            "ticket_followup": "用户正在跟进工单进度或状态。",
+            "technical_error": "用户反馈产品报错或技术异常，仍需继续跟进。",
+            "account_issue": "用户存在账户相关问题，仍需继续跟进。",
+        }
+        default = "用户存在待跟进问题。"
+        snippet = text.strip().replace("\n", " ")
+        snippet = snippet[:90]
+        return f"{content_map.get(issue_code, default)} 用户原话：{snippet}"
+
+    def _extract_profile_memories(self, user_message: str) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        for pattern in (r"我叫([^\s，。,.!?？!]{1,12})", r"我的名字是([^\s，。,.!?？!]{1,12})"):
+            match = re.search(pattern, user_message, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                records.append(
+                    {
+                        "memory_id": "profile:name",
+                        "memory_type": "profile",
+                        "field": "name",
+                        "value": name,
+                        "content": f"用户姓名是 {name}",
+                        "importance": MEMORY_IMPORTANCE["profile"],
+                        "status": "active",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                break
+        return records
+
+    def _extract_preference_memories(self, user_message: str) -> List[Dict[str, Any]]:
+        lowered = user_message.lower()
+        records: List[Dict[str, Any]] = []
+        if any(token in lowered for token in ("中文", "汉语", "chinese")):
+            records.append(
+                {
+                    "memory_id": "preference:language",
+                    "memory_type": "preference",
+                    "field": "language",
+                    "value": "zh-CN",
+                    "content": "用户偏好中文沟通。",
+                    "importance": MEMORY_IMPORTANCE["preference"],
+                    "status": "active",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        elif any(token in lowered for token in ("英文", "英语", "english")):
+            records.append(
+                {
+                    "memory_id": "preference:language",
+                    "memory_type": "preference",
+                    "field": "language",
+                    "value": "en-US",
+                    "content": "用户偏好英文沟通。",
+                    "importance": MEMORY_IMPORTANCE["preference"],
+                    "status": "active",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+        if any(token in lowered for token in ("邮件通知", "邮箱通知", "email")):
+            records.append(
+                {
+                    "memory_id": "preference:contact_channel",
+                    "memory_type": "preference",
+                    "field": "contact_channel",
+                    "value": "email",
+                    "content": "用户偏好通过邮件接收通知。",
+                    "importance": MEMORY_IMPORTANCE["preference"],
+                    "status": "active",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        elif any(token in lowered for token in ("电话联系", "电话通知", "phone")):
+            records.append(
+                {
+                    "memory_id": "preference:contact_channel",
+                    "memory_type": "preference",
+                    "field": "contact_channel",
+                    "value": "phone",
+                    "content": "用户偏好电话联系。",
+                    "importance": MEMORY_IMPORTANCE["preference"],
+                    "status": "active",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        return records
+
+    def _should_track_open_issue(
+        self,
+        *,
+        intent: str,
+        active_agent: str,
+        sentiment: Optional[SentimentResult],
+        user_message: str,
+        assistant_message: str,
+    ) -> bool:
+        lowered_user = user_message.lower()
+        lowered_assistant = assistant_message.lower()
+        unresolved_tokens = ("没解决", "还没", "异常", "问题", "报错", "投诉", "失败", "无法", "不行")
+        if active_agent in {"action", "escalation"}:
+            return True
+        if intent in {"complaint", "request"} and any(token in lowered_user for token in unresolved_tokens):
+            return True
+        return bool(sentiment and sentiment.frustration_score >= 0.45) or any(
+            token in lowered_assistant for token in ("创建工单", "升级到人工")
+        )
+
+    def _is_resolution_message(self, text: str) -> bool:
+        lowered = text.lower()
+        resolution_tokens = (
+            "已经解决",
+            "解决了",
+            "可以了",
+            "没事了",
+            "搞定了",
+            "resolved",
+            "fixed",
+            "works now",
+        )
+        return any(token in lowered for token in resolution_tokens)
+
+    def _latest_open_issue(self, user_id: str) -> Optional[Dict[str, Any]]:
+        open_items = [
+            item
+            for item in self._list_structured_memory(user_id, limit=settings.max_memory_items_per_user)
+            if item.get("memory_type") == "open_issue"
+        ]
+        if not open_items:
+            return None
+        return sorted(open_items, key=lambda item: item.get("updated_at", ""), reverse=True)[0]
+
+    def _write_structured_memories(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        intent: str,
+        active_agent: str,
+        user_message: str,
+        assistant_message: str,
+        sentiment: Optional[SentimentResult],
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+
+        for record in self._extract_profile_memories(user_message):
+            self._upsert_structured_memory(
+                user_id=user_id,
+                memory_id=record["memory_id"],
+                payload=record,
+                thread_id=thread_id,
+            )
+
+        for record in self._extract_preference_memories(user_message):
+            self._upsert_structured_memory(
+                user_id=user_id,
+                memory_id=record["memory_id"],
+                payload=record,
+                thread_id=thread_id,
+            )
+
+        if self._is_resolution_message(user_message) or self._is_resolution_message(assistant_message):
+            issue_code = self._issue_code_from_text(user_message) or self._issue_code_from_text(assistant_message)
+            open_issue = (
+                self._load_structured_memory_item(user_id, f"open_issue:{issue_code}")
+                if issue_code
+                else self._latest_open_issue(user_id)
+            )
+            if open_issue is not None:
+                open_issue_id = str(open_issue.get("memory_id"))
+                self._delete_structured_memory(
+                    user_id=user_id,
+                    memory_id=open_issue_id,
+                    thread_id=thread_id,
+                    reason="resolve_open_issue",
+                )
+                resolved_issue_code = issue_code or str(open_issue.get("issue_code", "general_issue"))
+                resolved_record = {
+                    "memory_type": "resolved_issue",
+                    "issue_code": resolved_issue_code,
+                    "content": f"问题已解决：{open_issue.get('content', '')}",
+                    "summary": open_issue.get("summary", ""),
+                    "importance": MEMORY_IMPORTANCE["resolved_issue"],
+                    "status": "resolved",
+                    "updated_at": now,
+                }
+                self._upsert_structured_memory(
+                    user_id=user_id,
+                    memory_id=f"resolved_issue:{resolved_issue_code}",
+                    payload=resolved_record,
+                    thread_id=thread_id,
+                )
+            else:
+                self._record_memory_skip(thread_id, "resolution_without_open_issue", user_message)
+            return
+
+        issue_code = self._issue_code_from_text(user_message)
+        if issue_code and self._should_track_open_issue(
+            intent=intent,
+            active_agent=active_agent,
+            sentiment=sentiment,
+            user_message=user_message,
+            assistant_message=assistant_message,
+        ):
+            open_issue_record = {
+                "memory_type": "open_issue",
+                "issue_code": issue_code,
+                "category": issue_code.split("_", 1)[0],
+                "content": self._issue_content(issue_code, user_message),
+                "summary": user_message[:120],
+                "importance": MEMORY_IMPORTANCE["open_issue"],
+                "status": "open",
+                "updated_at": now,
+            }
+            self._upsert_structured_memory(
+                user_id=user_id,
+                memory_id=f"open_issue:{issue_code}",
+                payload=open_issue_record,
+                thread_id=thread_id,
+            )
+        else:
+            self._record_memory_skip(thread_id, "no_structured_issue_written", user_message)
 
     def _analyze_and_route(
         self,
@@ -279,6 +853,38 @@ class SupportAgent:
             except Exception as error:
                 logger.warning(f"LLM analyze+route failed, fallback to heuristic routing: {error}")
 
+        if self._is_subscription_status_query(message):
+            needs_knowledge = False
+            needs_action = True
+            selected_agent = "action"
+            execution_steps = []
+            needs_action_after_knowledge = False
+            route_reason = f"{route_reason}+subscription_status"
+
+        if self._is_invoice_explanation_query(message) or self._is_invoice_lookup_query(message):
+            needs_knowledge = False
+            needs_action = True
+            selected_agent = "action"
+            execution_steps = []
+            needs_action_after_knowledge = False
+            route_reason = f"{route_reason}+billing_action"
+
+        if self._is_billing_ticket_request(message):
+            needs_knowledge = False
+            needs_action = True
+            selected_agent = "action"
+            execution_steps = []
+            needs_action_after_knowledge = False
+            route_reason = f"{route_reason}+billing_ticket"
+
+        if self._is_subscription_policy_query(message):
+            needs_knowledge = True
+            needs_action = False
+            selected_agent = "knowledge"
+            execution_steps = []
+            needs_action_after_knowledge = False
+            route_reason = f"{route_reason}+subscription_policy"
+
         if intent == "request" and "怎么" in message:
             needs_knowledge = True
 
@@ -316,6 +922,12 @@ class SupportAgent:
         elif selected_agent == "supervisor" and execution_steps:
             selected_agent = execution_steps[0]
 
+        step_summary = " -> ".join(execution_steps) if execution_steps else "direct_respond"
+        decision_summary = (
+            f"意图={intent}，风险={risk}，首选代理={selected_agent}，"
+            f"执行路径={step_summary}，原因={route_reason or 'heuristic'}。"
+        )
+
         return {
             "intent": intent,
             "risk": risk,
@@ -328,6 +940,7 @@ class SupportAgent:
             "execution_steps": execution_steps,
             "needs_action_after_knowledge": needs_action_after_knowledge,
             "route_reason": route_reason,
+            "decision_summary": decision_summary,
         }
     def _plan_route(
         self,
@@ -366,14 +979,157 @@ class SupportAgent:
     def _agent_thread_id(self, thread_id: str, role: str) -> str:
         return f"{settings.langgraph_thread_prefix}:{role}:{thread_id}"
 
+    def _tool_label(self, tool_name: str) -> str:
+        return TOOL_LABELS.get(tool_name, tool_name or "未知动作")
+
+    def _summarize_tool_args(self, args: Any, limit: int = 4) -> Dict[str, Any]:
+        if not isinstance(args, dict):
+            return {}
+
+        preview: Dict[str, Any] = {}
+        for index, (key, value) in enumerate(args.items()):
+            if index >= limit:
+                break
+            if isinstance(value, (int, float, bool)) or value is None:
+                preview[str(key)] = value
+                continue
+            if isinstance(value, str):
+                preview[str(key)] = value if len(value) <= 80 else f"{value[:77]}..."
+                continue
+            serialized = json.dumps(value, ensure_ascii=False)
+            preview[str(key)] = serialized if len(serialized) <= 80 else f"{serialized[:77]}..."
+        return preview
+
+    def _interrupt_reason(self, tool_name: str, description: Optional[str] = None) -> str:
+        if description:
+            return str(description).strip()
+        return f"{self._tool_label(tool_name)} 属于高风险写操作，需要人工审批。"
+
+    def _build_approval_payload(self, interrupts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not interrupts:
+            return None
+
+        tools: List[Dict[str, Any]] = []
+        for item in interrupts:
+            tool_name = str(item.get("tool", "unknown_tool"))
+            tools.append(
+                {
+                    "id": item.get("id"),
+                    "tool": tool_name,
+                    "tool_label": item.get("tool_label") or self._tool_label(tool_name),
+                    "reason": item.get("reason") or self._interrupt_reason(tool_name),
+                    "args_preview": item.get("args_preview", {}),
+                    "allowed_decisions": item.get("allowed_decisions", ["approve", "edit", "reject"]),
+                }
+            )
+
+        count = len(tools)
+        labels = "、".join(tool["tool_label"] for tool in tools)
+        return {
+            "count": count,
+            "required_decisions": count,
+            "tools": tools,
+            "message": f"当前有 {count} 个待审批动作：{labels}。请在 /resume 中提交 {count} 条 decisions。",
+        }
+
+    def _build_next_action(
+        self,
+        *,
+        run_status: str,
+        thread_id: Optional[str],
+        approval: Optional[Dict[str, Any]] = None,
+        error_message: str = "",
+    ) -> str:
+        if run_status == "completed":
+            return "本轮已完成，无需继续操作。"
+        if run_status == "interrupted":
+            count = int((approval or {}).get("required_decisions", 1))
+            return f"请调用 /runs/{thread_id}/resume，并提交 {count} 条 decisions。"
+
+        if "未找到待审批线程" in error_message:
+            return "请确认使用的是上一次 /chat 返回的 thread_id。"
+        if approval:
+            count = int(approval.get("required_decisions", len(approval.get("tools", [])) or 1))
+            return f"请检查 decisions 数量是否与待审批动作一致，然后重新调用 /runs/{thread_id}/resume。当前应提交 {count} 条 decisions。"
+        return "请检查请求参数或服务日志后重试。"
+
+    def _format_resume_error(self, error: Exception, pending_state: OrchestrationState) -> str:
+        raw = str(error)
+        approval = self._build_approval_payload(pending_state.get("interrupts", []))
+        mismatch = re.search(r"human decisions \((\d+)\).*hanging tool calls \((\d+)\)", raw, re.IGNORECASE)
+        if mismatch and approval:
+            received = mismatch.group(1)
+            expected = mismatch.group(2)
+            tools = "、".join(tool["tool_label"] for tool in approval.get("tools", []))
+            return (
+                f"恢复会话失败：当前有 {expected} 个待审批动作"
+                f"（{tools}），但只收到了 {received} 条 decisions。"
+            )
+        return f"恢复会话失败：{raw}"
+
     def _extract_interrupts(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_interrupts = result.get("__interrupt__", []) if isinstance(result, dict) else []
         payloads: List[Dict[str, Any]] = []
         for item in raw_interrupts:
+            interrupt_id = getattr(item, "id", None)
+            value = getattr(item, "value", item)
+
+            if isinstance(value, dict) and isinstance(value.get("action_requests"), list):
+                review_configs = value.get("review_configs", [])
+                for index, action_request in enumerate(value.get("action_requests", [])):
+                    if not isinstance(action_request, dict):
+                        continue
+                    review_config = (
+                        review_configs[index]
+                        if index < len(review_configs) and isinstance(review_configs[index], dict)
+                        else {}
+                    )
+                    tool_name = str(action_request.get("name", "unknown_tool"))
+                    payloads.append(
+                        {
+                            "id": f"{interrupt_id}:{index}" if interrupt_id is not None else f"interrupt:{index}",
+                            "interrupt_id": interrupt_id,
+                            "tool": tool_name,
+                            "tool_label": self._tool_label(tool_name),
+                            "reason": self._interrupt_reason(tool_name, action_request.get("description")),
+                            "args_preview": self._summarize_tool_args(action_request.get("args", {})),
+                            "allowed_decisions": review_config.get(
+                                "allowed_decisions", ["approve", "edit", "reject"]
+                            ),
+                        }
+                    )
+                continue
+
+            tool_name = "unknown_tool"
+            args: Dict[str, Any] = {}
+            description: Optional[str] = None
+            if isinstance(value, dict):
+                nested_action = value.get("action")
+                if isinstance(nested_action, dict):
+                    tool_name = str(
+                        nested_action.get("name")
+                        or value.get("tool")
+                        or value.get("name")
+                        or value.get("action_name")
+                        or "unknown_tool"
+                    )
+                    args = nested_action.get("args", {})
+                else:
+                    tool_name = str(
+                        value.get("tool") or value.get("name") or value.get("action_name") or "unknown_tool"
+                    )
+                    args = value.get("args", {})
+                description = value.get("description")
+
             payloads.append(
                 {
-                    "id": getattr(item, "id", None),
-                    "value": getattr(item, "value", item),
+                    "id": str(interrupt_id) if interrupt_id is not None else None,
+                    "interrupt_id": interrupt_id,
+                    "tool": tool_name,
+                    "tool_label": self._tool_label(tool_name),
+                    "reason": self._interrupt_reason(tool_name, description),
+                    "args_preview": self._summarize_tool_args(args),
+                    "allowed_decisions": ["approve", "edit", "reject"],
                 }
             )
         return payloads
@@ -400,12 +1156,22 @@ class SupportAgent:
 
         lowered = message.lower()
         if role == "knowledge":
+            structured_lookup = self._run_structured_knowledge_lookup(message)
+            if structured_lookup is not None:
+                return intro + structured_lookup
             try:
                 return intro + search_faq.invoke({"query": message, "category": None})
             except Exception as error:
                 return intro + f"知识检索失败：{error}"
 
         if role == "action":
+            structured_action = self._run_structured_business_action(
+                user_id=user_id,
+                message=message,
+            )
+            if structured_action is not None:
+                return intro + structured_action
+
             if "工单" in message and any(token in lowered for token in ("创建", "create", "open", "new")):
                 return intro + create_ticket.invoke(
                     {
@@ -413,6 +1179,7 @@ class SupportAgent:
                         "subject": message[:80],
                         "description": message,
                         "priority": "medium",
+                        "category": "general",
                     }
                 )
             if "状态" in message or "status" in lowered:
@@ -478,7 +1245,7 @@ class SupportAgent:
     ) -> None:
         if not self.enable_memory:
             return
-        payload = {
+        telemetry_payload = {
             "kind": "conversation_turn",
             "thread_id": thread_id,
             "intent": intent,
@@ -489,20 +1256,16 @@ class SupportAgent:
             "frustration_score": sentiment.frustration_score if sentiment else 0.0,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        self._save_memory_item(user_id=user_id, payload=payload)
-
-        for pattern in (r"我叫([^\s，。,.!?？!]+)", r"my name is ([a-zA-Z]+)"):
-            match = re.search(pattern, user_message, re.IGNORECASE)
-            if match:
-                self._save_memory_item(
-                    user_id=user_id,
-                    payload={
-                        "kind": "user_fact",
-                        "fact": f"用户姓名可能是：{match.group(1)}",
-                        "thread_id": thread_id,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
+        self._save_memory_item(user_id=user_id, payload=telemetry_payload)
+        self._write_structured_memories(
+            user_id=user_id,
+            thread_id=thread_id,
+            intent=intent,
+            active_agent=active_agent,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            sentiment=sentiment,
+        )
 
     def _call_role_agent(
         self,
@@ -561,6 +1324,10 @@ class SupportAgent:
             sources.append("Fallback Policy")
         return self._merge_unique([], sources)
 
+    def _trace_preview(self, state: OrchestrationState, limit: int = 8) -> List[Dict[str, Any]]:
+        trace_events = state.get("trace_events", [])
+        return trace_events[-limit:]
+
     def chat(
         self,
         user_id: str,
@@ -572,6 +1339,7 @@ class SupportAgent:
         trace_id = str(uuid.uuid4())
         self._thread_user[thread] = user_id
         self._trace_by_thread[thread] = trace_id
+        self._reset_memory_debug(thread)
 
         baseline_sentiment = (
             self.sentiment_analyzer.analyze(message)
@@ -593,6 +1361,9 @@ class SupportAgent:
             "selected_agent": "supervisor",
             "active_agent": "supervisor",
             "execution_steps": [],
+            "route_path": [],
+            "trace_events": [],
+            "decision_summary": "",
             "needs_knowledge": False,
             "needs_action": False,
             "needs_action_after_knowledge": False,
@@ -633,6 +1404,24 @@ class SupportAgent:
                 citations=self._extract_citations(fallback),
                 active_agent=initial_state["selected_agent"],
                 trace_id=trace_id,
+                route_path=["fallback"],
+                validation_notes=[],
+                trace_preview=[
+                    build_trace_event(
+                        node="fallback",
+                        agent="supervisor",
+                        summary="图执行失败，已回退到模板回复。",
+                        status="error",
+                        details={"error": str(error)},
+                    )
+                ],
+                decision_summary="图执行失败，已使用回退策略直接回复。",
+                approval=None,
+                memory_debug=self._memory_debug_snapshot(thread),
+                next_action=self._build_next_action(
+                    run_status="completed",
+                    thread_id=thread,
+                ),
             )
 
         if final_state.get("run_status") == "interrupted":
@@ -642,6 +1431,7 @@ class SupportAgent:
             wait_message = "检测到高风险动作，已暂停执行，等待人工审批（approve/edit/reject）。"
             self._record_history(user_id, "assistant", wait_message)
             sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
+            approval = self._build_approval_payload(final_state.get("interrupts", []))
             return SupportResponse(
                 message=wait_message,
                 intent=final_state.get("intent", "other"),
@@ -655,6 +1445,17 @@ class SupportAgent:
                 citations=final_state.get("citations", []),
                 active_agent=pending_role,
                 trace_id=trace_id,
+                route_path=final_state.get("route_path", []),
+                validation_notes=final_state.get("validation_notes", []),
+                trace_preview=self._trace_preview(final_state),
+                decision_summary=final_state.get("decision_summary", ""),
+                approval=approval,
+                memory_debug=self._memory_debug_snapshot(thread),
+                next_action=self._build_next_action(
+                    run_status="interrupted",
+                    thread_id=thread,
+                    approval=approval,
+                ),
             )
 
         response_message = final_state.get("final_message") or final_state.get("tool_text") or final_state.get(
@@ -690,6 +1491,16 @@ class SupportAgent:
             citations=citations,
             active_agent=active_agent,
             trace_id=trace_id,
+            route_path=final_state.get("route_path", []),
+            validation_notes=final_state.get("validation_notes", []),
+            trace_preview=self._trace_preview(final_state),
+            decision_summary=final_state.get("decision_summary", ""),
+            approval=None,
+            memory_debug=self._memory_debug_snapshot(thread),
+            next_action=self._build_next_action(
+                run_status="completed",
+                thread_id=thread,
+            ),
         )
     def resume(
         self,
@@ -713,6 +1524,24 @@ class SupportAgent:
                 run_status="error",
                 active_agent="unknown",
                 trace_id=trace_id,
+                route_path=["resume"],
+                validation_notes=[],
+                trace_preview=[
+                    build_trace_event(
+                        node="resume",
+                        agent="unknown",
+                        summary="未找到待审批线程。",
+                        status="error",
+                    )
+                ],
+                decision_summary="恢复失败：未找到待审批线程。",
+                approval=None,
+                memory_debug=self._memory_debug_snapshot(thread_id),
+                next_action=self._build_next_action(
+                    run_status="error",
+                    thread_id=thread_id,
+                    error_message="未找到待审批线程，无法恢复。",
+                ),
             )
 
         if not self.llm_enabled or role not in self.role_agents:
@@ -727,6 +1556,16 @@ class SupportAgent:
                 run_status="completed",
                 active_agent=role,
                 trace_id=trace_id,
+                route_path=pending_state.get("route_path", []),
+                validation_notes=pending_state.get("validation_notes", []),
+                trace_preview=self._trace_preview(pending_state),
+                decision_summary=pending_state.get("decision_summary", ""),
+                approval=None,
+                memory_debug=self._memory_debug_snapshot(thread_id),
+                next_action=self._build_next_action(
+                    run_status="completed",
+                    thread_id=thread_id,
+                ),
             )
 
         agent = self.role_agents[role]
@@ -747,8 +1586,9 @@ class SupportAgent:
             )
         except Exception as error:
             logger.error(f"Resume failed: {error}")
+            approval = self._build_approval_payload(pending_state.get("interrupts", []))
             return SupportResponse(
-                message=f"恢复会话失败：{error}",
+                message=self._format_resume_error(error, pending_state),
                 intent="resume",
                 sentiment=neutral_sentiment,
                 sources=["HITL Middleware"],
@@ -756,10 +1596,45 @@ class SupportAgent:
                 run_status="error",
                 active_agent=role,
                 trace_id=trace_id,
+                route_path=pending_state.get("route_path", []),
+                validation_notes=pending_state.get("validation_notes", []),
+                trace_preview=[
+                    *self._trace_preview(pending_state),
+                    build_trace_event(
+                        node=role,
+                        agent=role,
+                        summary="恢复执行失败。",
+                        status="error",
+                        details={"error": str(error)},
+                    ),
+                ][-8:],
+                decision_summary=pending_state.get("decision_summary", ""),
+                approval=approval,
+                memory_debug=self._memory_debug_snapshot(thread_id),
+                next_action=self._build_next_action(
+                    run_status="error",
+                    thread_id=thread_id,
+                    approval=approval,
+                    error_message=str(error),
+                ),
             )
 
         interrupts = self._extract_interrupts(result)
         if interrupts:
+            resumed_trace = [
+                *pending_state.get("trace_events", []),
+                build_trace_event(
+                    node=role,
+                    agent=role,
+                    summary="恢复后仍需继续人工审批。",
+                    status="interrupted",
+                    details={
+                        "interrupt_count": len(interrupts),
+                        "tools": [item.get("tool_label") or item.get("tool") for item in interrupts],
+                    },
+                ),
+            ]
+            approval = self._build_approval_payload(interrupts)
             return SupportResponse(
                 message="仍有待审批动作，请继续提交决策。",
                 intent="resume",
@@ -770,6 +1645,17 @@ class SupportAgent:
                 interrupts=interrupts,
                 active_agent=role,
                 trace_id=trace_id,
+                route_path=pending_state.get("route_path", []),
+                validation_notes=pending_state.get("validation_notes", []),
+                trace_preview=resumed_trace[-8:],
+                decision_summary=pending_state.get("decision_summary", ""),
+                approval=approval,
+                memory_debug=self._memory_debug_snapshot(thread_id),
+                next_action=self._build_next_action(
+                    run_status="interrupted",
+                    thread_id=thread_id,
+                    approval=approval,
+                ),
             )
 
         resumed_text = self._extract_ai_text(result)
@@ -781,6 +1667,15 @@ class SupportAgent:
             merged_state.get("citations", []),
             self._extract_citations(resumed_text),
         )
+        merged_state["trace_events"] = [
+            *merged_state.get("trace_events", []),
+            build_trace_event(
+                node=role,
+                agent=role,
+                summary="审批完成，继续执行图流程。",
+                status="completed",
+            ),
+        ]
 
         if role == "knowledge":
             merged_state["retrieval_text"] = resumed_text
@@ -820,6 +1715,16 @@ class SupportAgent:
             citations=merged_state.get("citations", []),
             active_agent=merged_state.get("selected_agent", role),
             trace_id=trace_id,
+            route_path=merged_state.get("route_path", []),
+            validation_notes=merged_state.get("validation_notes", []),
+            trace_preview=self._trace_preview(merged_state),
+            decision_summary=merged_state.get("decision_summary", ""),
+            approval=None,
+            memory_debug=self._memory_debug_snapshot(thread_id),
+            next_action=self._build_next_action(
+                run_status="completed",
+                thread_id=thread_id,
+            ),
         )
 
     def stream_chat(
@@ -840,14 +1745,15 @@ class SupportAgent:
             yield {
                 "type": "interrupt",
                 "thread_id": response.thread_id,
-                "interrupts": response.interrupts,
+                "approval": response.approval,
+                "next_action": response.next_action,
             }
-            yield {"type": "done", "payload": response.to_dict()}
+            yield {"type": "done", "payload": response.to_dict(include_debug=True)}
             return
 
         for token in response.message.split():
             yield {"type": "token", "content": token}
-        yield {"type": "done", "payload": response.to_dict()}
+        yield {"type": "done", "payload": response.to_dict(include_debug=True)}
 
     def reindex_knowledge(self, clear_existing: bool = False) -> str:
         return reindex_knowledge_base.invoke({"clear_existing": clear_existing})
@@ -861,6 +1767,7 @@ class SupportAgent:
                 self._pending_state.pop(thread, None)
                 self._thread_user.pop(thread, None)
                 self._trace_by_thread.pop(thread, None)
+                self._memory_debug_by_thread.pop(thread, None)
 
     def get_conversation_history(self, user_id: str, limit: int = 10) -> List[Dict[str, str]]:
         with self._lock:

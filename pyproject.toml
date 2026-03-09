@@ -1,0 +1,69 @@
+[project]
+name = "customer-support-agent"
+version = "1.0.0"
+description = "Chinese-first customer support agent demo built with LangGraph and FastAPI"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "aiosqlite==0.19.0",
+  "chromadb==0.4.22",
+  "fastapi==0.135.1",
+  "httpx==0.28.1",
+  "langchain==1.2.10",
+  "langchain-community==0.4.1",
+  "langchain-openai==1.1.10",
+  "langgraph==1.0.10",
+  "langgraph-checkpoint-postgres==3.0.4",
+  "nltk==3.8.1",
+  "numpy<2",
+  "psycopg[binary,pool]==3.3.3",
+  "pydantic==2.12.5",
+  "pydantic-settings==2.13.1",
+  "python-dotenv==1.0.0",
+  "python-json-logger==2.0.7",
+  "python-multipart==0.0.6",
+  "rank-bm25==0.2.2",
+  "sentence-transformers==5.2.3",
+  "slowapi==0.1.9",
+  "sqlalchemy==2.0.25",
+  "sse-starlette==3.3.2",
+  "tenacity==9.1.4",
+  "textblob==0.17.1",
+  "uvicorn[standard]==0.41.0",
+  "websockets==12.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==7.4.4",
+  "pytest-asyncio==0.23.3",
+  "pytest-cov==4.1.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+]
+filterwarnings = [
+  "ignore:urllib3 .* doesn't match a supported version:requests.exceptions.RequestsDependencyWarning",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+  "tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "if __name__ == .__main__.:",
+]

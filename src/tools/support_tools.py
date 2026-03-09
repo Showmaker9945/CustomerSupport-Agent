@@ -5,11 +5,12 @@ Provides ticket management, account lookup, and FAQ search tools
 that can be used by LangChain agents.
 """
 
+import copy
 import json
 import logging
 import threading
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,8 +52,8 @@ def _load_mock_accounts() -> Dict[str, Any]:
                 "team_limit": 20,
             },
             "billing": {
-                "invoice_amount": "$99.00",
-                "last_payment": "2026-02-01",
+                "invoice_amount": "¥199.00",
+                "last_payment": "2026-03-01",
                 "payment_method": "Visa **** 4242",
             },
             "support_history": {
@@ -88,6 +89,7 @@ class Ticket:
     user_id: str
     subject: str
     description: str
+    category: str = "general"
     status: TicketStatus = TicketStatus.OPEN
     priority: TicketPriority = TicketPriority.MEDIUM
     assigned_to: Optional[str] = None
@@ -198,6 +200,7 @@ class TicketStore:
         subject: str,
         description: str,
         priority: str = "medium",
+        category: str = "general",
         metadata: Optional[Dict[str, Any]] = None
     ) -> Ticket:
         """
@@ -219,6 +222,7 @@ class TicketStore:
                 user_id=user_id,
                 subject=subject,
                 description=description,
+                category=category,
                 priority=TicketPriority(priority.lower()),
                 metadata=metadata or {}
             )
@@ -352,6 +356,179 @@ class TicketStore:
 MOCK_ACCOUNTS: Dict[str, Any] = _load_mock_accounts()
 
 
+def _build_mock_subscriptions() -> Dict[str, Dict[str, Any]]:
+    """Build compact subscription records for demo flows."""
+    return {
+        "user_001": {
+            "user_id": "user_001",
+            "plan_name": "Pro 团队版",
+            "plan_code": "pro_monthly",
+            "status": "active",
+            "billing_cycle": "monthly",
+            "renewal_date": "2026-04-01",
+            "currency": "CNY",
+            "amount": 199.0,
+            "auto_renew": True,
+            "seat_quota": 20,
+            "seats_used": 8,
+            "benefits": ["高级知识库检索", "团队协作权限", "优先客服支持"],
+        },
+        "user_002": {
+            "user_id": "user_002",
+            "plan_name": "Free 免费版",
+            "plan_code": "free",
+            "status": "active",
+            "billing_cycle": "monthly",
+            "renewal_date": None,
+            "currency": "CNY",
+            "amount": 0.0,
+            "auto_renew": False,
+            "seat_quota": 3,
+            "seats_used": 1,
+            "benefits": ["基础问答", "单人空间"],
+        },
+    }
+
+
+def _build_mock_invoices() -> Dict[str, List[Dict[str, Any]]]:
+    """Build compact invoice ledger for demo flows."""
+    return {
+        "user_001": [
+            {
+                "invoice_id": "INV-202603-0001",
+                "user_id": "user_001",
+                "issued_at": "2026-03-01",
+                "period_start": "2026-03-01",
+                "period_end": "2026-03-31",
+                "status": "paid",
+                "currency": "CNY",
+                "total_amount": 199.0,
+                "payment_method": "Visa **** 4242",
+                "summary": "2026 年 3 月 Pro 团队版续费",
+                "line_items": [
+                    {
+                        "name": "Pro 团队版月费",
+                        "amount": 159.0,
+                        "type": "subscription",
+                        "reason": "3 月套餐续费",
+                    },
+                    {
+                        "name": "超额存储包 100GB",
+                        "amount": 40.0,
+                        "type": "usage",
+                        "reason": "2 月存储使用超出基础额度",
+                    },
+                ],
+                "explanation": [
+                    "本次扣费的主体是 3 月份 Pro 团队版月费。",
+                    "额外 40 元来自上一个计费周期的超额存储。",
+                    "当前账单已支付成功，没有重复扣款迹象。",
+                ],
+            },
+            {
+                "invoice_id": "INV-202602-0008",
+                "user_id": "user_001",
+                "issued_at": "2026-02-01",
+                "period_start": "2026-02-01",
+                "period_end": "2026-02-28",
+                "status": "paid",
+                "currency": "CNY",
+                "total_amount": 159.0,
+                "payment_method": "Visa **** 4242",
+                "summary": "2026 年 2 月 Pro 团队版续费",
+                "line_items": [
+                    {
+                        "name": "Pro 团队版月费",
+                        "amount": 159.0,
+                        "type": "subscription",
+                        "reason": "2 月套餐续费",
+                    }
+                ],
+                "explanation": [
+                    "本次账单仅包含标准月费，没有额外用量费用。"
+                ],
+            },
+        ],
+        "user_002": [],
+    }
+
+
+MOCK_SUBSCRIPTIONS = _build_mock_subscriptions()
+MOCK_INVOICES = _build_mock_invoices()
+
+
+def get_account_record(user_id: str) -> Optional[Dict[str, Any]]:
+    """Get a safe copy of account data."""
+    account = MOCK_ACCOUNTS.get(user_id)
+    return copy.deepcopy(account) if account else None
+
+
+def get_subscription_record(user_id: str) -> Optional[Dict[str, Any]]:
+    """Get a safe copy of subscription data."""
+    record = MOCK_SUBSCRIPTIONS.get(user_id)
+    if record:
+        return copy.deepcopy(record)
+
+    account = get_account_record(user_id)
+    if not account:
+        return None
+
+    status = str(account.get("status", "active"))
+    return {
+        "user_id": user_id,
+        "plan_name": f"{account.get('plan', 'Unknown')} 套餐",
+        "plan_code": str(account.get("plan", "unknown")).lower(),
+        "status": status,
+        "billing_cycle": "monthly",
+        "renewal_date": None if status != "active" else (
+            datetime.now(timezone.utc) + timedelta(days=30)
+        ).date().isoformat(),
+        "currency": "USD",
+        "amount": 0.0,
+        "auto_renew": status == "active",
+        "seat_quota": account.get("usage", {}).get("team_limit", 1),
+        "seats_used": account.get("usage", {}).get("team_members", 1),
+        "benefits": ["基础支持"],
+    }
+
+
+def get_latest_invoice_record(user_id: str) -> Optional[Dict[str, Any]]:
+    """Get latest invoice for a user."""
+    invoices = MOCK_INVOICES.get(user_id, [])
+    if not invoices:
+        return None
+    sorted_invoices = sorted(invoices, key=lambda item: item.get("issued_at", ""), reverse=True)
+    return copy.deepcopy(sorted_invoices[0])
+
+
+def get_invoice_record(invoice_id: str) -> Optional[Dict[str, Any]]:
+    """Get invoice by invoice ID."""
+    normalized = str(invoice_id).strip().upper()
+    for invoices in MOCK_INVOICES.values():
+        for invoice in invoices:
+            if str(invoice.get("invoice_id", "")).upper() == normalized:
+                return copy.deepcopy(invoice)
+    return None
+
+
+def _format_money(amount: float, currency: str) -> str:
+    if str(currency).upper() == "CNY":
+        return f"¥{amount:.2f}"
+    return f"{str(currency).upper()} {amount:.2f}"
+
+
+def _ticket_next_step(ticket: Ticket) -> str:
+    if ticket.status == TicketStatus.OPEN:
+        return "下一步：客服会先完成分诊，通常会在 24 小时内给出首轮回复。"
+    if ticket.status == TicketStatus.IN_PROGRESS:
+        return "下一步：工单正在处理中，请留意邮件或站内通知。"
+    if ticket.status == TicketStatus.WAITING_CUSTOMER:
+        return "下一步：当前等待你补充信息，补充后会继续处理。"
+    if ticket.status == TicketStatus.RESOLVED:
+        return "下一步：如果问题仍存在，可以直接回复当前工单继续跟进。"
+    return "下一步：如需继续处理，可补充说明后重新联系支持团队。"
+
+
 # Global FAQ store instance
 _faq_store: Optional[FAQStore] = None
 
@@ -407,11 +584,23 @@ def search_faq(query: str, category: Optional[str] = None) -> str:
     try:
         store = get_faq_store()
         results = store.search_hybrid(query, category=category, top_k=settings.rag_top_k)
+        trace = store.get_last_query_trace()
 
         if not results:
             return f"未找到与该问题相关的知识：{query}"
 
         output_parts = [f"找到 {len(results)} 条相关知识（混合检索+重排）：\n"]
+
+        if settings.debug:
+            strategy_parts = []
+            if trace.get("effective_category"):
+                strategy_parts.append(f"分类推断：{trace['effective_category']}")
+            if trace.get("sub_queries"):
+                strategy_parts.append(f"子问题：{len(trace['sub_queries'])} 个")
+            if trace.get("rewrite_used"):
+                strategy_parts.append("启用改写兜底")
+            if strategy_parts:
+                output_parts.append("检索策略：" + " | ".join(strategy_parts))
 
         for i, result in enumerate(results, 1):
             output_parts.append(
@@ -456,7 +645,8 @@ def create_ticket(
     user_id: str,
     subject: str,
     description: str,
-    priority: str = "medium"
+    priority: str = "medium",
+    category: str = "general",
 ) -> str:
     """
     为用户创建新的客服工单。
@@ -466,6 +656,7 @@ def create_ticket(
         subject: 问题主题
         description: 问题详情
         priority: 优先级（low/medium/high/urgent）
+        category: 工单分类（general/billing/account/technical/escalation）
 
     Returns:
         创建结果和工单号
@@ -476,16 +667,19 @@ def create_ticket(
             user_id=user_id,
             subject=subject,
             description=description,
-            priority=priority
+            priority=priority,
+            category=category,
         )
 
         return (
             f"工单创建成功。\n"
             f"工单号：{ticket.ticket_id}\n"
+            f"分类：{ticket.category}\n"
             f"状态：{ticket.status.value}\n"
             f"优先级：{ticket.priority.value}\n"
             f"创建时间：{ticket.created_at}\n"
-            f"后续进展会通过邮件通知你。"
+            f"{_ticket_next_step(ticket)}\n"
+            f"来源：Support Ticket Store"
         )
 
     except Exception as e:
@@ -512,10 +706,11 @@ def get_ticket_status(ticket_id: str) -> str:
         output = [
             f"工单号：{ticket.ticket_id}",
             f"主题：{ticket.subject}",
+            f"分类：{ticket.category}",
             f"状态：{ticket.status.value}",
             f"优先级：{ticket.priority.value}",
             f"创建时间：{ticket.created_at}",
-            f"更新时间：{ticket.updated_at}"
+            f"更新时间：{ticket.updated_at}",
         ]
 
         if ticket.assigned_to:
@@ -532,6 +727,8 @@ def get_ticket_status(ticket_id: str) -> str:
             for note in ticket.notes:
                 output.append(f"- {note}")
 
+        output.append(_ticket_next_step(ticket))
+        output.append("来源：Support Ticket Store")
         return "\n".join(output)
 
     except Exception as e:
@@ -566,11 +763,15 @@ def update_ticket(
             return f"未找到工单 {ticket_id}。"
 
         result = f"工单 {ticket_id} 更新成功。\n"
+        result += f"分类：{ticket.category}\n"
         result += f"新状态：{ticket.status.value}\n"
         result += f"更新时间：{ticket.updated_at}"
 
         if notes:
             result += f"\n新增备注：{notes}"
+
+        result += f"\n{_ticket_next_step(ticket)}"
+        result += "\n来源：Support Ticket Store"
 
         return result
 
@@ -601,11 +802,13 @@ def get_user_tickets(user_id: str, status: Optional[str] = None) -> str:
         for ticket in tickets:
             output.append(
                 f"{ticket.ticket_id} - {ticket.subject}\n"
+                f"分类：{ticket.category} | "
                 f"状态：{ticket.status.value} | "
                 f"优先级：{ticket.priority.value} | "
                 f"创建日期：{ticket.created_at[:10]}"
             )
 
+        output.append("\n来源：Support Ticket Store")
         return "\n".join(output)
 
     except Exception as e:
@@ -623,10 +826,12 @@ def lookup_account(user_id: str) -> str:
         账户详情文本
     """
     try:
-        account = MOCK_ACCOUNTS.get(user_id)
+        account = get_account_record(user_id)
 
         if not account:
             return f"未找到用户 {user_id} 的账户信息。"
+
+        subscription = get_subscription_record(user_id)
 
         output = [
             f"{account['name']} 的账户信息",
@@ -659,18 +864,148 @@ def lookup_account(user_id: str) -> str:
             if billing.get('payment_method'):
                 output.append(f"  支付方式：{billing['payment_method']}")
 
+        if subscription:
+            output.append("")
+            output.append("订阅摘要：")
+            output.append(f"  当前订阅：{subscription['plan_name']}")
+            output.append(f"  计费周期：{subscription['billing_cycle']}")
+            if subscription.get("renewal_date"):
+                output.append(f"  下次续费：{subscription['renewal_date']}")
+            output.append(f"  自动续费：{'开启' if subscription.get('auto_renew') else '关闭'}")
+            output.append(
+                f"  席位使用：{subscription.get('seats_used', 0)} / {subscription.get('seat_quota', 0)}"
+            )
+
         output.append("")
         output.append("客服历史：")
         support = account['support_history']
         output.append(f"  总工单数：{support['total_tickets']}")
         output.append(f"  已解决：{support['resolved_tickets']}")
         output.append(f"  平均解决时长：{support['avg_resolution_time']}")
+        output.append("")
+        output.append("来源：Account Profile")
 
         return "\n".join(output)
 
     except Exception as e:
         logger.error(f"Account lookup error: {e}")
         return f"查询账户失败：{str(e)}"
+@tool
+def get_subscription_status(user_id: str) -> str:
+    """
+    查询用户当前订阅状态、套餐与续费时间。
+
+    Args:
+        user_id: 用户唯一标识
+
+    Returns:
+        订阅摘要文本
+    """
+    try:
+        subscription = get_subscription_record(user_id)
+        if not subscription:
+            return f"未找到用户 {user_id} 的订阅信息。"
+
+        renewal = subscription.get("renewal_date") or "当前无需续费"
+        amount = _format_money(subscription.get("amount", 0.0), subscription.get("currency", "CNY"))
+        benefits = "、".join(subscription.get("benefits", [])) or "基础支持"
+
+        return (
+            f"订阅状态查询成功。\n"
+            f"用户：{user_id}\n"
+            f"当前套餐：{subscription['plan_name']}\n"
+            f"状态：{subscription['status']}\n"
+            f"计费周期：{subscription['billing_cycle']}\n"
+            f"下次续费：{renewal}\n"
+            f"当前费用：{amount}\n"
+            f"自动续费：{'开启' if subscription.get('auto_renew') else '关闭'}\n"
+            f"席位使用：{subscription.get('seats_used', 0)} / {subscription.get('seat_quota', 0)}\n"
+            f"权益摘要：{benefits}\n"
+            f"下一步：如需变更套餐，可继续说明是升级、降级还是关闭自动续费。\n"
+            f"来源：Subscription Ledger"
+        )
+    except Exception as e:
+        logger.error(f"Get subscription status error: {e}")
+        return f"查询订阅失败：{str(e)}"
+
+
+@tool
+def get_latest_invoice(user_id: str) -> str:
+    """
+    查询用户最近一笔账单。
+
+    Args:
+        user_id: 用户唯一标识
+
+    Returns:
+        最新账单摘要
+    """
+    try:
+        invoice = get_latest_invoice_record(user_id)
+        if not invoice:
+            return f"未找到用户 {user_id} 的账单记录。"
+
+        line_summaries = []
+        for item in invoice.get("line_items", []):
+            line_summaries.append(
+                f"- {item['name']}：{_format_money(item['amount'], invoice.get('currency', 'CNY'))}（{item['reason']}）"
+            )
+        lines = "\n".join(line_summaries) if line_summaries else "- 无明细"
+
+        return (
+            f"最近账单查询成功。\n"
+            f"账单号：{invoice['invoice_id']}\n"
+            f"账单摘要：{invoice['summary']}\n"
+            f"出账时间：{invoice['issued_at']}\n"
+            f"账单周期：{invoice['period_start']} 至 {invoice['period_end']}\n"
+            f"账单状态：{invoice['status']}\n"
+            f"总金额：{_format_money(invoice['total_amount'], invoice.get('currency', 'CNY'))}\n"
+            f"支付方式：{invoice.get('payment_method', '未记录')}\n"
+            f"费用明细：\n{lines}\n"
+            f"下一步：如果你怀疑扣费异常，我可以继续解释金额构成，或为你创建账单异常工单。\n"
+            f"来源：Billing Ledger"
+        )
+    except Exception as e:
+        logger.error(f"Get latest invoice error: {e}")
+        return f"查询最新账单失败：{str(e)}"
+
+
+@tool
+def explain_invoice_charge(invoice_id: str) -> str:
+    """
+    查询并解释指定账单的扣费原因与金额构成。
+
+    Args:
+        invoice_id: 账单号（如 INV-202603-0001）
+
+    Returns:
+        账单解释文本
+    """
+    try:
+        invoice = get_invoice_record(invoice_id)
+        if not invoice:
+            return f"未找到账单 {invoice_id}。"
+
+        explanations = "\n".join(f"- {line}" for line in invoice.get("explanation", [])) or "- 暂无解释信息"
+        line_items = "\n".join(
+            f"- {item['name']}：{_format_money(item['amount'], invoice.get('currency', 'CNY'))}"
+            for item in invoice.get("line_items", [])
+        ) or "- 无明细"
+
+        return (
+            f"账单扣费说明。\n"
+            f"账单号：{invoice['invoice_id']}\n"
+            f"总金额：{_format_money(invoice['total_amount'], invoice.get('currency', 'CNY'))}\n"
+            f"费用构成：\n{line_items}\n"
+            f"扣费解释：\n{explanations}\n"
+            f"下一步：如果你认为其中某项费用不合理，我可以继续为你创建账单异常工单并转人工复核。\n"
+            f"来源：Billing Explanation Engine"
+        )
+    except Exception as e:
+        logger.error(f"Explain invoice charge error: {e}")
+        return f"解释账单失败：{str(e)}"
+
+
 @tool
 def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> str:
     """
@@ -694,6 +1029,7 @@ def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> s
             subject=f"人工升级：{reason}",
             description=conversation_summary,
             priority="high",
+            category="escalation",
             metadata={"escalated": True, "reason": reason}
         )
 
@@ -709,9 +1045,13 @@ def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> s
         return (
             f"已升级到人工客服。\n\n"
             f"已创建工单：{ticket.ticket_id}\n"
+            f"工单分类：{ticket.category}\n"
             f"优先级：high\n"
             f"升级原因：{reason}\n\n"
-            f"{user_name}，我们会尽快通过邮件与你联系。"
+            f"交接摘要：{conversation_summary[:120]}\n"
+            f"{user_name}，人工客服会在 2 小时内接手，并优先通过邮件与你联系。\n"
+            f"下一步：如果你有新的补充信息，可以继续回复本线程，人工客服会一并查看。\n"
+            f"来源：Human Escalation Queue"
         )
 
     except Exception as e:
@@ -726,6 +1066,9 @@ ALL_TOOLS = [
     update_ticket,
     get_user_tickets,
     lookup_account,
+    get_subscription_status,
+    get_latest_invoice,
+    explain_invoice_charge,
     escalate_to_human
 ]
 

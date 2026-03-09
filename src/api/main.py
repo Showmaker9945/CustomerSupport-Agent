@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import uuid
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -27,7 +27,12 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..config import settings
 from ..conversation.support_agent import get_support_agent, peek_support_agent
-from ..tools.support_tools import TicketStore, get_ticket_store
+from ..tools.support_tools import (
+    TicketStore,
+    get_latest_invoice_record,
+    get_subscription_record,
+    get_ticket_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,26 +44,61 @@ class ChatMessage(BaseModel):
     content: str = Field(..., min_length=1, max_length=6000)
     thread_id: Optional[str] = Field(None, description="LangGraph 线程 ID")
     session_id: Optional[str] = Field(None, description="向后兼容字段，将映射到 thread_id")
+    debug: bool = Field(False, description="是否返回调试信息（路由、校验、trace）。")
+
+
+class SentimentPayload(BaseModel):
+    label: str
+    polarity: float
+    frustration_score: float
+
+
+class ResultPayload(BaseModel):
+    escalated: bool
+    ticket_created: Optional[str]
+    sources: List[str]
+    citations: List[str]
+
+
+class ApprovalToolPayload(BaseModel):
+    id: Optional[str]
+    tool: str
+    tool_label: str
+    reason: str
+    args_preview: Dict[str, Any] = Field(default_factory=dict)
+    allowed_decisions: List[str] = Field(default_factory=list)
+
+
+class ApprovalPayload(BaseModel):
+    count: int
+    required_decisions: int
+    tools: List[ApprovalToolPayload]
+    message: str
+
+
+class DebugPayload(BaseModel):
+    trace_id: Optional[str]
+    route_path: List[str]
+    validation_notes: List[str]
+    trace_preview: List[Dict[str, Any]]
+    decision_summary: str
+    memory: Optional[Dict[str, Any]] = None
 
 
 class ChatResponse(BaseModel):
-    """聊天响应（兼容旧字段 + 新字段）。"""
+    """更适合演示与调试的聊天响应。"""
 
     message: str
-    intent: str
-    sentiment: str
-    sentiment_polarity: float
-    frustration_score: float
-    sources: List[str]
-    escalated: bool
-    ticket_created: Optional[str]
-    timestamp: str
     thread_id: str
     run_status: str
-    interrupts: List[Dict[str, Any]]
-    citations: List[str]
     active_agent: str
-    trace_id: str
+    intent: str
+    sentiment: SentimentPayload
+    result: ResultPayload
+    next_action: str
+    approval: Optional[ApprovalPayload] = None
+    debug: Optional[DebugPayload] = None
+    timestamp: str
 
 
 class ResumeDecision(BaseModel):
@@ -73,6 +113,7 @@ class ResumeRequest(BaseModel):
     """恢复请求体。"""
 
     decisions: List[ResumeDecision] = Field(default_factory=list)
+    debug: bool = Field(False, description="是否返回调试信息（路由、校验、trace）。")
 
 
 class ReindexRequest(BaseModel):
@@ -96,6 +137,11 @@ class HealthResponse(BaseModel):
     timestamp: str
     version: str
     components: Dict[str, str]
+
+
+def _build_chat_response(payload: Dict[str, Any]) -> ChatResponse:
+    payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+    return ChatResponse(**payload)
 
 
 class ConnectionManager:
@@ -187,10 +233,41 @@ async def _cleanup_task() -> None:
         await asyncio.sleep(3600)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    with suppress(Exception):
+        from shared.security import SensitiveDataFilter
+
+        logging.getLogger().addFilter(SensitiveDataFilter())
+
+    cleanup_task = asyncio.create_task(_cleanup_task())
+    warmup_task = asyncio.create_task(asyncio.to_thread(get_support_agent))
+    app.state.cleanup_task = cleanup_task
+    app.state.warmup_task = warmup_task
+
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
+
+        if not warmup_task.done():
+            warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await warmup_task
+
+        agent = peek_support_agent()
+        if agent:
+            with suppress(Exception):
+                agent.close()
+
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description="LangGraph 多 Agent 客服服务",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -210,72 +287,26 @@ except ImportError:
     logger.warning("Rate limiting module not available.")
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    with suppress(Exception):
-        from shared.security import SensitiveDataFilter
-
-        logging.getLogger().addFilter(SensitiveDataFilter())
-    asyncio.create_task(_cleanup_task())
-    asyncio.create_task(asyncio.to_thread(get_support_agent))
-
-
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    agent = peek_support_agent()
-    if agent:
-        with suppress(Exception):
-            agent.close()
-
-
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse, response_model_exclude_none=True)
 async def chat(message: ChatMessage) -> ChatResponse:
     """核心聊天接口。"""
     agent = get_support_agent()
     thread_id = message.thread_id or message.session_id
     response = agent.chat(user_id=message.user_id, message=message.content, thread_id=thread_id)
-    return ChatResponse(
-        message=response.message,
-        intent=response.intent,
-        sentiment=response.sentiment.label,
-        sentiment_polarity=response.sentiment.polarity,
-        frustration_score=response.sentiment.frustration_score,
-        sources=response.sources,
-        escalated=response.escalated,
-        ticket_created=response.ticket_created,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        thread_id=response.thread_id or "",
-        run_status=response.run_status,
-        interrupts=response.interrupts,
-        citations=response.citations,
-        active_agent=response.active_agent,
-        trace_id=response.trace_id or "",
-    )
+    payload = response.to_dict(include_debug=message.debug)
+    payload["thread_id"] = response.thread_id or ""
+    return _build_chat_response(payload)
 
 
-@app.post("/runs/{thread_id}/resume", response_model=ChatResponse)
+@app.post("/runs/{thread_id}/resume", response_model=ChatResponse, response_model_exclude_none=True)
 async def resume_run(thread_id: str, request: ResumeRequest) -> ChatResponse:
     """恢复 HITL 中断。"""
     agent = get_support_agent()
     decisions = [decision.model_dump(exclude_none=True) for decision in request.decisions]
     response = agent.resume(thread_id=thread_id, decisions=decisions)
-    return ChatResponse(
-        message=response.message,
-        intent=response.intent,
-        sentiment=response.sentiment.label,
-        sentiment_polarity=response.sentiment.polarity,
-        frustration_score=response.sentiment.frustration_score,
-        sources=response.sources,
-        escalated=response.escalated,
-        ticket_created=response.ticket_created,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        thread_id=response.thread_id or thread_id,
-        run_status=response.run_status,
-        interrupts=response.interrupts,
-        citations=response.citations,
-        active_agent=response.active_agent,
-        trace_id=response.trace_id or "",
-    )
+    payload = response.to_dict(include_debug=request.debug)
+    payload["thread_id"] = response.thread_id or thread_id
+    return _build_chat_response(payload)
 
 
 @app.get("/chat/stream")
@@ -361,6 +392,22 @@ async def get_user_tickets(user_id: str, status: Optional[str] = None):
     return {"user_id": user_id, "tickets": [ticket.to_dict() for ticket in tickets], "count": len(tickets)}
 
 
+@app.get("/users/{user_id}/subscription")
+async def get_user_subscription(user_id: str):
+    subscription = get_subscription_record(user_id)
+    if not subscription:
+        raise HTTPException(status_code=404, detail="未找到该用户的订阅信息")
+    return {"user_id": user_id, "subscription": subscription}
+
+
+@app.get("/users/{user_id}/invoices/latest")
+async def get_user_latest_invoice(user_id: str):
+    invoice = get_latest_invoice_record(user_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="未找到该用户的最新账单")
+    return {"user_id": user_id, "invoice": invoice}
+
+
 @app.get("/users/{user_id}/history")
 async def get_conversation_history(user_id: str, limit: int = 20):
     agent = get_support_agent()
@@ -442,6 +489,8 @@ async def root():
             "websocket": "/ws/chat/{user_id}",
             "knowledge_reindex": "/knowledge/reindex (POST)",
             "tickets": "/users/{user_id}/tickets (GET)",
+            "subscription": "/users/{user_id}/subscription (GET)",
+            "latest_invoice": "/users/{user_id}/invoices/latest (GET)",
             "history": "/users/{user_id}/history (GET)",
             "health": "/health (GET)",
             "docs": "/docs",

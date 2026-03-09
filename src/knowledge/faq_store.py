@@ -5,6 +5,7 @@
 用于中文优先的客服问答场景。
 """
 
+import copy
 import json
 import logging
 import re
@@ -176,6 +177,76 @@ class FAQStore:
         }
     ]
 
+    CATEGORY_HINTS = {
+        "billing": (
+            "账单", "扣费", "扣款", "收费", "订阅", "套餐", "续费", "付款", "支付", "发票",
+            "退款", "试用", "优惠", "存储", "配额", "billing", "invoice", "plan", "subscription",
+        ),
+        "account": (
+            "密码", "登录", "账号", "账户", "邮箱", "所有权", "转移",
+            "password", "reset", "login", "account",
+        ),
+        "workspace": (
+            "团队", "成员", "角色", "权限", "工作区",
+            "team", "member", "role", "permission", "workspace",
+        ),
+        "security": (
+            "安全", "加密", "隐私", "双重", "双因素", "认证", "2fa",
+            "security", "encryption", "privacy", "authentication",
+        ),
+        "technical": (
+            "api", "接口", "导出", "集成", "开发者", "数据", "服务器", "区域", "webhook",
+            "integration", "export", "developer", "server",
+        ),
+        "support": (
+            "客服", "工单", "人工", "联系", "帮助", "时效", "sla",
+            "support", "ticket", "response", "human",
+        ),
+        "product": (
+            "更新", "发布", "路线图", "功能", "roadmap", "feature", "release",
+        ),
+    }
+
+    QUERY_NORMALIZATION_PATTERNS = (
+        (r"\bsubscriptions?\b", "订阅"),
+        (r"\bplans?\b", "套餐"),
+        (r"\bcancel(?:ation)?\b", "取消"),
+        (r"\brefunds?\b", "退款"),
+        (r"\bbilling\b", "账单"),
+        (r"\binvoices?\b", "账单"),
+        (r"\btickets?\b", "工单"),
+        (r"\bsupport\b", "客服"),
+        (r"\bpassword\b", "密码"),
+        (r"\breset\b", "重置"),
+        (r"\blog(?:\s|-)?in\b", "登录"),
+        (r"\bworkspace\b", "工作区"),
+        (r"\bteams?\b", "团队"),
+        (r"\bmembers?\b", "成员"),
+        (r"\bpermissions?\b", "权限"),
+    )
+
+    QUERY_PHRASE_PATTERNS = (
+        (r"扣款|扣费|收费", "账单扣费"),
+        (r"退订|取消续费|停用套餐|关掉自动续费|关闭自动续费", "取消订阅"),
+        (r"改套餐|换套餐|套餐变更", "升级或降级套餐"),
+        (r"找回密码|忘记密码", "重置密码"),
+        (r"人工客服|真人客服", "人工客服"),
+    )
+
+    QUERY_REWRITE_PATTERNS = (
+        (r"^(怎么|如何)?退(订)?$", "如何取消订阅？"),
+        (r"(怎么|如何).*(取消订阅|退订|取消套餐|停用套餐)", "如何取消订阅？"),
+        (r"(取消订阅|退订).*(什么时候|何时|多久).*(生效|失效)", "取消订阅后什么时候生效？"),
+        (r"取消.*(什么时候|何时|多久).*(生效|失效)", "取消订阅后什么时候生效？"),
+        (r"(怎么|如何).*(升级或降级套餐|升级套餐|降级套餐)", "可以升级或降级套餐吗？"),
+        (r"(为什么|为何).*(账单扣费|扣费|收费|扣款)", "账单扣费的原因是什么？"),
+        (r"(怎么|如何).*(重置密码)", "如何重置密码？"),
+        (r"(工单|人工客服).*(多久|多长时间|什么时候|时效).*(回复|响应|处理)?", "客服工单的响应时效是多久？"),
+    )
+    _EMBEDDING_MODEL_CACHE: Dict[str, SentenceTransformer] = {}
+    _RERANKER_MODEL_CACHE: Dict[str, Any] = {}
+
+
     def __init__(
         self,
         chroma_path: Optional[Path] = None,
@@ -193,11 +264,14 @@ class FAQStore:
         self.chroma_path = chroma_path or settings.chroma_persist_dir
         self.embedding_model_name = embedding_model or settings.embedding_model
         self.collection_name = collection_name
+        self._last_query_trace: Dict[str, Any] = {}
 
         # Initialize embedding model
         try:
-            self.embedding_model = SentenceTransformer(self.embedding_model_name)
-            logger.info(f"Loaded embedding model: {self.embedding_model_name}")
+            if self.embedding_model_name not in self._EMBEDDING_MODEL_CACHE:
+                self._EMBEDDING_MODEL_CACHE[self.embedding_model_name] = SentenceTransformer(self.embedding_model_name)
+                logger.info(f"Loaded embedding model: {self.embedding_model_name}")
+            self.embedding_model = self._EMBEDDING_MODEL_CACHE[self.embedding_model_name]
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise
@@ -232,8 +306,10 @@ class FAQStore:
             if settings.enable_reranker:
                 try:
                     from sentence_transformers import CrossEncoder  # local import to avoid hard fail
-                    self.reranker = CrossEncoder(settings.reranker_model)
-                    logger.info(f"Loaded reranker model: {settings.reranker_model}")
+                    if settings.reranker_model not in self._RERANKER_MODEL_CACHE:
+                        self._RERANKER_MODEL_CACHE[settings.reranker_model] = CrossEncoder(settings.reranker_model)
+                        logger.info(f"Loaded reranker model: {settings.reranker_model}")
+                    self.reranker = self._RERANKER_MODEL_CACHE[settings.reranker_model]
                 except Exception as rerank_error:
                     self.reranker = None
                     logger.warning(f"Reranker unavailable, fallback to fusion-only search: {rerank_error}")
@@ -263,13 +339,229 @@ class FAQStore:
         logger.info(f"Loaded {len(self.SAMPLE_FAQS)} sample FAQs")
 
     def _tokenize_for_bm25(self, text: str) -> List[str]:
-        """为中英混合文本生成 BM25 检索 token。"""
+        """Build BM25 tokens for mixed Chinese and English text."""
         if not text:
             return []
         lowered = text.lower()
         english_tokens = re.findall(r"[a-z0-9_]+", lowered)
-        chinese_chars = [char for char in text if "\u4e00" <= char <= "\u9fff"]
+        chinese_chars = [char for char in text if "一" <= char <= "鿿"]
         return english_tokens + chinese_chars
+
+    def _extract_field_from_doc(self, doc: str, field_name: str) -> str:
+        """Extract a structured field from the stored FAQ document."""
+        if not doc:
+            return ""
+        prefix = f"{field_name}:"
+        for line in doc.splitlines():
+            if line.startswith(prefix):
+                return line.replace(prefix, "", 1).strip()
+        return ""
+
+    def _normalize_query(self, query: str) -> str:
+        """Normalize mixed-language queries before retrieval."""
+        normalized = re.sub(r"\s+", " ", (query or "").strip()).lower()
+        for pattern, replacement in self.QUERY_NORMALIZATION_PATTERNS:
+            normalized = re.sub(pattern, replacement, normalized)
+        for pattern, replacement in self.QUERY_PHRASE_PATTERNS:
+            normalized = re.sub(pattern, replacement, normalized)
+        normalized = normalized.replace("?", "？").replace("!", "！")
+        normalized = re.sub(r"\s+", " ", normalized).strip(" ，,;；。！？!?\n\t")
+        return normalized
+
+    def _infer_query_category(self, query: str) -> Optional[str]:
+        """Infer the most likely FAQ category from the normalized query."""
+        normalized = self._normalize_query(query)
+        if not normalized:
+            return None
+
+        scores: Dict[str, int] = {}
+        for category, hints in self.CATEGORY_HINTS.items():
+            score = 0
+            for hint in hints:
+                if hint.lower() in normalized:
+                    score += max(1, len(hint) // 2)
+            if score > 0:
+                scores[category] = score
+
+        if not scores:
+            return None
+        return max(scores.items(), key=lambda item: (item[1], item[0]))[0]
+
+    def _rewrite_query(self, query: str) -> str:
+        """Rewrite short or noisy queries into FAQ-friendly phrasing."""
+        normalized = self._normalize_query(query)
+        if not normalized:
+            return ""
+        for pattern, rewritten in self.QUERY_REWRITE_PATTERNS:
+            if re.search(pattern, normalized):
+                return rewritten
+        return normalized
+
+    def _split_subqueries(self, query: str) -> List[str]:
+        """Split compound questions into at most two focused subqueries."""
+        normalized = self._normalize_query(query)
+        if not normalized:
+            return []
+
+        if re.search(r"(取消订阅|退订|取消).*(什么时候|何时|多久).*(生效|失效)", normalized):
+            return [
+                "如何取消订阅？",
+                "取消订阅后什么时候生效？",
+            ]
+
+        parts = [
+            part.strip()
+            for part in re.split(r"[，,;；。]|(?:以及|还有|并且|同时|然后)", normalized)
+            if part and part.strip()
+        ]
+        if len(parts) <= 1:
+            return []
+
+        subqueries: List[str] = []
+        for part in parts:
+            if len(part) < 3:
+                continue
+            candidate = self._rewrite_query(part)
+            if candidate and candidate not in subqueries:
+                subqueries.append(candidate)
+            if len(subqueries) >= 2:
+                break
+        return subqueries
+
+    def _merge_candidate_maps(
+        self,
+        target: Dict[Tuple[str, str], Dict[str, Any]],
+        incoming: Dict[Tuple[str, str], Dict[str, Any]],
+    ) -> None:
+        """Merge candidate scores from multiple retrieval rounds."""
+        for key, item in incoming.items():
+            if key not in target:
+                target[key] = {
+                    "result": copy.deepcopy(item["result"]),
+                    "score": float(item.get("score", 0.0)),
+                    "queries": list(item.get("queries", [])),
+                    "round_types": list(item.get("round_types", [])),
+                }
+                continue
+
+            target[key]["score"] += float(item.get("score", 0.0))
+            target[key]["result"].confidence = max(
+                target[key]["result"].confidence,
+                item["result"].confidence,
+            )
+            for source_query in item.get("queries", []):
+                if source_query not in target[key]["queries"]:
+                    target[key]["queries"].append(source_query)
+            for round_type in item.get("round_types", []):
+                if round_type not in target[key]["round_types"]:
+                    target[key]["round_types"].append(round_type)
+
+    def _run_retrieval_round(
+        self,
+        query: str,
+        category: Optional[str],
+        candidate_k: int,
+        min_confidence: float,
+        round_type: str,
+        round_weight: float,
+    ) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], Dict[str, Any]]:
+        """Run one retrieval round and collect fusion signals."""
+        vector_results = self._vector_search(
+            query=query,
+            category=category,
+            top_k=candidate_k,
+            min_confidence=min_confidence,
+        )
+        keyword_results = self._keyword_search(
+            query=query,
+            top_k=candidate_k,
+            category=category,
+        )
+
+        vector_weight = settings.rag_vector_weight * round_weight
+        keyword_weight = settings.rag_keyword_weight * round_weight
+        fusion_k = max(1, settings.rag_fusion_k)
+
+        candidates: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for source_weight, results in (
+            (vector_weight, vector_results),
+            (keyword_weight, keyword_results),
+        ):
+            for rank, result in enumerate(results, start=1):
+                key = (result.question, result.answer)
+                if key not in candidates:
+                    candidates[key] = {
+                        "result": copy.deepcopy(result),
+                        "score": 0.0,
+                        "queries": [query],
+                        "round_types": [round_type],
+                    }
+                candidates[key]["score"] += source_weight * (1.0 / (fusion_k + rank))
+                candidates[key]["result"].confidence = max(
+                    candidates[key]["result"].confidence,
+                    result.confidence,
+                )
+
+        return candidates, {
+            "query": query,
+            "category": category,
+            "round_type": round_type,
+            "vector_hits": len(vector_results),
+            "keyword_hits": len(keyword_results),
+        }
+
+    def _finalize_candidates(
+        self,
+        candidates: Dict[Tuple[str, str], Dict[str, Any]],
+        reference_query: str,
+        candidate_k: int,
+        min_confidence: float,
+    ) -> List[FAQResult]:
+        """Convert accumulated retrieval signals into final ranked results."""
+        if not candidates:
+            return []
+
+        fusion_k = max(1, settings.rag_fusion_k)
+        merged_results: List[FAQResult] = []
+        for item in sorted(candidates.values(), key=lambda row: row["score"], reverse=True)[:candidate_k]:
+            result = copy.deepcopy(item["result"])
+            result.confidence = max(
+                result.confidence,
+                min(1.0, float(item["score"] * fusion_k)),
+            )
+            result.metadata = {
+                **result.metadata,
+                "retrieval_queries": list(item.get("queries", [])),
+                "retrieval_round_types": list(item.get("round_types", [])),
+            }
+            merged_results.append(result)
+
+        if self.reranker and merged_results:
+            try:
+                pairs = [[reference_query, f"{result.question}\n{result.answer}"] for result in merged_results]
+                rerank_scores = self.reranker.predict(pairs)
+                reranked = sorted(
+                    zip(merged_results, rerank_scores),
+                    key=lambda row: float(row[1]),
+                    reverse=True,
+                )
+                normalized_results: List[FAQResult] = []
+                max_rerank = float(max(rerank_scores)) if len(rerank_scores) > 0 else 0.0
+                for result, score in reranked:
+                    if max_rerank > 0:
+                        result.confidence = max(0.0, min(1.0, float(score / max_rerank)))
+                    normalized_results.append(result)
+                merged_results = normalized_results
+            except Exception as rerank_error:
+                logger.warning(f"Rerank failed, using fusion ranking only: {rerank_error}")
+
+        filtered_results = [result for result in merged_results if result.confidence >= min_confidence]
+        filtered_results.sort(key=lambda result: result.confidence, reverse=True)
+        return filtered_results
+
+    def get_last_query_trace(self) -> Dict[str, Any]:
+        """Return the latest retrieval trace for debugging or demos."""
+        return copy.deepcopy(self._last_query_trace)
 
     def _refresh_keyword_index(self) -> None:
         """构建或刷新 BM25 词法索引。"""
@@ -327,7 +619,7 @@ class FAQStore:
         top_k: int = 6,
         category: Optional[str] = None
     ) -> List[FAQResult]:
-        """基于 BM25 执行 FAQ 词法检索。"""
+        """Run BM25 keyword retrieval over the FAQ corpus."""
         self._refresh_keyword_index()
         if self._bm25_index is None:
             return []
@@ -357,18 +649,13 @@ class FAQStore:
             if category and result_category != category:
                 continue
 
-            question = metadata.get("question", "")
-            if not question:
-                for line in doc.split("\n"):
-                    if line.startswith("Question:"):
-                        question = line.replace("Question:", "").strip()
-                        break
-
+            question = metadata.get("question", "") or self._extract_field_from_doc(doc, "Question")
+            answer = metadata.get("answer", "") or self._extract_field_from_doc(doc, "Answer") or doc
             confidence = float(scores[idx] / max_score)
             results.append(
                 FAQResult(
                     question=question or "Unknown question",
-                    answer=metadata.get("answer", doc),
+                    answer=answer,
                     category=result_category,
                     confidence=max(0.0, min(1.0, confidence)),
                     metadata={k: v for k, v in metadata.items() if k not in {"question", "answer", "category"}},
@@ -383,82 +670,95 @@ class FAQStore:
         top_k: Optional[int] = None,
         min_confidence: float = 0.0
     ) -> List[FAQResult]:
-        """
-        Hybrid retrieval: vector + BM25 + optional cross-encoder rerank.
-
-        This method keeps old `search` behavior intact while providing a stronger
-        retrieval strategy for multilingual customer support scenarios.
-        """
+        """Run lightweight hybrid retrieval with normalization, splitting, and rewrite fallback."""
         final_top_k = top_k or settings.rag_top_k
         candidate_k = max(final_top_k * 3, 8)
 
-        vector_results = self._vector_search(
-            query=query,
-            category=category,
-            top_k=candidate_k,
-            min_confidence=min_confidence,
-        )
-        keyword_results = self._keyword_search(
-            query=query,
-            top_k=candidate_k,
-            category=category,
-        )
+        normalized_query = self._normalize_query(query)
+        rewritten_query = self._rewrite_query(query)
+        subqueries = self._split_subqueries(query)
+        inferred_category = self._infer_query_category(normalized_query) if not category else None
+        effective_category = category or inferred_category
 
-        if not vector_results and not keyword_results:
-            return []
+        trace: Dict[str, Any] = {
+            "original_query": query,
+            "normalized_query": normalized_query,
+            "rewritten_query": rewritten_query if rewritten_query != normalized_query else None,
+            "requested_category": category,
+            "inferred_category": inferred_category,
+            "effective_category": effective_category,
+            "sub_queries": subqueries,
+            "rewrite_used": False,
+            "retrieval_rounds": [],
+            "final_result_count": 0,
+            "top_result": None,
+        }
 
-        vector_weight = settings.rag_vector_weight
-        keyword_weight = settings.rag_keyword_weight
-        fusion_k = max(1, settings.rag_fusion_k)
+        queries_to_run: List[Tuple[str, str, float]] = []
+        if normalized_query:
+            queries_to_run.append((normalized_query, "primary", 1.0))
+        for index, subquery in enumerate(subqueries, start=1):
+            if subquery != normalized_query:
+                queries_to_run.append((subquery, f"subquery_{index}", max(0.8, 0.95 - (index * 0.05))))
 
         candidates: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        seen_queries = set()
+        for round_query, round_type, round_weight in queries_to_run:
+            if not round_query or round_query in seen_queries:
+                continue
+            seen_queries.add(round_query)
+            round_candidates, round_trace = self._run_retrieval_round(
+                query=round_query,
+                category=effective_category,
+                candidate_k=candidate_k,
+                min_confidence=min_confidence,
+                round_type=round_type,
+                round_weight=round_weight,
+            )
+            self._merge_candidate_maps(candidates, round_candidates)
+            trace["retrieval_rounds"].append(round_trace)
 
-        for rank, result in enumerate(vector_results, start=1):
-            key = (result.question, result.answer)
-            if key not in candidates:
-                candidates[key] = {"result": result, "score": 0.0}
-            candidates[key]["score"] += vector_weight * (1.0 / (fusion_k + rank))
-
-        for rank, result in enumerate(keyword_results, start=1):
-            key = (result.question, result.answer)
-            if key not in candidates:
-                candidates[key] = {"result": result, "score": 0.0}
-            candidates[key]["score"] += keyword_weight * (1.0 / (fusion_k + rank))
-
-        fused = sorted(
-            candidates.values(),
-            key=lambda item: item["score"],
-            reverse=True,
+        merged_results = self._finalize_candidates(
+            candidates=candidates,
+            reference_query=normalized_query or query,
+            candidate_k=candidate_k,
+            min_confidence=min_confidence,
         )
 
-        merged_results: List[FAQResult] = []
-        for item in fused[:candidate_k]:
-            result = item["result"]
-            result.confidence = max(result.confidence, min(1.0, float(item["score"] * fusion_k)))
-            merged_results.append(result)
+        should_retry_with_rewrite = (
+            rewritten_query
+            and rewritten_query not in seen_queries
+            and (not merged_results or merged_results[0].confidence < 0.45)
+        )
+        if should_retry_with_rewrite:
+            round_candidates, round_trace = self._run_retrieval_round(
+                query=rewritten_query,
+                category=effective_category,
+                candidate_k=candidate_k,
+                min_confidence=min_confidence,
+                round_type="rewrite_retry",
+                round_weight=0.78,
+            )
+            self._merge_candidate_maps(candidates, round_candidates)
+            trace["retrieval_rounds"].append(round_trace)
+            trace["rewrite_used"] = True
+            merged_results = self._finalize_candidates(
+                candidates=candidates,
+                reference_query=normalized_query or query,
+                candidate_k=candidate_k,
+                min_confidence=min_confidence,
+            )
 
-        # Optional reranking
-        if self.reranker and merged_results:
-            try:
-                pairs = [[query, f"{result.question}\n{result.answer}"] for result in merged_results]
-                rerank_scores = self.reranker.predict(pairs)
-                reranked = sorted(
-                    zip(merged_results, rerank_scores),
-                    key=lambda row: float(row[1]),
-                    reverse=True,
-                )
-                normalized_results: List[FAQResult] = []
-                max_rerank = float(max(rerank_scores)) if len(rerank_scores) > 0 else 0.0
-                for result, score in reranked:
-                    if max_rerank > 0:
-                        result.confidence = max(0.0, min(1.0, float(score / max_rerank)))
-                    normalized_results.append(result)
-                merged_results = normalized_results
-            except Exception as rerank_error:
-                logger.warning(f"Rerank failed, using fusion ranking only: {rerank_error}")
-
-        filtered = [result for result in merged_results if result.confidence >= min_confidence]
-        return filtered[:final_top_k]
+        final_results = merged_results[:final_top_k]
+        trace["final_result_count"] = len(final_results)
+        if final_results:
+            trace["top_result"] = {
+                "question": final_results[0].question,
+                "category": final_results[0].category,
+                "confidence": round(final_results[0].confidence, 4),
+            }
+        self._last_query_trace = trace
+        return final_results
 
     def add_faq(
         self,
@@ -500,6 +800,7 @@ class FAQStore:
             faq_metadata = {
                 "category": category,
                 "question": question,
+                "answer": answer,
             }
 
             # Add metadata but convert lists to strings
@@ -606,61 +907,30 @@ class FAQStore:
         top_k: int = 3,
         min_confidence: float = 0.0
     ) -> List[FAQResult]:
-        """
-        执行纯向量检索。
-
-        Args:
-            query: Search query
-            category: Optional category filter
-            top_k: Number of results to return
-            min_confidence: Minimum confidence threshold (0-1)
-
-        Returns:
-            List of FAQResults sorted by confidence
-        """
+        """Run vector retrieval against the FAQ collection."""
         try:
-            # Create query embedding
             query_embedding = self._create_embedding(query)
-
-            # Build where clause for category filter
             where_clause = {"category": category} if category else None
-
-            # Search in ChromaDB
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=top_k * 2,  # Get more results to filter
+                n_results=top_k * 2,
                 where=where_clause
             )
 
-            # Process results
             faq_results = []
             if results["documents"] and results["documents"][0]:
                 for i, doc in enumerate(results["documents"][0]):
                     metadata = results["metadatas"][0][i]
                     distance = results["distances"][0][i]
-
-                    # Convert distance to confidence (ChromaDB uses L2 distance)
-                    # L2 distance ranges from 0 (identical) to infinity
-                    # We'll map to confidence using a simple formula
                     confidence = max(0, 1 - (distance / 2))
-
-                    # Apply confidence threshold
                     if confidence < min_confidence:
                         continue
 
-                    # Extract question from metadata or doc
-                    question = metadata.get("question", "")
-                    if not question and doc:
-                        # Parse question from document
-                        lines = doc.split('\n')
-                        for line in lines:
-                            if line.startswith("Question:"):
-                                question = line.replace("Question:", "").strip()
-                                break
-
+                    question = metadata.get("question", "") or self._extract_field_from_doc(doc, "Question")
+                    answer = metadata.get("answer", "") or self._extract_field_from_doc(doc, "Answer") or doc
                     faq_results.append(FAQResult(
                         question=question or "Unknown question",
-                        answer=metadata.get("answer", doc),
+                        answer=answer,
                         category=metadata.get("category", "general"),
                         confidence=confidence,
                         metadata={
@@ -669,7 +939,6 @@ class FAQStore:
                         }
                     ))
 
-            # Sort by confidence and limit to top_k
             faq_results.sort(key=lambda x: x.confidence, reverse=True)
             return faq_results[:top_k]
 
@@ -783,7 +1052,12 @@ class FAQStore:
                 name=self.collection_name,
                 metadata={"description": "Customer support FAQ knowledge base"}
             )
+            self._bm25_index = None
+            self._bm25_docs = []
+            self._bm25_metadatas = []
+            self._bm25_ids = []
             self._bm25_dirty = True
+            self._last_query_trace = {}
             logger.info("Cleared all FAQs")
         except Exception as e:
             logger.error(f"Failed to clear FAQs: {e}")

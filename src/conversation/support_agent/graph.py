@@ -39,6 +39,11 @@ REQUEST_HINTS = (
     "账户",
     "账号",
     "账单",
+    "发票",
+    "订阅",
+    "套餐",
+    "续费",
+    "扣费",
 )
 ESCALATION_HINTS = (
     "人工",
@@ -51,8 +56,25 @@ ESCALATION_HINTS = (
     "unacceptable",
     "sue",
 )
-ACCOUNT_HINTS = ("账户", "账号", "账单", "member", "plan", "invoice", "account")
-TICKET_HINTS = ("工单", "ticket", "状态", "进度", "升级", "催单")
+ACCOUNT_HINTS = (
+    "账户",
+    "账号",
+    "账单",
+    "发票",
+    "订阅",
+    "套餐",
+    "续费",
+    "扣费",
+    "member",
+    "plan",
+    "invoice",
+    "billing",
+    "subscription",
+    "renewal",
+    "charge",
+    "account",
+)
+TICKET_HINTS = ("工单", "ticket", "状态", "进度", "升级", "催单", "账单异常")
 
 
 class ConversationState(TypedDict):
@@ -84,6 +106,9 @@ class OrchestrationState(TypedDict, total=False):
     selected_agent: str
     active_agent: str
     execution_steps: List[str]
+    route_path: List[str]
+    trace_events: List[Dict[str, Any]]
+    decision_summary: str
     needs_knowledge: bool
     needs_action: bool
     needs_action_after_knowledge: bool
@@ -128,27 +153,95 @@ class SupportResponse:
     citations: List[str] = field(default_factory=list)
     active_agent: str = "supervisor"
     trace_id: Optional[str] = None
+    route_path: List[str] = field(default_factory=list)
+    validation_notes: List[str] = field(default_factory=list)
+    trace_preview: List[Dict[str, Any]] = field(default_factory=list)
+    decision_summary: str = ""
+    approval: Optional[Dict[str, Any]] = None
+    memory_debug: Dict[str, Any] = field(default_factory=dict)
+    next_action: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, include_debug: bool = True) -> Dict[str, Any]:
         """Convert the dataclass into an API-friendly payload."""
-        return {
+        payload: Dict[str, Any] = {
             "message": self.message,
+            "thread_id": self.thread_id,
+            "run_status": self.run_status,
+            "active_agent": self.active_agent,
             "intent": self.intent,
             "sentiment": {
                 "label": self.sentiment.label,
                 "polarity": self.sentiment.polarity,
                 "frustration_score": self.sentiment.frustration_score,
             },
-            "sources": self.sources,
-            "escalated": self.escalated,
-            "ticket_created": self.ticket_created,
-            "thread_id": self.thread_id,
-            "run_status": self.run_status,
-            "interrupts": self.interrupts,
-            "citations": self.citations,
-            "active_agent": self.active_agent,
-            "trace_id": self.trace_id,
+            "result": {
+                "escalated": self.escalated,
+                "ticket_created": self.ticket_created,
+                "sources": self.sources,
+                "citations": self.citations,
+            },
+            "next_action": self.next_action,
         }
+        if self.approval:
+            payload["approval"] = self.approval
+        if include_debug:
+            payload["debug"] = {
+                "trace_id": self.trace_id,
+                "route_path": self.route_path,
+                "validation_notes": self.validation_notes,
+                "trace_preview": self.trace_preview,
+                "decision_summary": self.decision_summary,
+            }
+            if self.memory_debug:
+                payload["debug"]["memory"] = self.memory_debug
+        return payload
+
+
+def build_trace_event(
+    *,
+    node: str,
+    agent: str,
+    summary: str,
+    status: str = "completed",
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a lightweight trace event for graph debugging and demos."""
+    event: Dict[str, Any] = {
+        "node": node,
+        "agent": agent,
+        "status": status,
+        "summary": summary,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    cleaned_details = {key: value for key, value in (details or {}).items() if value is not None}
+    if cleaned_details:
+        event["details"] = cleaned_details
+    return event
+
+
+def extend_trace(
+    state: OrchestrationState,
+    *,
+    node: str,
+    agent: str,
+    summary: str,
+    status: str = "completed",
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Append route path and trace event updates for a graph node."""
+    return {
+        "route_path": [*state.get("route_path", []), node],
+        "trace_events": [
+            *state.get("trace_events", []),
+            build_trace_event(
+                node=node,
+                agent=agent,
+                summary=summary,
+                status=status,
+                details=details,
+            ),
+        ],
+    }
 
 
 def infer_intent(message: str) -> str:
@@ -325,16 +418,35 @@ def build_neutral_sentiment() -> SentimentResult:
 def build_role_system_prompt(role: str, memory_items: List[Dict[str, Any]]) -> str:
     role_rules = {
         "supervisor": "你是客服总调度，负责判断问题类型并给出决策建议。",
-        "knowledge": "你是知识检索专家，优先调用 search_faq，严格基于证据回复。",
-        "action": "你是客服执行专家，负责工单与账户类动作，必要时调用工具。",
+        "knowledge": "你是知识检索专家，优先调用 search_faq，负责回答套餐规则、取消订阅、帮助文档与常见问题。",
+        "action": "你是客服执行专家，负责订阅状态、账单解释、工单与账户类动作，必要时调用工具。",
         "escalation": "你是升级专员，负责人工介入、风险沟通与交接摘要。",
         "responder": "你是最终回答代理，负责融合证据与工具结果，生成最终答复。",
     }
-    memory_text = "\n".join(
-        f"- {item.get('fact', item.get('message', ''))}"
-        for item in memory_items
-        if item
-    )
+    memory_lines: List[str] = []
+    for item in memory_items:
+        if not item:
+            continue
+        memory_type = str(item.get("memory_type", item.get("kind", "memory"))).strip().lower()
+        content = (
+            item.get("content")
+            or item.get("summary")
+            or item.get("fact")
+            or item.get("message")
+            or item.get("response")
+            or ""
+        )
+        if not content:
+            continue
+        label_map = {
+            "profile": "用户画像",
+            "preference": "用户偏好",
+            "open_issue": "待跟进问题",
+            "resolved_issue": "已解决问题",
+        }
+        memory_lines.append(f"- [{label_map.get(memory_type, '记忆')}] {content}")
+
+    memory_text = "\n".join(memory_lines)
     memory_block = f"\n用户长期记忆：\n{memory_text}" if memory_text else "\n用户长期记忆：暂无"
     return (
         f"{role_rules.get(role, '你是客服助手。')}\n"
@@ -358,7 +470,7 @@ def compose_action_prompt(state: OrchestrationState) -> str:
     return (
         f"用户请求：{state.get('current_message', '')}\n"
         f"{retrieval_block}"
-        "任务：判断是否需要调用工单/账户类工具，必要时执行，输出执行结果。"
+        "任务：判断是否需要调用订阅/账单/工单/账户类工具，必要时执行，输出执行结果。"
     )
 
 
@@ -377,6 +489,7 @@ def compose_responder_prompt(state: OrchestrationState) -> str:
     note_block = "\n".join(f"- {note}" for note in notes) if notes else "无"
     retrieval_text = state.get("retrieval_text") or "无"
     tool_text = state.get("tool_text") or "无"
+    decision_summary = state.get("decision_summary") or "无"
     return (
         "请基于以下结构化上下文生成最终客服答复：\n"
         f"- 用户问题：{state.get('current_message', '')}\n"
@@ -384,6 +497,7 @@ def compose_responder_prompt(state: OrchestrationState) -> str:
         f"- 风险等级：{state.get('risk', 'low')}\n"
         f"- 情绪标签：{state.get('sentiment_label', 'neutral')}\n"
         f"- 挫败分：{state.get('frustration_score', 0.0):.2f}\n"
+        f"- 图决策摘要：{decision_summary}\n"
         f"- 知识证据：\n{retrieval_text}\n"
         f"- 工具执行结果：\n{tool_text}\n"
         f"- 是否人工升级：{'是' if state.get('escalated') else '否'}\n"
@@ -510,16 +624,30 @@ class SupportAgentOrchestrator:
                 "needs_action_after_knowledge": route["needs_action_after_knowledge"],
                 "needs_escalation": route["needs_escalation"],
                 "reason": route["route_reason"],
+                "decision_summary": route["decision_summary"],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
 
+        trace_update = extend_trace(
+            state,
+            node="analyze",
+            agent="supervisor",
+            summary=route["decision_summary"],
+            details={
+                "selected_agent": route["selected_agent"],
+                "execution_steps": route["execution_steps"],
+                "intent": route["intent"],
+                "risk": route["risk"],
+            },
+        )
         return {
             "intent": route["intent"],
             "risk": route["risk"],
             "sentiment_label": route["sentiment_label"],
             "frustration_score": route["frustration_score"],
             "route_reason": route["route_reason"],
+            "decision_summary": route["decision_summary"],
             "selected_agent": route["selected_agent"],
             "active_agent": route["selected_agent"],
             "execution_steps": route["execution_steps"],
@@ -529,6 +657,7 @@ class SupportAgentOrchestrator:
             "needs_escalation": route["needs_escalation"],
             "run_status": "completed",
             "interrupts": [],
+            **trace_update,
         }
 
     def node_knowledge(self, state: OrchestrationState) -> Dict[str, Any]:
@@ -537,7 +666,10 @@ class SupportAgentOrchestrator:
         intent = state.get("intent", "question")
         risk = state.get("risk", "low")
 
-        if self.owner.llm_enabled:
+        structured_lookup = self.owner._run_structured_knowledge_lookup(state.get("current_message", ""))
+        if structured_lookup is not None:
+            retrieval_text = structured_lookup
+        elif self.owner.llm_enabled:
             result = self.owner._call_role_agent(
                 role="knowledge",
                 user_id=user_id,
@@ -551,11 +683,23 @@ class SupportAgentOrchestrator:
             retrieval_text = self.owner._fallback_response("knowledge", user_id, state.get("current_message", ""), None)
 
         citations = merge_unique(state.get("citations", []), extract_citations(retrieval_text))
+        trace_update = extend_trace(
+            state,
+            node="knowledge",
+            agent="knowledge",
+            summary="知识检索已完成。",
+            details={
+                "has_retrieval": bool(retrieval_text),
+                "citation_count": len(citations),
+                "text_length": len(retrieval_text),
+            },
+        )
         return {
             "active_agent": "knowledge",
             "retrieval_text": retrieval_text,
             "citations": citations,
             "run_status": "completed",
+            **trace_update,
         }
 
     def node_action(self, state: OrchestrationState) -> Dict[str, Any]:
@@ -564,7 +708,13 @@ class SupportAgentOrchestrator:
         intent = state.get("intent", "request")
         risk = state.get("risk", "medium")
 
-        if self.owner.llm_enabled:
+        structured_action = self.owner._run_structured_business_action(
+            user_id=user_id,
+            message=state.get("current_message", ""),
+        )
+        if structured_action is not None:
+            tool_text = structured_action
+        elif self.owner.llm_enabled:
             result = self.owner._call_role_agent(
                 role="action",
                 user_id=user_id,
@@ -575,11 +725,21 @@ class SupportAgentOrchestrator:
             )
             interrupts = self.owner._extract_interrupts(result)
             if interrupts:
+                interrupt_tools = [item.get("tool_label") or item.get("tool") for item in interrupts]
+                trace_update = extend_trace(
+                    state,
+                    node="action",
+                    agent="action",
+                    summary=f"动作执行命中 HITL，待审批动作：{'、'.join(interrupt_tools)}。",
+                    status="interrupted",
+                    details={"interrupt_count": len(interrupts), "tools": interrupt_tools},
+                )
                 return {
                     "active_agent": "action",
                     "run_status": "interrupted",
                     "interrupts": interrupts,
                     "citations": state.get("citations", []),
+                    **trace_update,
                 }
             tool_text = self.owner._extract_ai_text(result)
         else:
@@ -588,6 +748,17 @@ class SupportAgentOrchestrator:
         ticket_id = ticket_id_from_text(tool_text) or state.get("ticket_id")
         citations = merge_unique(state.get("citations", []), extract_citations(tool_text))
         escalated = bool(state.get("escalated")) or is_positive_escalation_text(tool_text)
+        trace_update = extend_trace(
+            state,
+            node="action",
+            agent="action",
+            summary="动作执行已完成。",
+            details={
+                "ticket_id": ticket_id,
+                "escalated": escalated,
+                "citation_count": len(citations),
+            },
+        )
         return {
             "active_agent": "action",
             "tool_text": tool_text,
@@ -596,6 +767,7 @@ class SupportAgentOrchestrator:
             "run_status": "completed",
             "interrupts": [],
             "citations": citations,
+            **trace_update,
         }
 
     def node_escalation(self, state: OrchestrationState) -> Dict[str, Any]:
@@ -614,12 +786,22 @@ class SupportAgentOrchestrator:
             )
             interrupts = self.owner._extract_interrupts(result)
             if interrupts:
+                interrupt_tools = [item.get("tool_label") or item.get("tool") for item in interrupts]
+                trace_update = extend_trace(
+                    state,
+                    node="escalation",
+                    agent="escalation",
+                    summary=f"人工升级动作待审批：{'、'.join(interrupt_tools)}。",
+                    status="interrupted",
+                    details={"interrupt_count": len(interrupts), "tools": interrupt_tools},
+                )
                 return {
                     "active_agent": "escalation",
                     "run_status": "interrupted",
                     "interrupts": interrupts,
                     "escalated": True,
                     "citations": state.get("citations", []),
+                    **trace_update,
                 }
             tool_text = self.owner._extract_ai_text(result)
         else:
@@ -627,6 +809,16 @@ class SupportAgentOrchestrator:
 
         ticket_id = ticket_id_from_text(tool_text) or state.get("ticket_id")
         citations = merge_unique(state.get("citations", []), extract_citations(tool_text))
+        trace_update = extend_trace(
+            state,
+            node="escalation",
+            agent="escalation",
+            summary="人工升级流程已完成。",
+            details={
+                "ticket_id": ticket_id,
+                "citation_count": len(citations),
+            },
+        )
         return {
             "active_agent": "escalation",
             "tool_text": tool_text,
@@ -635,14 +827,28 @@ class SupportAgentOrchestrator:
             "run_status": "completed",
             "interrupts": [],
             "citations": citations,
+            **trace_update,
         }
 
     def node_validate(self, state: OrchestrationState) -> Dict[str, Any]:
         notes: List[str] = []
         retrieval_text = (state.get("retrieval_text") or "").strip()
         tool_text = (state.get("tool_text") or "").strip()
+        current_message = state.get("current_message", "")
         combined_text = "\n".join(part for part in (retrieval_text, tool_text) if part).strip()
         has_evidence = bool(state.get("retrieval_text") or state.get("tool_text"))
+        selected_agent = state.get("selected_agent")
+        is_subscription_query = any(token in current_message for token in ("套餐", "订阅", "续费"))
+        is_billing_query = any(token in current_message for token in ("账单", "发票", "扣费", "扣款", "金额"))
+        needs_next_step = (
+            not combined_text
+            or selected_agent in {"action", "escalation"}
+            or state.get("intent") == "complaint"
+        )
+        has_next_step_signal = any(
+            token in combined_text
+            for token in ("下一步", "接下来", "稍后", "分钟", "小时", "工作日", "请", "建议")
+        )
 
         if not combined_text:
             notes.append("当前没有有效证据或执行结果，需要明确告知用户信息不足并给出下一步建议。")
@@ -655,12 +861,31 @@ class SupportAgentOrchestrator:
             notes.append("如果已经生成工单号，需要在最终回复中明确展示。")
         if state.get("escalated") and "人工" not in combined_text and "升级" not in combined_text:
             notes.append("如果已经升级人工，需要明确告知用户后续人工跟进。")
+        if state.get("selected_agent") in {"action", "escalation"} and not tool_text and state.get("run_status") == "completed":
+            notes.append("如果本轮未真正执行动作，需要解释原因并给出下一步处理方式。")
+        if retrieval_text and "来源：" not in retrieval_text and not state.get("citations"):
+            notes.append("知识检索结果存在但未体现来源，最终回复中必须补充来源信息。")
+        if is_subscription_query and not any(token in combined_text for token in ("套餐", "订阅", "续费", "状态")):
+            notes.append("订阅类问题的最终回复需要明确写出套餐、订阅状态或续费信息。")
+        if is_billing_query and not any(token in combined_text for token in ("账单", "发票", "金额", "扣费")):
+            notes.append("账单类问题的最终回复需要明确写出账单、金额或扣费说明。")
+        if needs_next_step and not has_next_step_signal:
+            notes.append("最终回复需要先直接回答用户核心问题，再给出明确的下一步建议或处理时效。")
         if not has_evidence and state.get("intent") in {"question", "request", "complaint"}:
             notes.append("如果证据不足，需要主动说明信息缺口并引导补充信息。")
 
+        trace_update = extend_trace(
+            state,
+            node="validate",
+            agent="validator",
+            summary="校验通过。" if not notes else f"校验发现 {len(notes)} 项修正要求。",
+            status="completed" if not notes else "needs_revision",
+            details={"validation_passed": not notes, "note_count": len(notes)},
+        )
         return {
             "validation_notes": notes,
             "validation_passed": not notes,
+            **trace_update,
         }
 
     def node_respond(self, state: OrchestrationState) -> Dict[str, Any]:
@@ -690,10 +915,22 @@ class SupportAgentOrchestrator:
         citations = merge_unique(state.get("citations", []), extract_citations(final_message))
         ticket_id = state.get("ticket_id") or ticket_id_from_text(final_message)
         escalated = bool(state.get("escalated") or state.get("selected_agent") == "escalation")
+        trace_update = extend_trace(
+            state,
+            node="respond",
+            agent="responder",
+            summary="最终回复已生成。",
+            details={
+                "message_length": len(final_message),
+                "citation_count": len(citations),
+                "validation_passed": state.get("validation_passed", True),
+            },
+        )
         return {
             "final_message": final_message,
             "ticket_id": ticket_id,
             "escalated": escalated,
             "citations": citations,
             "run_status": "completed",
+            **trace_update,
         }
