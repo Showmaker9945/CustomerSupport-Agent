@@ -1,16 +1,51 @@
-﻿# CustomerSupport-Agent
+# CustomerSupport-Agent
 
-一个中文优先的客服 Agent Demo，基于 LangGraph 多 Agent、FastAPI、混合检索 RAG、持久记忆和 HITL 审批流程构建，适合作为实习简历中的工程化 Agent 项目。
+一个中文优先的客服 Agent Demo，基于 LangGraph 条件路由、多 Agent 协作、HITL 审批、混合检索 RAG、长短期记忆与 FastAPI 构建，适合作为实习简历里的工程化 Agent 项目。
+
+## 简历版摘要
+
+一句话版本：
+
+基于 LangGraph 和 FastAPI 实现中文客服 Agent 系统，支持条件路由、多 Agent 协作、HITL 审批、混合检索 RAG 与持久记忆，并完成可演示 API 与测试闭环。
+
+三点版本：
+
+- 使用 LangGraph 搭建中文客服多 Agent 图，按意图、风险和上下文在知识检索、业务执行、人工升级等路径间条件路由。
+- 实现 middleware、HITL 审批、线程级状态恢复与用户级长期记忆，保证高风险动作可中断、可恢复、可追踪。
+- 基于 FastAPI 提供 REST、SSE、WebSocket 与 Swagger Demo，并补齐单元测试，形成可直接展示的完整后端项目。
+
+更多求职用表述见 [CAREER_GUIDE.md](./CAREER_GUIDE.md)。
 
 ## 项目亮点
 
-- LangGraph 条件边编排：分析、知识检索、动作执行、升级、校验、回复分层明确
-- LangChain v1 / LangGraph v1：使用 `create_agent` + middleware 体系
-- 中文优先客服体验：默认中文输出、中文情绪识别、中文 FAQ 与业务示例
+- LangGraph 条件边编排：分析、路由、检索、执行、升级、校验、回复职责清晰
+- LangChain v1 / LangGraph v1：对齐 `create_agent` 与 middleware 体系
+- 中文优先：默认中文输出、中文情绪识别、中文 FAQ 与业务示例
 - 轻量增强 RAG：混合检索、查询规范化、分类推断、子问题拆分、一次改写兜底
-- Memory 治理：线程级状态、用户级长期记忆、记忆抽取与调试输出
-- HITL：高风险工具调用中断、审批后恢复同一线程
-- FastAPI 演示友好：REST、WebSocket、SSE、Swagger 文档、完整单测
+- Memory 治理：线程级短期记忆、用户级长期记忆、记忆抽取与召回
+- HITL：高风险工具先中断审批，再恢复同一线程执行
+- FastAPI 演示友好：REST、WebSocket、SSE、Swagger、回归测试
+
+## 适合展示的能力
+
+- 会搭 LangGraph，而不是只写单条 chain
+- 会做 Agent 的工程化落地，而不是只调模型
+- 会把 RAG、记忆、工具调用、审批流整合成完整后端系统
+- 会补测试、补文档、补运行方式，让项目真的能演示
+
+## 核心架构
+
+主流程：
+
+`用户请求 -> 分析节点 -> 条件路由 -> 知识检索 / 业务执行 / 人工升级 -> 校验节点 -> 中文回复`
+
+关键模块：
+
+- `src/conversation/support_agent/`：Support Agent 图、服务层、中间件、持久化适配
+- `src/knowledge/faq_store.py`：FAQ 知识库、混合检索、融合与轻量增强 RAG
+- `src/tools/support_tools.py`：账户、订阅、账单、工单、人工升级等业务工具
+- `src/api/main.py`：FastAPI、Swagger、SSE、WebSocket、恢复接口
+- `src/sentiment/analyzer.py`：中文优先情绪识别
 
 ## 当前技术栈
 
@@ -21,7 +56,7 @@
 - LangGraph 1.x
 - ChromaDB + BM25
 - Sentence Transformers
-- PostgreSQL + pgvector（可选，用于持久化/长期记忆扩展）
+- PostgreSQL + pgvector（可选，用于持久化和长期记忆扩展）
 
 ## 目录结构
 
@@ -82,7 +117,7 @@ LLM_HIGH_QUALITY_MODEL=qwen-max
 
 - 主配置项是 `LLM_API_KEY`
 - `OPENAI_API_KEY` 仅保留向后兼容，不再作为默认说明
-- 本项目默认使用千问兼容接口，不需要额外改 provider
+- 项目默认使用千问兼容接口，不需要额外改 provider
 
 ### 4. 启动服务
 
@@ -118,7 +153,7 @@ uv run pytest
 uv run pytest --cov=src --cov-report=term-missing --cov-report=html
 ```
 
-## Docs 验证建议
+## 推荐演示路径
 
 建议在 `/docs` 里按下面顺序验证：
 
@@ -166,17 +201,17 @@ LANGGRAPH_USE_POSTGRES=true
 LANGGRAPH_PERSISTENCE_BACKEND=postgres
 ```
 
-## 工程说明
+## 项目定位
 
-这个项目当前更强调：
+这个项目更强调：
 
-- Agent 图设计是否清晰
-- 中间件和 HITL 能否体现 LangGraph 工程能力
-- RAG 是否“有效而轻量”，而不是堆砌复杂组件
-- API、测试、调试输出是否足够适合作为 demo 展示
+- Agent 图设计清晰，而不是把所有逻辑塞进单个 Agent
+- 中间件、审批流、持久化、RAG、业务工具能够协同工作
+- API、测试、文档齐全，适合作为简历 Demo 和现场演示项目
 
 ## 相关文档
 
+- [CAREER_GUIDE.md](./CAREER_GUIDE.md)
 - [PROJECT_OVERVIEW.md](./PROJECT_OVERVIEW.md)
 - [examples/README.md](./examples/README.md)
 
