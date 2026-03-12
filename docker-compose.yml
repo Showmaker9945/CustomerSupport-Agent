@@ -21,7 +21,7 @@
       LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       LLM_API_KEY: ${LLM_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:///./data/support.db}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://support_user:support_pass@postgres:5432/support}
       POSTGRES_URI: ${POSTGRES_URI:-postgresql://support_user:support_pass@postgres:5432/support?sslmode=disable}
       LANGGRAPH_PERSISTENCE_BACKEND: ${LANGGRAPH_PERSISTENCE_BACKEND:-memory}
       LANGGRAPH_USE_POSTGRES: ${LANGGRAPH_USE_POSTGRES:-false}

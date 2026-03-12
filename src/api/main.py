@@ -28,10 +28,9 @@ from sse_starlette.sse import EventSourceResponse
 from ..config import settings
 from ..conversation.support_agent import get_support_agent, peek_support_agent
 from ..tools.support_tools import (
-    TicketStore,
     get_latest_invoice_record,
     get_subscription_record,
-    get_ticket_store,
+    list_ticket_records,
 )
 
 logger = logging.getLogger(__name__)
@@ -387,9 +386,8 @@ async def websocket_chat(websocket: WebSocket, user_id: str) -> None:
 
 @app.get("/users/{user_id}/tickets")
 async def get_user_tickets(user_id: str, status: Optional[str] = None):
-    ticket_store: TicketStore = get_ticket_store()
-    tickets = ticket_store.get_user_tickets(user_id, status=status)
-    return {"user_id": user_id, "tickets": [ticket.to_dict() for ticket in tickets], "count": len(tickets)}
+    tickets = list_ticket_records(user_id, status=status)
+    return {"user_id": user_id, "tickets": tickets, "count": len(tickets)}
 
 
 @app.get("/users/{user_id}/subscription")

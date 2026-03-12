@@ -5,7 +5,6 @@ Provides ticket management, account lookup, and FAQ search tools
 that can be used by LangChain agents.
 """
 
-import copy
 import json
 import logging
 import threading
@@ -18,51 +17,30 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.tools import tool
 
 from ..config import settings
+from ..db.demo_seed import load_seed_accounts, load_seed_invoices, load_seed_subscriptions
+from ..db.repositories import (
+    create_ticket_record,
+    ensure_business_database,
+    get_invoice_record as repo_get_invoice_record,
+    get_latest_invoice_record as repo_get_latest_invoice_record,
+    get_subscription_record as repo_get_subscription_record,
+    get_ticket_record,
+    get_user_record as repo_get_user_record,
+    list_ticket_records,
+    update_ticket_record,
+)
 from ..knowledge.faq_store import FAQStore, create_faq_store
 
 logger = logging.getLogger(__name__)
 
 
-# Load mock accounts from external file
 def _load_mock_accounts() -> Dict[str, Any]:
-    """Load mock account data from JSON file."""
-    mock_path = Path(__file__).parent.parent.parent / "data" / "mock_accounts.json"
+    """Load seed accounts from external JSON file."""
     try:
-        if mock_path.exists():
-            with open(mock_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+        return load_seed_accounts()
     except Exception as e:
-        logger.warning(f"Failed to load mock accounts from {mock_path}: {e}")
-    # Built-in fallback so tools and tests still work without external file.
-    return {
-        "user_001": {
-            "user_id": "user_001",
-            "name": "Alice Johnson",
-            "email": "alice.johnson@example.com",
-            "plan": "Pro",
-            "status": "active",
-            "member_since": "2023-01-15",
-            "company": "Acme Labs",
-            "usage": {
-                "storage_used": "42GB",
-                "storage_limit": "100GB",
-                "api_calls_this_month": 12840,
-                "api_limit": 50000,
-                "team_members": 8,
-                "team_limit": 20,
-            },
-            "billing": {
-                "invoice_amount": "¥199.00",
-                "last_payment": "2026-03-01",
-                "payment_method": "Visa **** 4242",
-            },
-            "support_history": {
-                "total_tickets": 12,
-                "resolved_tickets": 11,
-                "avg_resolution_time": "6h",
-            },
-        }
-    }
+        logger.warning(f"Failed to load demo seed accounts: {e}")
+        return {}
 
 
 class TicketStatus(str, Enum):
@@ -352,122 +330,49 @@ class TicketStore:
         return results
 
 
-# Mock account database for demo - loaded from external file
 MOCK_ACCOUNTS: Dict[str, Any] = _load_mock_accounts()
+try:
+    MOCK_SUBSCRIPTIONS = load_seed_subscriptions()
+except Exception as error:
+    logger.warning(f"Failed to load demo seed subscriptions: {error}")
+    MOCK_SUBSCRIPTIONS = {}
 
-
-def _build_mock_subscriptions() -> Dict[str, Dict[str, Any]]:
-    """Build compact subscription records for demo flows."""
-    return {
-        "user_001": {
-            "user_id": "user_001",
-            "plan_name": "Pro 团队版",
-            "plan_code": "pro_monthly",
-            "status": "active",
-            "billing_cycle": "monthly",
-            "renewal_date": "2026-04-01",
-            "currency": "CNY",
-            "amount": 199.0,
-            "auto_renew": True,
-            "seat_quota": 20,
-            "seats_used": 8,
-            "benefits": ["高级知识库检索", "团队协作权限", "优先客服支持"],
-        },
-        "user_002": {
-            "user_id": "user_002",
-            "plan_name": "Free 免费版",
-            "plan_code": "free",
-            "status": "active",
-            "billing_cycle": "monthly",
-            "renewal_date": None,
-            "currency": "CNY",
-            "amount": 0.0,
-            "auto_renew": False,
-            "seat_quota": 3,
-            "seats_used": 1,
-            "benefits": ["基础问答", "单人空间"],
-        },
-    }
-
-
-def _build_mock_invoices() -> Dict[str, List[Dict[str, Any]]]:
-    """Build compact invoice ledger for demo flows."""
-    return {
-        "user_001": [
-            {
-                "invoice_id": "INV-202603-0001",
-                "user_id": "user_001",
-                "issued_at": "2026-03-01",
-                "period_start": "2026-03-01",
-                "period_end": "2026-03-31",
-                "status": "paid",
-                "currency": "CNY",
-                "total_amount": 199.0,
-                "payment_method": "Visa **** 4242",
-                "summary": "2026 年 3 月 Pro 团队版续费",
-                "line_items": [
-                    {
-                        "name": "Pro 团队版月费",
-                        "amount": 159.0,
-                        "type": "subscription",
-                        "reason": "3 月套餐续费",
-                    },
-                    {
-                        "name": "超额存储包 100GB",
-                        "amount": 40.0,
-                        "type": "usage",
-                        "reason": "2 月存储使用超出基础额度",
-                    },
-                ],
-                "explanation": [
-                    "本次扣费的主体是 3 月份 Pro 团队版月费。",
-                    "额外 40 元来自上一个计费周期的超额存储。",
-                    "当前账单已支付成功，没有重复扣款迹象。",
-                ],
-            },
-            {
-                "invoice_id": "INV-202602-0008",
-                "user_id": "user_001",
-                "issued_at": "2026-02-01",
-                "period_start": "2026-02-01",
-                "period_end": "2026-02-28",
-                "status": "paid",
-                "currency": "CNY",
-                "total_amount": 159.0,
-                "payment_method": "Visa **** 4242",
-                "summary": "2026 年 2 月 Pro 团队版续费",
-                "line_items": [
-                    {
-                        "name": "Pro 团队版月费",
-                        "amount": 159.0,
-                        "type": "subscription",
-                        "reason": "2 月套餐续费",
-                    }
-                ],
-                "explanation": [
-                    "本次账单仅包含标准月费，没有额外用量费用。"
-                ],
-            },
-        ],
-        "user_002": [],
-    }
-
-
-MOCK_SUBSCRIPTIONS = _build_mock_subscriptions()
-MOCK_INVOICES = _build_mock_invoices()
+try:
+    MOCK_INVOICES = load_seed_invoices()
+except Exception as error:
+    logger.warning(f"Failed to load demo seed invoices: {error}")
+    MOCK_INVOICES = {}
 
 
 def get_account_record(user_id: str) -> Optional[Dict[str, Any]]:
-    """Get a safe copy of account data."""
+    """Get account data from the business database."""
+    try:
+        ensure_business_database()
+        account = repo_get_user_record(user_id)
+        if account:
+            return account
+    except Exception as error:
+        logger.error(f"Business account lookup failed for {user_id}: {error}")
+
     account = MOCK_ACCOUNTS.get(user_id)
-    return copy.deepcopy(account) if account else None
+    if not account:
+        return None
+    return json.loads(json.dumps(account, ensure_ascii=False))
 
 
 def get_subscription_record(user_id: str) -> Optional[Dict[str, Any]]:
-    """Get a safe copy of subscription data."""
+    """Get subscription data from the business database."""
+    try:
+        ensure_business_database()
+        record = repo_get_subscription_record(user_id)
+        if record:
+            return record
+    except Exception as error:
+        logger.error(f"Business subscription lookup failed for {user_id}: {error}")
+
     record = MOCK_SUBSCRIPTIONS.get(user_id)
     if record:
-        return copy.deepcopy(record)
+        return json.loads(json.dumps(record, ensure_ascii=False))
 
     account = get_account_record(user_id)
     if not account:
@@ -494,20 +399,36 @@ def get_subscription_record(user_id: str) -> Optional[Dict[str, Any]]:
 
 def get_latest_invoice_record(user_id: str) -> Optional[Dict[str, Any]]:
     """Get latest invoice for a user."""
+    try:
+        ensure_business_database()
+        record = repo_get_latest_invoice_record(user_id)
+        if record:
+            return record
+    except Exception as error:
+        logger.error(f"Business latest invoice lookup failed for {user_id}: {error}")
+
     invoices = MOCK_INVOICES.get(user_id, [])
     if not invoices:
         return None
     sorted_invoices = sorted(invoices, key=lambda item: item.get("issued_at", ""), reverse=True)
-    return copy.deepcopy(sorted_invoices[0])
+    return json.loads(json.dumps(sorted_invoices[0], ensure_ascii=False))
 
 
 def get_invoice_record(invoice_id: str) -> Optional[Dict[str, Any]]:
     """Get invoice by invoice ID."""
     normalized = str(invoice_id).strip().upper()
+    try:
+        ensure_business_database()
+        record = repo_get_invoice_record(normalized)
+        if record:
+            return record
+    except Exception as error:
+        logger.error(f"Business invoice lookup failed for {invoice_id}: {error}")
+
     for invoices in MOCK_INVOICES.values():
         for invoice in invoices:
             if str(invoice.get("invoice_id", "")).upper() == normalized:
-                return copy.deepcopy(invoice)
+                return json.loads(json.dumps(invoice, ensure_ascii=False))
     return None
 
 
@@ -515,6 +436,10 @@ def _format_money(amount: float, currency: str) -> str:
     if str(currency).upper() == "CNY":
         return f"¥{amount:.2f}"
     return f"{str(currency).upper()} {amount:.2f}"
+
+
+def _record_to_ticket(record: Dict[str, Any]) -> Ticket:
+    return Ticket.from_dict(record)
 
 
 def _ticket_next_step(ticket: Ticket) -> str:
@@ -662,13 +587,14 @@ def create_ticket(
         创建结果和工单号
     """
     try:
-        store = get_ticket_store()
-        ticket = store.create_ticket(
-            user_id=user_id,
-            subject=subject,
-            description=description,
-            priority=priority,
-            category=category,
+        ticket = _record_to_ticket(
+            create_ticket_record(
+                user_id=user_id,
+                subject=subject,
+                description=description,
+                priority=priority,
+                category=category,
+            )
         )
 
         return (
@@ -697,8 +623,8 @@ def get_ticket_status(ticket_id: str) -> str:
         工单详情文本
     """
     try:
-        store = get_ticket_store()
-        ticket = store.get_ticket(ticket_id)
+        record = get_ticket_record(ticket_id)
+        ticket = _record_to_ticket(record) if record else None
 
         if not ticket:
             return f"未找到工单 {ticket_id}，请检查工单号是否正确。"
@@ -752,12 +678,12 @@ def update_ticket(
         更新结果
     """
     try:
-        store = get_ticket_store()
-        ticket = store.update_ticket(
+        record = update_ticket_record(
             ticket_id=ticket_id,
             status=status,
-            notes=notes
+            notes=notes,
         )
+        ticket = _record_to_ticket(record) if record else None
 
         if not ticket:
             return f"未找到工单 {ticket_id}。"
@@ -791,8 +717,7 @@ def get_user_tickets(user_id: str, status: Optional[str] = None) -> str:
         工单列表摘要
     """
     try:
-        store = get_ticket_store()
-        tickets = store.get_user_tickets(user_id, status=status)
+        tickets = [_record_to_ticket(record) for record in list_ticket_records(user_id, status=status)]
 
         if not tickets:
             return f"用户 {user_id} 暂无工单记录。"
@@ -1022,24 +947,26 @@ def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> s
         升级结果和工单信息
     """
     try:
-        store = get_ticket_store()
-
-        ticket = store.create_ticket(
-            user_id=user_id,
-            subject=f"人工升级：{reason}",
-            description=conversation_summary,
-            priority="high",
-            category="escalation",
-            metadata={"escalated": True, "reason": reason}
+        ticket = _record_to_ticket(
+            create_ticket_record(
+                user_id=user_id,
+                subject=f"人工升级：{reason}",
+                description=conversation_summary,
+                priority="high",
+                category="escalation",
+                metadata={"escalated": True, "reason": reason},
+            )
         )
 
-        store.update_ticket(
-            ticket.ticket_id,
+        updated = update_ticket_record(
+            ticket_id=ticket.ticket_id,
             status="in_progress",
-            notes=f"由AI升级，原因：{reason}"
+            notes=f"由AI升级，原因：{reason}",
         )
+        if updated:
+            ticket = _record_to_ticket(updated)
 
-        account = MOCK_ACCOUNTS.get(user_id)
+        account = get_account_record(user_id)
         user_name = account['name'] if account else "用户"
 
         return (
@@ -1112,4 +1039,3 @@ if __name__ == "__main__":
     print(result[:300] + "...")
 
     print("\n" + "=" * 60)
-

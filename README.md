@@ -14,7 +14,6 @@
 - 实现 middleware、HITL 审批、线程级状态恢复与用户级长期记忆，保证高风险动作可中断、可恢复、可追踪。
 - 基于 FastAPI 提供 REST、SSE、WebSocket 与 Swagger Demo，并补齐单元测试，形成可直接展示的完整后端项目。
 
-更多求职用表述见 [CAREER_GUIDE.md](./CAREER_GUIDE.md)。
 
 ## 项目亮点
 
@@ -180,6 +179,24 @@ uv run pytest --cov=src --cov-report=term-missing --cov-report=html
 
 更详细的验证脚本和场景见 [examples/README.md](./examples/README.md)。
 
+## 业务数据说明
+
+- 结构化业务数据默认使用 PostgreSQL：`users`、`subscriptions`、`invoices`、`invoice_items`、`tickets`
+- FAQ / RAG 检索继续使用 Chroma
+- `data/demo_seed/` 中的 JSON 只作为演示初始化数据，不再作为运行时主存储
+
+### 初始化 PostgreSQL 演示数据
+
+```bash
+# 1. 启动 PostgreSQL
+docker compose up -d postgres
+
+# 2. 初始化业务表与 demo 数据
+uv run python scripts/init_demo_db.py
+```
+
+初始化完成后，可通过 `docker exec -it support-postgres psql -U support_user -d support` 进入数据库，再用 `\dt` 查看表结构。
+
 ## Docker
 
 构建镜像：
@@ -211,7 +228,6 @@ LANGGRAPH_PERSISTENCE_BACKEND=postgres
 
 ## 相关文档
 
-- [CAREER_GUIDE.md](./CAREER_GUIDE.md)
 - [PROJECT_OVERVIEW.md](./PROJECT_OVERVIEW.md)
 - [examples/README.md](./examples/README.md)
 

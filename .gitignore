@@ -12,6 +12,13 @@ dist/
 
 # Virtual environments
 .venv/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.fls
+*.fdb_latexmk
+*.out
 venv/
 env/
 ENV/
@@ -44,3 +51,6 @@ data/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Personal materials
+career/
