@@ -117,3 +117,17 @@ def fake_faq_dependencies(monkeypatch):
     monkeypatch.setattr(faq_store_module, "SentenceTransformer", FakeSentenceTransformer)
     monkeypatch.setattr(faq_store_module.chromadb, "PersistentClient", FakePersistentClient)
     yield
+
+
+@pytest.fixture
+def isolated_business_db(monkeypatch, tmp_path):
+    from src.config import settings
+    from src.db.repositories import reset_business_database
+    from src.db.session import reset_database_connection
+
+    db_path = (tmp_path / "business.db").resolve()
+    monkeypatch.setattr(settings, "database_url", f"sqlite+pysqlite:///{db_path.as_posix()}", raising=False)
+    reset_database_connection()
+    reset_business_database(seed_demo=True)
+    yield
+    reset_database_connection()

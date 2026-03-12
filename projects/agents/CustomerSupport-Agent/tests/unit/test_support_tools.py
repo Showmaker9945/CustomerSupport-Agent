@@ -22,6 +22,11 @@ from src.tools.support_tools import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_business_runtime(isolated_business_db):
+    yield
+
+
 class TestTicket:
     """Test Ticket data model."""
 

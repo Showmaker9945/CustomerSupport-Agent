@@ -6,9 +6,7 @@ from fastapi.testclient import TestClient
 from src.api.main import app
 from src.conversation.support_agent import SupportAgent
 from src.conversation.support_agent import service as support_service
-from src.tools import support_tools
 from src.tools.support_tools import (
-    TicketStore,
     create_ticket,
     explain_invoice_charge,
     get_latest_invoice,
@@ -17,21 +15,18 @@ from src.tools.support_tools import (
 
 
 @pytest.fixture(autouse=True)
-def isolate_runtime(monkeypatch, tmp_path):
+def isolate_runtime(monkeypatch, isolated_business_db):
     """Keep global agent/ticket state deterministic across tests."""
     monkeypatch.setenv("DISABLE_LLM", "true")
 
     if support_service._support_agent is not None:
         support_service._support_agent.close()
     support_service._support_agent = None
-
-    support_tools._ticket_store = TicketStore(persist_path=tmp_path / "tickets.json")
     yield
 
     if support_service._support_agent is not None:
         support_service._support_agent.close()
-    support_service._support_agent = None
-    support_tools.reset_ticket_store()
+        support_service._support_agent = None
 
 
 @pytest.fixture
