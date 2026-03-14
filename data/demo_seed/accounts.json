@@ -1,0 +1,56 @@
+{
+  "user_001": {
+    "user_id": "user_001",
+    "name": "Alice Johnson",
+    "email": "alice.johnson@example.com",
+    "plan": "Pro",
+    "status": "active",
+    "member_since": "2023-01-15",
+    "company": "Acme Labs",
+    "usage": {
+      "storage_used": "42GB",
+      "storage_limit": "100GB",
+      "api_calls_this_month": 12840,
+      "api_limit": 50000,
+      "team_members": 8,
+      "team_limit": 20
+    },
+    "billing": {
+      "invoice_amount": "¥199.00",
+      "last_payment": "2026-03-01",
+      "payment_method": "Visa **** 4242"
+    },
+    "support_history": {
+      "total_tickets": 2,
+      "resolved_tickets": 1,
+      "avg_resolution_time": "6h"
+    }
+  },
+  "user_002": {
+    "user_id": "user_002",
+    "name": "Bob Chen",
+    "email": "bob.chen@example.com",
+    "plan": "Free",
+    "status": "active",
+    "member_since": "2025-06-08",
+    "company": null,
+    "usage": {
+      "storage_used": "2GB",
+      "storage_limit": "5GB",
+      "api_calls_this_month": 120,
+      "api_limit": 1000,
+      "team_members": 1,
+      "team_limit": 3
+    },
+    "billing": {
+      "invoice_amount": "¥0.00",
+      "last_payment": null,
+      "payment_method": null
+    },
+    "support_history": {
+      "total_tickets": 0,
+      "resolved_tickets": 0,
+      "avg_resolution_time": "N/A"
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "user_001": [
+    {
+      "invoice_id": "INV-202603-0001",
+      "user_id": "user_001",
+      "issued_at": "2026-03-01",
+      "period_start": "2026-03-01",
+      "period_end": "2026-03-31",
+      "status": "paid",
+      "currency": "CNY",
+      "total_amount": 199.0,
+      "payment_method": "Visa **** 4242",
+      "summary": "2026 年 3 月 Pro 团队版续费",
+      "line_items": [
+        {
+          "name": "Pro 团队版月费",
+          "amount": 159.0,
+          "type": "subscription",
+          "reason": "3 月套餐续费"
+        },
+        {
+          "name": "超额存储包 100GB",
+          "amount": 40.0,
+          "type": "usage",
+          "reason": "2 月存储使用超出基础额度"
+        }
+      ],
+      "explanation": [
+        "本次扣费的主体是 3 月份 Pro 团队版月费。",
+        "额外 40 元来自上一个计费周期的超额存储。",
+        "当前账单已支付成功，没有重复扣款迹象。"
+      ]
+    },
+    {
+      "invoice_id": "INV-202602-0008",
+      "user_id": "user_001",
+      "issued_at": "2026-02-01",
+      "period_start": "2026-02-01",
+      "period_end": "2026-02-28",
+      "status": "paid",
+      "currency": "CNY",
+      "total_amount": 159.0,
+      "payment_method": "Visa **** 4242",
+      "summary": "2026 年 2 月 Pro 团队版续费",
+      "line_items": [
+        {
+          "name": "Pro 团队版月费",
+          "amount": 159.0,
+          "type": "subscription",
+          "reason": "2 月套餐续费"
+        }
+      ],
+      "explanation": [
+        "本次账单仅包含标准月费，没有额外用量费用。"
+      ]
+    }
+  ],
+  "user_002": []
+}

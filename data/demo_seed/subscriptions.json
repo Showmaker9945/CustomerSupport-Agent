@@ -1,0 +1,37 @@
+{
+  "user_001": {
+    "user_id": "user_001",
+    "plan_name": "Pro 团队版",
+    "plan_code": "pro_monthly",
+    "status": "active",
+    "billing_cycle": "monthly",
+    "renewal_date": "2026-04-01",
+    "currency": "CNY",
+    "amount": 199.0,
+    "auto_renew": true,
+    "seat_quota": 20,
+    "seats_used": 8,
+    "benefits": [
+      "高级知识库检索",
+      "团队协作权限",
+      "优先客服支持"
+    ]
+  },
+  "user_002": {
+    "user_id": "user_002",
+    "plan_name": "Free 免费版",
+    "plan_code": "free",
+    "status": "active",
+    "billing_cycle": "monthly",
+    "renewal_date": null,
+    "currency": "CNY",
+    "amount": 0.0,
+    "auto_renew": false,
+    "seat_quota": 3,
+    "seats_used": 1,
+    "benefits": [
+      "基础问答",
+      "单人空间"
+    ]
+  }
+}

@@ -1,9 +1,4 @@
-﻿"""
-Support tools for customer service agent.
-
-Provides ticket management, account lookup, and FAQ search tools
-that can be used by LangChain agents.
-"""
+"""客服 Agent 可调用的业务工具集合。"""
 
 import json
 import logging
@@ -44,7 +39,7 @@ def _load_mock_accounts() -> Dict[str, Any]:
 
 
 class TicketStatus(str, Enum):
-    """Ticket status values."""
+    """工单状态枚举。"""
     OPEN = "open"
     IN_PROGRESS = "in_progress"
     WAITING_CUSTOMER = "waiting_customer"
@@ -53,7 +48,7 @@ class TicketStatus(str, Enum):
 
 
 class TicketPriority(str, Enum):
-    """Ticket priority levels."""
+    """工单优先级枚举。"""
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -62,7 +57,7 @@ class TicketPriority(str, Enum):
 
 @dataclass
 class Ticket:
-    """Support ticket data model."""
+    """工单领域对象。"""
     ticket_id: str
     user_id: str
     subject: str
@@ -79,7 +74,7 @@ class Ticket:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert ticket to dictionary."""
+        """将工单对象转换为字典。"""
         data = asdict(self)
         data["status"] = self.status.value
         data["priority"] = self.priority.value
@@ -87,7 +82,7 @@ class Ticket:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Ticket":
-        """Create ticket from dictionary."""
+        """从字典恢复工单对象。"""
         data = data.copy()
         if isinstance(data.get("status"), str):
             data["status"] = TicketStatus(data["status"])
@@ -97,33 +92,24 @@ class Ticket:
 
 
 class TicketStore:
-    """
-    In-memory ticket store with optional file persistence.
-
-    For production, replace with database implementation.
-    """
+    """本地演示用工单存储，支持内存读写和文件持久化。"""
 
     def __init__(self, persist_path: Optional[Path] = None):
-        """
-        Initialize ticket store.
-
-        Args:
-            persist_path: Optional path to persist tickets
-        """
+        """初始化工单存储。"""
         self.persist_path = persist_path or Path("./data/tickets.json")
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._tickets: Dict[str, Ticket] = {}
         self._user_tickets: Dict[str, List[str]] = {}  # user_id -> [ticket_ids]
-        self._ticket_counter = 0  # Counter for unique IDs
-        # Re-entrant lock prevents deadlock when nested helper methods also lock.
+        self._ticket_counter = 0  # 仅用于本地演示环境下生成唯一工单号
+        # 这里使用可重入锁，避免内部辅助方法嵌套加锁时发生死锁。
         self._lock = threading.RLock()
 
-        # Load existing tickets if file exists
+        # 启动时尝试恢复本地磁盘中的历史工单。
         self._load_from_disk()
 
     def _load_from_disk(self) -> None:
-        """Load tickets from disk."""
+        """从磁盘恢复工单数据。"""
         if not self.persist_path.exists():
             return
 
@@ -135,7 +121,7 @@ class TicketStore:
                 ticket = Ticket.from_dict(ticket_data)
                 self._tickets[ticket.ticket_id] = ticket
 
-                # Update user index
+                # 同步重建 user_id -> ticket_ids 的反向索引。
                 if ticket.user_id not in self._user_tickets:
                     self._user_tickets[ticket.user_id] = []
                 self._user_tickets[ticket.user_id].append(ticket.ticket_id)
@@ -146,7 +132,7 @@ class TicketStore:
             logger.error(f"Failed to load tickets: {e}")
 
     def _save_to_disk(self) -> None:
-        """Persist tickets to disk."""
+        """将工单持久化到本地文件。"""
         try:
             data = {
                 "tickets": [ticket.to_dict() for ticket in self._tickets.values()],
@@ -160,14 +146,9 @@ class TicketStore:
             logger.error(f"Failed to save tickets: {e}")
 
     def _generate_ticket_id(self) -> str:
-        """
-        Generate unique ticket ID.
-
-        Note: The counter is safely incremented within a lock to ensure
-        uniqueness across concurrent requests.
-        """
+        """生成唯一工单号。"""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        # Use atomic counter for uniqueness (thread-safe with lock)
+        # 在锁内自增计数器，避免并发请求下出现重复工单号。
         with self._lock:
             self._ticket_counter += 1
             return f"TKT-{timestamp}-{self._ticket_counter:04d}"
@@ -181,19 +162,7 @@ class TicketStore:
         category: str = "general",
         metadata: Optional[Dict[str, Any]] = None
     ) -> Ticket:
-        """
-        Create a new support ticket.
-
-        Args:
-            user_id: User ID
-            subject: Ticket subject
-            description: Ticket description
-            priority: Priority level (low, medium, high, urgent)
-            metadata: Optional metadata
-
-        Returns:
-            Created ticket
-        """
+        """创建新工单。"""
         with self._lock:
             ticket = Ticket(
                 ticket_id=self._generate_ticket_id(),
@@ -207,7 +176,7 @@ class TicketStore:
 
             self._tickets[ticket.ticket_id] = ticket
 
-            # Update user index
+            # 写入用户维度的工单索引，便于后续快速查询。
             if user_id not in self._user_tickets:
                 self._user_tickets[user_id] = []
             self._user_tickets[user_id].append(ticket.ticket_id)
@@ -218,15 +187,7 @@ class TicketStore:
             return ticket
 
     def get_ticket(self, ticket_id: str) -> Optional[Ticket]:
-        """
-        Get ticket by ID.
-
-        Args:
-            ticket_id: Ticket ID
-
-        Returns:
-            Ticket or None if not found
-        """
+        """按工单号查询工单。"""
         return self._tickets.get(ticket_id)
 
     def update_ticket(
@@ -237,19 +198,7 @@ class TicketStore:
         assigned_to: Optional[str] = None,
         tags: Optional[List[str]] = None
     ) -> Optional[Ticket]:
-        """
-        Update ticket.
-
-        Args:
-            ticket_id: Ticket ID
-            status: New status
-            notes: Notes to add
-            assigned_to: Assign to agent
-            tags: Tags to add
-
-        Returns:
-            Updated ticket or None if not found
-        """
+        """更新工单状态、备注、处理人与标签。"""
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             if not ticket:
@@ -268,7 +217,7 @@ class TicketStore:
 
             if tags:
                 ticket.tags.extend(tags)
-                ticket.tags = list(set(ticket.tags))  # Remove duplicates
+                ticket.tags = list(set(ticket.tags))  # 去重，避免重复标签污染工单视图。
 
             ticket.updated_at = datetime.now(timezone.utc).isoformat()
 
@@ -282,23 +231,14 @@ class TicketStore:
         user_id: str,
         status: Optional[str] = None
     ) -> List[Ticket]:
-        """
-        Get all tickets for a user.
-
-        Args:
-            user_id: User ID
-            status: Optional status filter
-
-        Returns:
-            List of tickets
-        """
+        """查询指定用户的全部工单。"""
         ticket_ids = self._user_tickets.get(user_id, [])
         tickets = [self._tickets[tid] for tid in ticket_ids if tid in self._tickets]
 
         if status:
             tickets = [t for t in tickets if t.status.value == status]
 
-        # Sort by created_at descending
+        # 默认按创建时间倒序，方便优先展示最近问题。
         tickets.sort(key=lambda t: t.created_at, reverse=True)
         return tickets
 
@@ -307,16 +247,7 @@ class TicketStore:
         query: str,
         limit: int = 10
     ) -> List[Ticket]:
-        """
-        Search tickets by subject/description.
-
-        Args:
-            query: Search query
-            limit: Max results
-
-        Returns:
-            List of matching tickets
-        """
+        """按主题和描述做简单关键词检索。"""
         query_lower = query.lower()
         results = []
 
@@ -454,12 +385,12 @@ def _ticket_next_step(ticket: Ticket) -> str:
     return "下一步：如需继续处理，可补充说明后重新联系支持团队。"
 
 
-# Global FAQ store instance
+# FAQ Store 全局单例
 _faq_store: Optional[FAQStore] = None
 
 
 def get_faq_store() -> FAQStore:
-    """Get or create global FAQ store instance."""
+    """获取或创建 FAQ Store 全局实例。"""
     global _faq_store
     if _faq_store is None:
         _faq_store = create_faq_store()
@@ -467,17 +398,17 @@ def get_faq_store() -> FAQStore:
 
 
 def reset_faq_store() -> None:
-    """Reset the global FAQ store instance (useful for testing)."""
+    """重置 FAQ Store 全局实例，主要用于测试。"""
     global _faq_store
     _faq_store = None
 
 
-# Global ticket store instance
+# TicketStore 全局单例
 _ticket_store: Optional[TicketStore] = None
 
 
 def get_ticket_store() -> TicketStore:
-    """Get or create global ticket store instance."""
+    """获取或创建 TicketStore 全局实例。"""
     global _ticket_store
     if _ticket_store is None:
         _ticket_store = TicketStore()
@@ -485,13 +416,13 @@ def get_ticket_store() -> TicketStore:
 
 
 def reset_ticket_store() -> None:
-    """Reset the global ticket store instance (useful for testing)."""
+    """重置 TicketStore 全局实例，主要用于测试。"""
     global _ticket_store
     _ticket_store = None
 
 
 # ============================================================================
-# LANGCHAIN TOOLS
+# LangChain 工具定义
 # ============================================================================
 
 @tool
@@ -984,7 +915,7 @@ def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> s
     except Exception as e:
         logger.error(f"Escalation error: {e}")
         return f"升级人工客服失败：{str(e)}"
-# List of all tools for LangChain agent
+# LangChain Agent 可见的全部工具
 ALL_TOOLS = [
     search_faq,
     reindex_knowledge_base,
@@ -1001,7 +932,7 @@ ALL_TOOLS = [
 
 
 def get_tool_by_name(name: str) -> Optional[Any]:
-    """Get a tool by name."""
+    """按工具名获取工具对象。"""
     for tool in ALL_TOOLS:
         if tool.name == name:
             return tool
@@ -1009,21 +940,21 @@ def get_tool_by_name(name: str) -> Optional[Any]:
 
 
 # ============================================================================
-# MAIN DEMO
+# 本地演示入口
 # ============================================================================
 
 if __name__ == "__main__":
-    """Demonstrate support tools usage."""
+    """演示客服工具的基础调用方式。"""
     print("=" * 60)
     print("Support Tools Demo")
     print("=" * 60)
 
-    # Test FAQ search
+    # FAQ 检索示例
     print("\n1. FAQ Search:")
     result = search_faq.invoke({"query": "password reset", "category": None})
     print(result[:200] + "...")
 
-    # Test ticket creation
+    # 工单创建示例
     print("\n2. Create Ticket:")
     result = create_ticket.invoke({
         "user_id": "demo_user",
@@ -1033,9 +964,10 @@ if __name__ == "__main__":
     })
     print(result)
 
-    # Test account lookup
+    # 账户查询示例
     print("\n3. Account Lookup:")
     result = lookup_account.invoke({"user_id": "user_001"})
     print(result[:300] + "...")
 
     print("\n" + "=" * 60)
+

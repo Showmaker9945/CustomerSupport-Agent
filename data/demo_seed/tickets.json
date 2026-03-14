@@ -1,0 +1,48 @@
+[
+  {
+    "ticket_id": "TKT-20260301103000-0001",
+    "user_id": "user_001",
+    "subject": "账单金额核查",
+    "description": "用户希望核查 2 月账单中的额外存储费用。",
+    "category": "billing",
+    "status": "resolved",
+    "priority": "medium",
+    "assigned_to": "billing_team",
+    "created_at": "2026-03-01T10:30:00+00:00",
+    "updated_at": "2026-03-01T16:30:00+00:00",
+    "resolved_at": "2026-03-01T16:30:00+00:00",
+    "tags": [
+      "billing",
+      "storage"
+    ],
+    "notes": [
+      "已向用户解释超额存储费用来源。"
+    ],
+    "metadata": {
+      "source": "demo_seed"
+    }
+  },
+  {
+    "ticket_id": "TKT-20260305090000-0001",
+    "user_id": "user_001",
+    "subject": "人工升级：复杂账单咨询",
+    "description": "用户要求人工复核本月套餐与额外费用。",
+    "category": "escalation",
+    "status": "in_progress",
+    "priority": "high",
+    "assigned_to": null,
+    "created_at": "2026-03-05T09:00:00+00:00",
+    "updated_at": "2026-03-05T09:10:00+00:00",
+    "resolved_at": null,
+    "tags": [
+      "escalation"
+    ],
+    "notes": [
+      "AI 已收集账单上下文，等待人工处理。"
+    ],
+    "metadata": {
+      "escalated": true,
+      "reason": "复杂账单咨询"
+    }
+  }
+]
