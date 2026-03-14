@@ -1,4 +1,4 @@
-"""ORM models for structured business data."""
+"""业务实体对应的 SQLAlchemy ORM 模型。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
-    """Base class for ORM models."""
+    """所有 ORM 模型的基类。"""
 
 
 class User(Base):
+    """用户主档，汇总基础资料、使用情况与客服历史。"""
+
     __tablename__ = "users"
 
     user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -32,6 +34,8 @@ class User(Base):
 
 
 class Subscription(Base):
+    """订阅信息，描述套餐、计费周期与席位使用情况。"""
+
     __tablename__ = "subscriptions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -52,6 +56,8 @@ class Subscription(Base):
 
 
 class Invoice(Base):
+    """账单主表，存储账期、总金额与摘要。"""
+
     __tablename__ = "invoices"
 
     invoice_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -75,6 +81,8 @@ class Invoice(Base):
 
 
 class InvoiceItem(Base):
+    """账单明细项。"""
+
     __tablename__ = "invoice_items"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -88,6 +96,8 @@ class InvoiceItem(Base):
 
 
 class TicketRecord(Base):
+    """客服工单记录。"""
+
     __tablename__ = "tickets"
 
     ticket_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -106,4 +116,3 @@ class TicketRecord(Base):
     metadata_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
 
     user: Mapped[User] = relationship(back_populates="tickets")
-

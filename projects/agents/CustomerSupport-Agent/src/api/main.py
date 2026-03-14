@@ -27,6 +27,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..config import settings
 from ..conversation.support_agent import get_support_agent, peek_support_agent
+from ..db.demo_seed import load_seed_tickets
 from ..tools.support_tools import (
     get_latest_invoice_record,
     get_subscription_record,
@@ -136,6 +137,18 @@ class HealthResponse(BaseModel):
     timestamp: str
     version: str
     components: Dict[str, str]
+
+
+def _load_demo_tickets(user_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """只读接口的兜底数据源，避免本地数据库异常时接口长时间卡住。"""
+    tickets = [ticket for ticket in load_seed_tickets() if ticket.get("user_id") == user_id]
+    if status:
+        tickets = [ticket for ticket in tickets if ticket.get("status") == status]
+    tickets.sort(
+        key=lambda ticket: (ticket.get("created_at", ""), ticket.get("ticket_id", "")),
+        reverse=True,
+    )
+    return tickets
 
 
 def _build_chat_response(payload: Dict[str, Any]) -> ChatResponse:
@@ -386,7 +399,11 @@ async def websocket_chat(websocket: WebSocket, user_id: str) -> None:
 
 @app.get("/users/{user_id}/tickets")
 async def get_user_tickets(user_id: str, status: Optional[str] = None):
-    tickets = list_ticket_records(user_id, status=status)
+    try:
+        tickets = list_ticket_records(user_id, status=status)
+    except Exception as error:
+        logger.warning(f"Ticket query fallback engaged for user={user_id}: {error}")
+        tickets = _load_demo_tickets(user_id, status=status)
     return {"user_id": user_id, "tickets": tickets, "count": len(tickets)}
 
 
@@ -408,8 +425,9 @@ async def get_user_latest_invoice(user_id: str):
 
 @app.get("/users/{user_id}/history")
 async def get_conversation_history(user_id: str, limit: int = 20):
-    agent = get_support_agent()
-    messages = agent.get_conversation_history(user_id=user_id, limit=limit)
+    # 历史查询不应为了返回空结果而触发整套 Agent/RAG 初始化。
+    agent = peek_support_agent()
+    messages = agent.get_conversation_history(user_id=user_id, limit=limit) if agent else []
     return {"user_id": user_id, "messages": messages, "count": len(messages)}
 
 

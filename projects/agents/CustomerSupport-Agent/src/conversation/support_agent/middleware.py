@@ -1,7 +1,8 @@
-﻿"""Role-agent construction with LangChain middleware."""
+"""支持客服角色 Agent 的中间件与构造逻辑。"""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -26,9 +27,116 @@ from .graph import AgentRuntimeContext, build_role_system_prompt
 
 logger = logging.getLogger(__name__)
 
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_SPACE_PATTERN = re.compile(r"\s+")
+
+
+def _message_content_to_text(content: Any) -> str:
+    """将消息内容规整成纯文本，便于统一估算 token。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                    continue
+                if isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+                    continue
+                parts.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
+                continue
+            parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False, sort_keys=True)
+    return str(content)
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """轻量估算文本 token 数，避免引入额外 tokenizer 依赖。"""
+    normalized = _SPACE_PATTERN.sub(" ", (text or "").strip())
+    if not normalized:
+        return 0
+
+    chinese_tokens = len(_CJK_PATTERN.findall(normalized))
+    english_tokens = sum(max(1, (len(word) + 3) // 4) for word in _WORD_PATTERN.findall(normalized))
+
+    residual = _WORD_PATTERN.sub("", normalized)
+    residual = _CJK_PATTERN.sub("", residual)
+    residual = _SPACE_PATTERN.sub("", residual)
+    residual_tokens = (len(residual) + 3) // 4 if residual else 0
+
+    return chinese_tokens + english_tokens + residual_tokens
+
+
+def estimate_message_tokens(message: Any) -> int:
+    """估算单条消息占用的上下文 token。"""
+    content = _message_content_to_text(getattr(message, "content", ""))
+    content_tokens = _estimate_text_tokens(content)
+
+    if isinstance(message, ToolMessage):
+        overhead = 12
+    elif isinstance(message, AIMessage):
+        overhead = 10
+    elif isinstance(message, HumanMessage):
+        overhead = 8
+    else:
+        overhead = 6
+
+    return max(overhead, content_tokens + overhead)
+
+
+def estimate_history_tokens(messages: List[Any]) -> int:
+    """估算一段历史消息总共占用的 token。"""
+    return sum(estimate_message_tokens(message) for message in messages)
+
+
+def build_history_trim_removals(
+    messages: List[Any],
+    *,
+    max_keep: int,
+    max_tokens: int,
+    min_keep: int = 6,
+) -> List[RemoveMessage]:
+    """根据消息条数和 token 预算生成删除指令。"""
+    if not messages:
+        return []
+
+    normalized_max_keep = max(1, int(max_keep))
+    normalized_max_tokens = max(200, int(max_tokens))
+    token_counts = [estimate_message_tokens(message) for message in messages]
+    total_tokens = sum(token_counts)
+
+    if len(messages) <= normalized_max_keep and total_tokens <= normalized_max_tokens:
+        return []
+
+    keep_start = max(len(messages) - normalized_max_keep, 0)
+    kept_count = len(messages) - keep_start
+    min_preserved = max(1, min(int(min_keep), kept_count))
+    kept_tokens = sum(token_counts[keep_start:])
+
+    # 在保留最近若干轮对话的前提下，继续压缩超预算的旧消息。
+    while kept_tokens > normalized_max_tokens and (len(messages) - keep_start) > min_preserved:
+        kept_tokens -= token_counts[keep_start]
+        keep_start += 1
+
+    return [
+        RemoveMessage(id=message.id)
+        for message in messages[:keep_start]
+        if getattr(message, "id", None)
+    ]
+
 
 def create_role_agent(owner: Any, role: str, tools: List[Any], enable_hitl: bool) -> Any:
-    """Create a LangChain agent for a given support role."""
+    """为指定客服角色创建 LangChain Agent。"""
 
     @dynamic_prompt
     def role_prompt(request: ModelRequest) -> str:
@@ -51,19 +159,23 @@ def create_role_agent(owner: Any, role: str, tools: List[Any], enable_hitl: bool
 
     @before_model
     def trim_history(state: Dict[str, Any], _runtime: Any) -> Dict[str, Any] | None:
+        """在模型调用前裁剪历史消息，兼顾消息条数和 token 预算。"""
         messages = state.get("messages", [])
         max_keep = max(8, settings.max_conversation_history)
-        if len(messages) <= max_keep:
-            return None
-        removals = [
-            RemoveMessage(id=msg.id) for msg in messages[:-max_keep] if getattr(msg, "id", None)
-        ]
+        max_tokens = max(600, settings.max_history_tokens)
+        removals = build_history_trim_removals(
+            messages,
+            max_keep=max_keep,
+            max_tokens=max_tokens,
+            min_keep=min(6, max_keep),
+        )
         if removals:
             return {"messages": removals}
         return None
 
     @wrap_model_call
     def dynamic_model_selector(request: ModelRequest, handler: Any) -> ModelResponse:
+        """复杂场景自动切换到高质量模型，普通场景走基础模型。"""
         if owner.advanced_model is None:
             return handler(request)
         message_count = len(request.state.get("messages", []))
@@ -75,6 +187,7 @@ def create_role_agent(owner: Any, role: str, tools: List[Any], enable_hitl: bool
 
     @wrap_tool_call
     def safe_tool_wrapper(request: ToolCallRequest, handler: Any) -> Any:
+        """统一记录工具调用并兜底工具异常。"""
         tool_name = request.tool_call.get("name", "unknown_tool")
         args = request.tool_call.get("args", {})
         logger.info(f"[tool_call] role={role} tool={tool_name} args={args}")
@@ -107,6 +220,7 @@ def create_role_agent(owner: Any, role: str, tools: List[Any], enable_hitl: bool
 
     @after_model
     def output_guard(state: Dict[str, Any], _runtime: Any) -> Dict[str, Any] | None:
+        """对模型输出做基础安全与中文一致性校验。"""
         messages = state.get("messages", [])
         last_ai: Optional[AIMessage] = next(
             (msg for msg in reversed(messages) if isinstance(msg, AIMessage)),

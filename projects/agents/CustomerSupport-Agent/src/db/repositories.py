@@ -1,4 +1,4 @@
-"""Repository helpers for structured business data."""
+"""结构化业务数据的建库、种子数据与查询封装。"""
 
 from __future__ import annotations
 
@@ -17,11 +17,12 @@ _ticket_lock = Lock()
 
 
 def _now_iso() -> str:
+    """返回当前 UTC 时间的 ISO 字符串。"""
     return datetime.now(timezone.utc).isoformat()
 
 
 def ensure_business_database(seed_demo: bool = True) -> None:
-    """Ensure business tables exist and optional demo data is present."""
+    """确保业务表存在，并在需要时自动注入演示数据。"""
     Base.metadata.create_all(get_engine())
     if not seed_demo:
         return
@@ -35,7 +36,7 @@ def ensure_business_database(seed_demo: bool = True) -> None:
 
 
 def reset_business_database(seed_demo: bool = True) -> None:
-    """Drop and recreate all business tables."""
+    """删除并重建全部业务表。"""
     engine = get_engine()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
@@ -44,7 +45,7 @@ def reset_business_database(seed_demo: bool = True) -> None:
 
 
 def seed_demo_data(clear_existing: bool = False) -> Dict[str, int]:
-    """Load curated demo seed data into the business database."""
+    """向业务库写入演示数据，并返回导入统计。"""
     Base.metadata.create_all(get_engine())
     bundle = load_seed_bundle()
     stats = {"users": 0, "subscriptions": 0, "invoices": 0, "invoice_items": 0, "tickets": 0}
@@ -141,6 +142,7 @@ def seed_demo_data(clear_existing: bool = False) -> Dict[str, int]:
 
 
 def _user_to_record(user: User) -> Dict[str, Any]:
+    """将 User ORM 对象转换为接口层可直接使用的字典。"""
     return {
         "user_id": user.user_id,
         "name": user.name,
@@ -156,6 +158,7 @@ def _user_to_record(user: User) -> Dict[str, Any]:
 
 
 def _subscription_to_record(subscription: Subscription) -> Dict[str, Any]:
+    """将订阅 ORM 对象转换为字典。"""
     return {
         "user_id": subscription.user_id,
         "plan_name": subscription.plan_name,
@@ -173,6 +176,7 @@ def _subscription_to_record(subscription: Subscription) -> Dict[str, Any]:
 
 
 def _invoice_to_record(invoice: Invoice) -> Dict[str, Any]:
+    """将账单 ORM 对象转换为字典。"""
     return {
         "invoice_id": invoice.invoice_id,
         "user_id": invoice.user_id,
@@ -198,6 +202,7 @@ def _invoice_to_record(invoice: Invoice) -> Dict[str, Any]:
 
 
 def _ticket_to_record(ticket: TicketRecord) -> Dict[str, Any]:
+    """将工单 ORM 对象转换为字典。"""
     return {
         "ticket_id": ticket.ticket_id,
         "user_id": ticket.user_id,
@@ -217,6 +222,7 @@ def _ticket_to_record(ticket: TicketRecord) -> Dict[str, Any]:
 
 
 def get_user_record(user_id: str) -> Optional[Dict[str, Any]]:
+    """按用户 ID 查询用户主档。"""
     ensure_business_database()
     with session_scope() as session:
         user = session.get(User, user_id)
@@ -224,6 +230,7 @@ def get_user_record(user_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_subscription_record(user_id: str) -> Optional[Dict[str, Any]]:
+    """按用户 ID 查询订阅记录。"""
     ensure_business_database()
     with session_scope() as session:
         subscription = session.scalar(select(Subscription).where(Subscription.user_id == user_id))
@@ -231,6 +238,7 @@ def get_subscription_record(user_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_latest_invoice_record(user_id: str) -> Optional[Dict[str, Any]]:
+    """查询用户最近一张账单。"""
     ensure_business_database()
     with session_scope() as session:
         invoice = session.scalar(
@@ -242,6 +250,7 @@ def get_latest_invoice_record(user_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_invoice_record(invoice_id: str) -> Optional[Dict[str, Any]]:
+    """按账单号查询账单。"""
     ensure_business_database()
     with session_scope() as session:
         invoice = session.get(Invoice, str(invoice_id).strip().upper())
@@ -249,12 +258,13 @@ def get_invoice_record(invoice_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _generate_ticket_id(session) -> str:
+    """生成线程安全的工单号。"""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     prefix = f"TKT-{timestamp}-"
     existing_count = session.scalar(
         select(func.count()).select_from(TicketRecord).where(TicketRecord.ticket_id.like(f"{prefix}%"))
     ) or 0
-    return f"{prefix}{existing_count + 1:04d}"
+    return f"TKT-{timestamp}-{existing_count + 1:04d}"
 
 
 def create_ticket_record(
@@ -266,6 +276,7 @@ def create_ticket_record(
     category: str = "general",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """创建新的工单记录。"""
     ensure_business_database()
     with _ticket_lock:
         with session_scope() as session:
@@ -290,6 +301,7 @@ def create_ticket_record(
 
 
 def get_ticket_record(ticket_id: str) -> Optional[Dict[str, Any]]:
+    """按工单号查询工单。"""
     ensure_business_database()
     with session_scope() as session:
         ticket = session.get(TicketRecord, ticket_id)
@@ -304,6 +316,7 @@ def update_ticket_record(
     assigned_to: Optional[str] = None,
     tags: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
+    """更新工单状态、备注、处理人与标签。"""
     ensure_business_database()
     with session_scope() as session:
         ticket = session.get(TicketRecord, ticket_id)
@@ -328,6 +341,7 @@ def update_ticket_record(
 
 
 def list_ticket_records(user_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """列出指定用户的工单，支持按状态过滤。"""
     ensure_business_database()
     with session_scope() as session:
         query = select(TicketRecord).where(TicketRecord.user_id == user_id)
@@ -335,4 +349,3 @@ def list_ticket_records(user_id: str, status: Optional[str] = None) -> List[Dict
             query = query.where(TicketRecord.status == status)
         query = query.order_by(TicketRecord.created_at.desc(), TicketRecord.ticket_id.desc())
         return [_ticket_to_record(ticket) for ticket in session.scalars(query).all()]
-

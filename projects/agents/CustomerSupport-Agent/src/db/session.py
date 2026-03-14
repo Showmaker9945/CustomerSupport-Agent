@@ -1,4 +1,4 @@
-"""SQLAlchemy session helpers for business data."""
+"""业务数据层的 SQLAlchemy 会话与连接管理。"""
 
 from __future__ import annotations
 
@@ -19,24 +19,37 @@ _configured_url: str | None = None
 _lock = Lock()
 
 
+def _ensure_postgres_connect_timeout(url: str, timeout_seconds: int = 3) -> str:
+    """为 Postgres 连接补上较短的 connect_timeout，避免接口长时间挂起。"""
+    if "connect_timeout=" in url:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}connect_timeout={timeout_seconds}"
+
+
 def normalize_database_url(url: str) -> str:
-    """Normalize configured URLs to a sync SQLAlchemy driver."""
+    """将配置中的数据库地址转换为同步 SQLAlchemy 驱动格式。"""
     normalized = (url or "").strip()
     if normalized.startswith("sqlite+aiosqlite://"):
         return normalized.replace("sqlite+aiosqlite://", "sqlite+pysqlite://", 1)
     if normalized.startswith("postgres://"):
-        return normalized.replace("postgres://", "postgresql+psycopg://", 1)
+        normalized = normalized.replace("postgres://", "postgresql+psycopg://", 1)
+        return _ensure_postgres_connect_timeout(normalized)
     if normalized.startswith("postgresql://"):
-        return normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+        normalized = normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+        return _ensure_postgres_connect_timeout(normalized)
+    if normalized.startswith("postgresql+psycopg://"):
+        return _ensure_postgres_connect_timeout(normalized)
     return normalized
 
 
 def get_database_url() -> str:
-    """Return the normalized business database URL."""
+    """返回归一化后的业务数据库地址。"""
     return normalize_database_url(settings.database_url)
 
 
 def _sqlite_path(url: str) -> Path | None:
+    """从 SQLite URL 中提取本地文件路径。"""
     marker = "///"
     if not url.startswith("sqlite") or marker not in url:
         return None
@@ -47,7 +60,7 @@ def _sqlite_path(url: str) -> Path | None:
 
 
 def get_engine() -> Engine:
-    """Return a cached SQLAlchemy engine for the active database URL."""
+    """返回与当前配置匹配的缓存 Engine。"""
     global _engine, _session_factory, _configured_url
 
     database_url = get_database_url()
@@ -59,6 +72,9 @@ def get_engine() -> Engine:
             _engine.dispose()
 
         connect_args = {}
+        if database_url.startswith("sqlite"):
+            # 本地 SQLite 被其他进程占用时尽快失败，避免接口长时间挂起。
+            connect_args["timeout"] = 3
         sqlite_path = _sqlite_path(database_url)
         if sqlite_path is not None:
             sqlite_path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +98,7 @@ def get_engine() -> Engine:
 
 
 def get_session_factory() -> sessionmaker[Session]:
-    """Return a cached session factory."""
+    """返回缓存的 Session 工厂。"""
     global _session_factory
     if _session_factory is None:
         get_engine()
@@ -92,7 +108,7 @@ def get_session_factory() -> sessionmaker[Session]:
 
 @contextmanager
 def session_scope() -> Iterator[Session]:
-    """Provide a transactional session scope."""
+    """提供一个带提交/回滚语义的事务会话上下文。"""
     session = get_session_factory()()
     try:
         yield session
@@ -105,7 +121,7 @@ def session_scope() -> Iterator[Session]:
 
 
 def reset_database_connection() -> None:
-    """Dispose the cached database engine/session factory."""
+    """重置缓存的数据库连接与会话工厂。"""
     global _engine, _session_factory, _configured_url
     with _lock:
         if _engine is not None:
@@ -113,4 +129,3 @@ def reset_database_connection() -> None:
         _engine = None
         _session_factory = None
         _configured_url = None
-

@@ -1,8 +1,5 @@
-"""
-Configuration settings for CustomerSupport-Agent.
+"""CustomerSupport-Agent 的统一配置。"""
 
-Loads settings from environment variables with sensible defaults.
-"""
 from functools import lru_cache
 from pathlib import Path
 from typing import List
@@ -12,62 +9,62 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application settings."""
+    """应用运行时配置。"""
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore"
+        extra="ignore",
     )
 
-    # Application
+    # 应用基础信息
     app_name: str = "CustomerSupport-Agent"
     app_version: str = "1.0.0"
     debug: bool = False
     environment: str = "development"
 
-    # Server
+    # 服务配置
     host: str = "0.0.0.0"
     port: int = 8000
     ws_port: int = 8001
 
-    # LLM Configuration
+    # LLM 配置
     llm_provider: str = "qwen"
     llm_model: str = "qwen-plus"
     llm_high_quality_model: str = "qwen-max"
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_temperature: float = 0.7
 
-    # API Keys (keep OPENAI_API_KEY for backward compatibility)
+    # API Key（保留 OPENAI_API_KEY 兼容旧环境变量）
     llm_api_key: str = Field(default="test-key")
     dashscope_api_key: str = Field(default="your_qwen_api_key_here")
     openai_api_key: str = Field(default="")
 
-    # CORS
+    # 跨域配置
     cors_origins: List[str] = Field(
         default_factory=lambda: ["http://localhost:3000", "http://localhost:8000"]
     )
 
-    # Database
+    # 业务数据库
     database_url: str = "sqlite+aiosqlite:///./data/support.db"
     postgres_uri: str = "postgresql://support_user:support_pass@localhost:5432/support?sslmode=disable"
     pgvector_enabled: bool = True
 
-    # LangGraph Persistence / Store
+    # LangGraph 持久化
     langgraph_persistence_backend: str = "memory"  # memory | postgres
     langgraph_use_postgres: bool = False
     langgraph_thread_prefix: str = "support"
     auto_setup_postgres: bool = True
 
-    # Vector Store (ChromaDB)
+    # 向量知识库（Chroma）
     chroma_persist_dir: Path = Field(default=Path("./data/chroma_db"))
     collection_name: str = "faq_knowledge_base"
     embedding_model: str = "all-MiniLM-L6-v2"
     reranker_model: str = "BAAI/bge-reranker-base"
     enable_reranker: bool = False
 
-    # Knowledge Base
+    # 知识库检索参数
     knowledge_base_path: Path = Field(default=Path("./data/knowledge_base"))
     chunk_size: int = 500
     chunk_overlap: int = 50
@@ -77,48 +74,56 @@ class Settings(BaseSettings):
     rag_vector_weight: float = 0.6
     rag_keyword_weight: float = 0.4
 
-    # Conversation Memory
-    memory_type: str = "sqlite"  # Options: postgres, sqlite, memory
+    # 会话与记忆
+    memory_type: str = "sqlite"  # postgres | sqlite | memory
     max_conversation_history: int = 20
+    max_history_tokens: int = 3000
     session_timeout_hours: int = 24
     long_term_memory_namespace: str = "user_memory"
     max_memory_items_per_user: int = 100
 
-    # Sentiment Analysis
+    # 情绪分析
     sentiment_threshold: float = 0.3
     frustration_keywords: List[str] = Field(
         default_factory=lambda: [
-            "生气", "愤怒", "投诉", "太差", "离谱",
-            "angry", "frustrated", "terrible", "awful",
-            "hate", "stupid", "useless",
+            "生气",
+            "愤怒",
+            "投诉",
+            "太差",
+            "离谱",
+            "angry",
+            "frustrated",
+            "terrible",
+            "awful",
+            "hate",
+            "stupid",
+            "useless",
         ]
     )
 
-    # Human Handoff
+    # 人工接管与审批
     handoff_threshold: float = -0.5
     max_ai_turns: int = 10
-    human_handoff_message: str = (
-        "我正在为你转接人工客服，请稍等。"
-    )
+    human_handoff_message: str = "我正在为你转接人工客服，请稍等。"
     hitl_high_risk_tools: List[str] = Field(
         default_factory=lambda: ["create_ticket", "update_ticket", "escalate_to_human"]
     )
 
-    # Rate Limiting
+    # 限流
     max_requests_per_minute: int = 60
     max_ws_connections_per_user: int = 5
 
-    # Logging
+    # 日志
     log_level: str = "INFO"
     log_format: str = "json"
 
-    # Localization
+    # 默认语言
     default_response_language: str = "zh-CN"
 
     @field_validator("debug", mode="before")
     @classmethod
     def parse_debug_value(cls, value):
-        """Support permissive DEBUG values from diverse environments."""
+        """兼容不同环境下的 DEBUG 写法。"""
         if isinstance(value, bool):
             return value
         if value is None:
@@ -135,24 +140,24 @@ class Settings(BaseSettings):
 
     @property
     def is_production(self) -> bool:
-        """Check if running in production."""
+        """当前是否为生产环境。"""
         return self.environment.lower() == "production"
 
     @property
     def is_development(self) -> bool:
-        """Check if running in development."""
+        """当前是否为开发环境。"""
         return self.environment.lower() == "development"
 
     @property
     def use_postgres_langgraph(self) -> bool:
-        """Whether LangGraph persistence should use Postgres."""
+        """LangGraph 持久化是否应切换到 Postgres。"""
         if self.langgraph_use_postgres:
             return True
         return self.langgraph_persistence_backend.lower() == "postgres"
 
     @property
     def resolved_llm_api_key(self) -> str:
-        """Resolve API key with backward-compatible fallbacks."""
+        """按兼容顺序解析真实可用的 LLM API Key。"""
         if self.llm_api_key and self.llm_api_key != "test-key":
             return self.llm_api_key
         if self.dashscope_api_key:
@@ -163,7 +168,7 @@ class Settings(BaseSettings):
 
     @property
     def has_valid_llm_api_key(self) -> bool:
-        """Whether an actually usable LLM API key is configured."""
+        """判断当前是否配置了有效的模型密钥。"""
         key = (self.resolved_llm_api_key or "").strip()
         invalid_values = {
             "",
@@ -176,9 +181,9 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Get cached settings instance."""
+    """返回缓存后的配置实例。"""
     return Settings()
 
 
-# Global settings instance
+# 全局配置实例
 settings = get_settings()
