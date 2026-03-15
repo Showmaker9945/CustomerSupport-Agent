@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # LLM 配置
     llm_provider: str = "qwen"
     llm_model: str = "qwen-plus"
-    llm_high_quality_model: str = "qwen-max"
+    llm_high_quality_model: str = "qwen3-max"
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_temperature: float = 0.7
 
@@ -74,8 +74,15 @@ class Settings(BaseSettings):
     rag_vector_weight: float = 0.6
     rag_keyword_weight: float = 0.4
 
-    # 会话与记忆
-    memory_type: str = "sqlite"  # postgres | sqlite | memory
+    # 短期对话上下文
+    transcript_backend: str = "database"
+    conversation_recent_turns: int = 6
+    conversation_context_messages: int = 12
+    conversation_context_tokens: int = 2000
+    conversation_summary_trigger_messages: int = 16
+    conversation_summary_refresh_interval: int = 6
+
+    # Agent 内部消息裁剪与长期记忆
     max_conversation_history: int = 20
     max_history_tokens: int = 3000
     session_timeout_hours: int = 24

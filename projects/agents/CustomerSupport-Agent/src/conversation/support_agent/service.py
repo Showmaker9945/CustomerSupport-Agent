@@ -11,6 +11,7 @@ import threading
 import uuid
 from contextlib import suppress
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -18,11 +19,24 @@ from langchain_openai import ChatOpenAI
 from langgraph.types import Command
 
 from ...config import settings
+from ...db.repositories import (
+    append_conversation_message,
+    build_recent_context_window,
+    clear_pending_conversation_state,
+    create_or_touch_conversation_thread,
+    delete_user_conversations,
+    get_conversation_thread,
+    mark_conversation_thread_status,
+    list_user_conversation_messages,
+    list_thread_messages,
+    save_pending_conversation_state,
+)
 from ...sentiment.analyzer import SentimentResult, get_sentiment_analyzer
 from ...tools.support_tools import (
     create_ticket,
     escalate_to_human,
     explain_invoice_charge,
+    get_tool_by_name,
     get_latest_invoice,
     get_latest_invoice_record,
     get_subscription_status,
@@ -44,6 +58,7 @@ from .graph import (
     SupportAgentOrchestrator,
     SupportResponse,
     as_bool,
+    append_node_timing,
     build_trace_event,
     build_execution_steps,
     build_neutral_sentiment,
@@ -120,7 +135,6 @@ class SupportAgent:
         self.sentiment_analyzer = get_sentiment_analyzer() if enable_sentiment else None
 
         self._lock = threading.Lock()
-        self._history: Dict[str, List[Dict[str, str]]] = {}
         self._thread_user: Dict[str, str] = {}
         self._pending_role: Dict[str, str] = {}
         self._pending_state: Dict[str, OrchestrationState] = {}
@@ -511,6 +525,9 @@ class SupportAgent:
             return get_subscription_status.invoke({"user_id": user_id})
 
         if self._is_billing_ticket_request(message):
+            # 写操作必须走带 HITL 的 action agent，避免绕过审批中间件。
+            if self.llm_enabled:
+                return None
             return create_ticket.invoke(
                 {
                     "user_id": user_id,
@@ -870,6 +887,7 @@ class SupportAgent:
             route_reason = f"{route_reason}+billing_action"
 
         if self._is_billing_ticket_request(message):
+            intent = "request"
             needs_knowledge = False
             needs_action = True
             selected_agent = "action"
@@ -1005,6 +1023,56 @@ class SupportAgent:
             return str(description).strip()
         return f"{self._tool_label(tool_name)} 属于高风险写操作，需要人工审批。"
 
+    def _build_interrupt_entry(
+        self,
+        *,
+        tool_name: str,
+        args: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+        allowed_decisions: Optional[List[str]] = None,
+        interrupt_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload_args = dict(args or {})
+        return {
+            "id": interrupt_id or f"manual:{tool_name}",
+            "interrupt_id": interrupt_id,
+            "tool": tool_name,
+            "tool_label": self._tool_label(tool_name),
+            "reason": self._interrupt_reason(tool_name, reason),
+            "args_preview": self._summarize_tool_args(payload_args),
+            "allowed_decisions": allowed_decisions or ["approve", "edit", "reject"],
+        }
+
+    def _build_billing_ticket_interrupt(
+        self,
+        *,
+        user_id: str,
+        message: str,
+    ) -> Dict[str, Any]:
+        tool_args = {
+            "user_id": user_id,
+            "subject": "账单异常核查",
+            "description": message,
+            "priority": "high",
+            "category": "billing",
+        }
+        interrupt = self._build_interrupt_entry(
+            tool_name="create_ticket",
+            args=tool_args,
+            reason="创建账单异常工单属于高风险写操作，需要人工审批后才能执行。",
+        )
+        return {
+            "interrupts": [interrupt],
+            "pending_approval_plan": {
+                "mode": "deterministic_tool_call",
+                "tool": "create_ticket",
+                "tool_label": interrupt["tool_label"],
+                "args": tool_args,
+                "reason": interrupt["reason"],
+                "reject_message": "已取消创建账单异常工单，本轮不会执行写操作。若仍需处理，请补充信息后重新提交。",
+            },
+        }
+
     def _build_approval_payload(self, interrupts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not interrupts:
             return None
@@ -1066,6 +1134,37 @@ class SupportAgent:
                 f"（{tools}），但只收到了 {received} 条 decisions。"
             )
         return f"恢复会话失败：{raw}"
+
+    def _resume_decision_count_error(
+        self,
+        decisions: List[Dict[str, Any]],
+        pending_state: OrchestrationState,
+    ) -> str:
+        expected = len(pending_state.get("interrupts", []))
+        if expected and len(decisions) != expected:
+            approval = self._build_approval_payload(pending_state.get("interrupts", [])) or {}
+            tools = "、".join(tool["tool_label"] for tool in approval.get("tools", [])) or "待审批动作"
+            return (
+                f"恢复会话失败：当前有 {expected} 个待审批动作"
+                f"（{tools}），但只收到了 {len(decisions)} 条 decisions。"
+            )
+        return ""
+
+    def _resume_decision_type(self, decision: Dict[str, Any]) -> str:
+        return str((decision or {}).get("type", "")).strip().lower()
+
+    def _edited_action_args(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        edited_action = (decision or {}).get("edited_action")
+        if not isinstance(edited_action, dict):
+            return {}
+        nested_args = edited_action.get("args")
+        if isinstance(nested_args, dict):
+            return dict(nested_args)
+        return {
+            str(key): value
+            for key, value in edited_action.items()
+            if key not in {"tool", "tool_name", "name"}
+        }
 
     def _extract_interrupts(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_interrupts = result.get("__interrupt__", []) if isinstance(result, dict) else []
@@ -1140,6 +1239,143 @@ class SupportAgent:
             if isinstance(message, AIMessage) and message.content:
                 return str(message.content)
         return "抱歉，我暂时无法给出有效回复。"
+
+    def _tool_result_ticket_id(self, tool_name: str, text: str) -> Optional[str]:
+        lowered = str(text or "").lower()
+        failure_markers = ("失败", "error", "未找到", "不存在", "无效")
+        if tool_name in {"create_ticket", "update_ticket", "escalate_to_human"} and any(
+            marker in lowered for marker in failure_markers
+        ):
+            return None
+        return self._ticket_id_from_text(text)
+
+    def _complete_resumed_turn(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        trace_id: str,
+        role: str,
+        pending_state: OrchestrationState,
+        neutral_sentiment: SentimentResult,
+        resumed_text: str,
+        role_elapsed_ms: float,
+        started: float,
+        trace_summary: str,
+        trace_details: Optional[Dict[str, Any]] = None,
+        tool_source: Optional[str] = None,
+        explicit_ticket_id: Optional[str] = None,
+        preserve_ticket_lookup: bool = True,
+    ) -> SupportResponse:
+        merged_state: OrchestrationState = dict(pending_state)
+        merged_state.update(
+            append_node_timing(
+                merged_state,
+                node=role,
+                agent=role,
+                duration_ms=role_elapsed_ms,
+                status="completed",
+            )
+        )
+        merged_state["active_agent"] = role
+        merged_state["run_status"] = "completed"
+        merged_state["interrupts"] = []
+        merged_state["citations"] = self._merge_unique(
+            merged_state.get("citations", []),
+            self._extract_citations(resumed_text),
+        )
+        merged_state["trace_events"] = [
+            *merged_state.get("trace_events", []),
+            build_trace_event(
+                node=role,
+                agent=role,
+                summary=trace_summary,
+                status="completed",
+                details=trace_details,
+            ),
+        ]
+
+        if role == "knowledge":
+            merged_state["retrieval_text"] = resumed_text
+        if role in {"action", "escalation"}:
+            merged_state["tool_text"] = resumed_text
+            if tool_source:
+                merged_state["tool_source"] = tool_source
+            if merged_state.get("ticket_id") is None:
+                if preserve_ticket_lookup:
+                    merged_state["ticket_id"] = explicit_ticket_id or self._ticket_id_from_text(resumed_text)
+                else:
+                    merged_state["ticket_id"] = explicit_ticket_id
+            if role == "action" and self._is_positive_escalation_text(resumed_text):
+                merged_state["escalated"] = True
+        if role == "escalation":
+            merged_state["escalated"] = True
+
+        merged_state.pop("pending_approval_plan", None)
+        merged_state = self.orchestrator.finalize_after_execution(merged_state)
+        response_message = merged_state.get("final_message", resumed_text)
+
+        self._pending_role.pop(thread_id, None)
+        self._pending_state.pop(thread_id, None)
+        self._record_history(
+            thread_id=thread_id,
+            user_id=user_id,
+            role="assistant",
+            content=response_message,
+            intent=merged_state.get("intent", "resume"),
+            active_agent=merged_state.get("selected_agent", role),
+            run_status="completed",
+            metadata={
+                "trace_id": trace_id,
+                "citations": merged_state.get("citations", []),
+                "ticket_id": merged_state.get("ticket_id"),
+                "resumed": True,
+            },
+            thread_status="completed",
+            trace_id=trace_id,
+        )
+        clear_pending_conversation_state(
+            thread_id,
+            status="completed",
+            last_active_agent=merged_state.get("selected_agent", role),
+            trace_id=trace_id,
+        )
+        self._refresh_thread_summary_if_needed(thread_id)
+        self._save_turn_memory(
+            user_id=user_id,
+            thread_id=thread_id,
+            intent=merged_state.get("intent", "resume"),
+            active_agent=merged_state.get("selected_agent", role),
+            user_message="[resume]",
+            assistant_message=response_message,
+            sentiment=neutral_sentiment,
+        )
+
+        return SupportResponse(
+            message=response_message,
+            intent=merged_state.get("intent", "resume"),
+            sentiment=neutral_sentiment,
+            sources=self._resolve_sources(merged_state),
+            escalated=bool(merged_state.get("escalated")),
+            ticket_created=merged_state.get("ticket_id"),
+            thread_id=thread_id,
+            run_status="completed",
+            citations=merged_state.get("citations", []),
+            active_agent=merged_state.get("selected_agent", role),
+            trace_id=trace_id,
+            route_path=merged_state.get("route_path", []),
+            validation_notes=merged_state.get("validation_notes", []),
+            trace_preview=self._trace_preview(merged_state),
+            node_timings=merged_state.get("node_timings", []),
+            decision_summary=merged_state.get("decision_summary", ""),
+            approval=None,
+            memory_debug=self._memory_debug_snapshot(thread_id),
+            next_action=self._build_next_action(
+                run_status="completed",
+                thread_id=thread_id,
+            ),
+            total_duration_ms=round((perf_counter() - started) * 1000, 2),
+        )
 
     def _fallback_response(
         self,
@@ -1220,18 +1456,214 @@ class SupportAgent:
             "请告诉我你遇到的具体现象（操作步骤、报错信息、期望结果）。"
         )
 
-    def _record_history(self, user_id: str, role: str, content: str) -> None:
-        with self._lock:
-            self._history.setdefault(user_id, []).append(
-                {
-                    "role": role,
-                    "content": content,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            max_items = max(settings.max_conversation_history * 4, 40)
-            if len(self._history[user_id]) > max_items:
-                self._history[user_id] = self._history[user_id][-max_items:]
+    def _touch_thread(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        status: str = "active",
+        title: Optional[str] = None,
+        last_active_agent: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> None:
+        """确保线程元数据存在，便于 transcript 与 API 查询统一落库。"""
+        create_or_touch_conversation_thread(
+            thread_id=thread_id,
+            user_id=user_id,
+            status=status,
+            title=title,
+            last_active_agent=last_active_agent,
+            trace_id=trace_id,
+        )
+
+    def _load_recent_history_context(self, thread_id: str) -> Dict[str, Any]:
+        """从数据库读取短期 transcript 窗口，供主图节点提示词使用。"""
+        return build_recent_context_window(
+            thread_id=thread_id,
+            recent_turns=settings.conversation_recent_turns,
+            max_messages=settings.conversation_context_messages,
+            max_tokens=settings.conversation_context_tokens,
+        )
+
+    def _heuristic_rolling_summary(
+        self,
+        messages: List[Dict[str, Any]],
+        previous_summary: str = "",
+    ) -> str:
+        """在无 LLM 或 LLM 摘要失败时，用规则生成结构化中文摘要。"""
+
+        def normalize_summary_text(raw: str, limit: int = 72) -> str:
+            compact = re.sub(r"\s+", " ", raw.strip())
+            if len(compact) <= limit:
+                return compact
+            return compact[: limit - 1].rstrip("，。；、:： ") + "…"
+
+        user_points: List[str] = []
+        resolved_points: List[str] = []
+        pending_points: List[str] = []
+        pending_markers = ("请", "需要", "建议", "等待", "稍后", "后续", "审批", "确认")
+
+        for item in messages:
+            content = normalize_summary_text(str(item.get("content", "")))
+            if not content:
+                continue
+
+            role = item.get("role")
+            if role == "user" and content not in user_points:
+                user_points.append(content)
+                continue
+
+            if role in {"assistant", "interrupt"}:
+                target = pending_points if role == "interrupt" or any(
+                    marker in content for marker in pending_markers
+                ) else resolved_points
+                if content not in target:
+                    target.append(content)
+
+        lines: List[str] = []
+        previous_summary = normalize_summary_text(previous_summary, limit=96)
+        if previous_summary:
+            lines.append(f"历史摘要：{previous_summary}")
+        if user_points:
+            lines.append("用户近期诉求：" + "；".join(user_points[-2:]))
+        if resolved_points:
+            lines.append("已处理/已确认：" + "；".join(resolved_points[-2:]))
+        if pending_points:
+            lines.append("待跟进事项：" + "；".join(pending_points[-2:]))
+        elif user_points:
+            lines.append(f"待跟进事项：继续围绕“{user_points[-1]}”跟进并给出下一步。")
+        return "\n".join(lines)[:420]
+
+    def _generate_rolling_summary(
+        self,
+        messages: List[Dict[str, Any]],
+        previous_summary: str = "",
+    ) -> str:
+        """优先用模型总结旧消息，失败时回退到规则摘要。"""
+        if not messages:
+            return ""
+
+        if self.llm_enabled and self.basic_model is not None:
+            transcript = []
+            for item in messages[-10:]:
+                role = item.get("role", "message")
+                content = str(item.get("content", "")).strip()
+                if content:
+                    transcript.append(f"{role}: {content}")
+            if transcript:
+                prompt = (
+                    "你是客服会话摘要器，请把更早的对话压缩成简洁、可续写的中文摘要。"
+                    "请最多输出 3 行，优先使用以下字段：用户近期诉求、已处理/已确认、待跟进事项。"
+                    "不要编造，不要重复，总长度控制在 180 字以内。\n\n"
+                    f"已有滚动摘要：{previous_summary or '无'}\n"
+                    "新增历史：\n"
+                    + "\n".join(transcript)
+                )
+                try:
+                    response = self.basic_model.invoke(prompt)
+                    summary = str(getattr(response, "content", "") or "").strip()
+                    if summary:
+                        return summary[:420]
+                except Exception as error:
+                    logger.debug(f"Rolling summary fallback to heuristic: {error}")
+
+        return self._heuristic_rolling_summary(messages, previous_summary=previous_summary)
+
+    def _refresh_thread_summary_if_needed(self, thread_id: str) -> None:
+        """在线程足够长时刷新 rolling summary，降低长对话的上下文开销。"""
+        thread = get_conversation_thread(thread_id)
+        if not thread:
+            return
+
+        message_count = int(thread.get("message_count") or 0)
+        trigger = max(6, settings.conversation_summary_trigger_messages)
+        interval = max(2, settings.conversation_summary_refresh_interval)
+        keep_tail = max(4, settings.conversation_context_messages)
+
+        if message_count < trigger:
+            return
+        if thread.get("rolling_summary") and (message_count - trigger) % interval != 0:
+            return
+
+        messages = list_thread_messages(thread_id, visible_only=True)
+        if len(messages) <= keep_tail:
+            return
+
+        older_messages = messages[:-keep_tail]
+        summary = self._generate_rolling_summary(
+            older_messages,
+            previous_summary=thread.get("rolling_summary", ""),
+        )
+        if not summary:
+            return
+
+        mark_conversation_thread_status(
+            thread_id,
+            status=thread.get("status", "active"),
+            last_active_agent=thread.get("last_active_agent"),
+            rolling_summary=summary,
+            pending_role=thread.get("pending_role") or "",
+            pending_state=thread.get("pending_state") or {},
+            trace_id=thread.get("trace_id"),
+        )
+
+    def _load_pending_context(self, thread_id: str) -> Tuple[str, str, Optional[str], OrchestrationState]:
+        """优先从内存缓存读取待审批状态，不存在时回退到数据库。"""
+        user_id = self._thread_user.get(thread_id, "unknown_user")
+        trace_id = self._trace_by_thread.get(thread_id, "")
+        role = self._pending_role.get(thread_id)
+        pending_state = self._pending_state.get(thread_id, {})
+
+        if role and pending_state:
+            return user_id, trace_id or str(uuid.uuid4()), role, pending_state
+
+        thread = get_conversation_thread(thread_id)
+        if not thread:
+            return user_id, trace_id or str(uuid.uuid4()), None, {}
+
+        persisted_role = str(thread.get("pending_role") or "").strip() or None
+        persisted_state = thread.get("pending_state") or {}
+        persisted_trace_id = thread.get("trace_id") or trace_id or str(uuid.uuid4())
+        persisted_user_id = thread.get("user_id") or user_id
+
+        if persisted_role and isinstance(persisted_state, dict) and persisted_state:
+            self._thread_user[thread_id] = persisted_user_id
+            self._trace_by_thread[thread_id] = persisted_trace_id
+            self._pending_role[thread_id] = persisted_role
+            self._pending_state[thread_id] = dict(persisted_state)
+            return persisted_user_id, persisted_trace_id, persisted_role, dict(persisted_state)
+
+        return persisted_user_id, persisted_trace_id, None, {}
+
+    def _record_history(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        role: str,
+        content: str,
+        intent: Optional[str] = None,
+        active_agent: Optional[str] = None,
+        run_status: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        visible: bool = True,
+        thread_status: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> None:
+        """将用户可见对话历史持久化到业务数据库。"""
+        append_conversation_message(
+            thread_id=thread_id,
+            user_id=user_id,
+            role=role,
+            content=content,
+            visible=visible,
+            intent=intent,
+            active_agent=active_agent,
+            run_status=run_status,
+            metadata=metadata,
+            thread_status=thread_status,
+            trace_id=trace_id,
+        )
 
     def _save_turn_memory(
         self,
@@ -1315,7 +1747,7 @@ class SupportAgent:
         if state.get("retrieval_text"):
             sources.extend(["Hybrid RAG", "FAQ Knowledge Base"])
         if state.get("tool_text"):
-            sources.append("Support Tools")
+            sources.append(state.get("tool_source") or "Support Tools")
         if state.get("selected_agent") == "escalation" or state.get("escalated"):
             sources.append("Human Handoff")
         if self.llm_enabled:
@@ -1335,6 +1767,7 @@ class SupportAgent:
         thread_id: Optional[str] = None,
     ) -> SupportResponse:
         """Process a user turn through the LangGraph workflow."""
+        started = perf_counter()
         thread = thread_id or str(uuid.uuid4())
         trace_id = str(uuid.uuid4())
         self._thread_user[thread] = user_id
@@ -1346,15 +1779,39 @@ class SupportAgent:
             if self.sentiment_analyzer
             else build_neutral_sentiment()
         )
+        initial_intent = self._infer_intent(message)
+        initial_risk = self._infer_risk(message, baseline_sentiment)
 
-        self._record_history(user_id, "user", message)
+        self._touch_thread(
+            thread_id=thread,
+            user_id=user_id,
+            status="active",
+            title=message,
+            last_active_agent="supervisor",
+            trace_id=trace_id,
+        )
+        recent_context = self._load_recent_history_context(thread)
+        self._record_history(
+            thread_id=thread,
+            user_id=user_id,
+            role="user",
+            content=message,
+            intent=initial_intent,
+            active_agent="supervisor",
+            run_status="active",
+            metadata={"source": "chat"},
+            thread_status="active",
+            trace_id=trace_id,
+        )
 
         initial_state: OrchestrationState = {
             "user_id": user_id,
             "thread_id": thread,
             "current_message": message,
-            "intent": self._infer_intent(message),
-            "risk": self._infer_risk(message, baseline_sentiment),
+            "recent_history_text": recent_context.get("text", ""),
+            "rolling_summary": recent_context.get("rolling_summary", ""),
+            "intent": initial_intent,
+            "risk": initial_risk,
             "sentiment_label": baseline_sentiment.label,
             "frustration_score": baseline_sentiment.frustration_score,
             "route_reason": "bootstrap",
@@ -1370,10 +1827,12 @@ class SupportAgent:
             "needs_escalation": False,
             "retrieval_text": "",
             "tool_text": "",
+            "tool_source": "",
             "validation_notes": [],
             "validation_passed": True,
             "final_message": "",
             "citations": [],
+            "pending_approval_plan": {},
             "run_status": "completed",
             "interrupts": [],
             "ticket_id": None,
@@ -1390,7 +1849,25 @@ class SupportAgent:
                 message=message,
                 sentiment=baseline_sentiment,
             )
-            self._record_history(user_id, "assistant", fallback)
+            self._record_history(
+                thread_id=thread,
+                user_id=user_id,
+                role="assistant",
+                content=fallback,
+                intent=initial_state["intent"],
+                active_agent=initial_state["selected_agent"],
+                run_status="completed",
+                metadata={"fallback": True, "trace_id": trace_id},
+                thread_status="completed",
+                trace_id=trace_id,
+            )
+            clear_pending_conversation_state(
+                thread,
+                status="completed",
+                last_active_agent=initial_state["selected_agent"],
+                trace_id=trace_id,
+            )
+            self._refresh_thread_summary_if_needed(thread)
             return SupportResponse(
                 message=fallback,
                 intent=initial_state["intent"],
@@ -1415,6 +1892,7 @@ class SupportAgent:
                         details={"error": str(error)},
                     )
                 ],
+                node_timings=initial_state.get("node_timings", []),
                 decision_summary="图执行失败，已使用回退策略直接回复。",
                 approval=None,
                 memory_debug=self._memory_debug_snapshot(thread),
@@ -1422,14 +1900,39 @@ class SupportAgent:
                     run_status="completed",
                     thread_id=thread,
                 ),
+                total_duration_ms=round((perf_counter() - started) * 1000, 2),
             )
 
         if final_state.get("run_status") == "interrupted":
             pending_role = final_state.get("active_agent", final_state.get("selected_agent", "action"))
             self._pending_role[thread] = pending_role
             self._pending_state[thread] = dict(final_state)
+            save_pending_conversation_state(
+                thread_id=thread,
+                user_id=user_id,
+                pending_role=pending_role,
+                pending_state=dict(final_state),
+                trace_id=trace_id,
+                status="interrupted",
+                last_active_agent=pending_role,
+            )
             wait_message = "检测到高风险动作，已暂停执行，等待人工审批（approve/edit/reject）。"
-            self._record_history(user_id, "assistant", wait_message)
+            self._record_history(
+                thread_id=thread,
+                user_id=user_id,
+                role="interrupt",
+                content=wait_message,
+                intent=final_state.get("intent", "other"),
+                active_agent=pending_role,
+                run_status="interrupted",
+                metadata={
+                    "trace_id": trace_id,
+                    "interrupt_count": len(final_state.get("interrupts", [])),
+                },
+                thread_status="interrupted",
+                trace_id=trace_id,
+            )
+            self._refresh_thread_summary_if_needed(thread)
             sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
             approval = self._build_approval_payload(final_state.get("interrupts", []))
             return SupportResponse(
@@ -1448,6 +1951,7 @@ class SupportAgent:
                 route_path=final_state.get("route_path", []),
                 validation_notes=final_state.get("validation_notes", []),
                 trace_preview=self._trace_preview(final_state),
+                node_timings=final_state.get("node_timings", []),
                 decision_summary=final_state.get("decision_summary", ""),
                 approval=approval,
                 memory_debug=self._memory_debug_snapshot(thread),
@@ -1456,6 +1960,7 @@ class SupportAgent:
                     thread_id=thread,
                     approval=approval,
                 ),
+                total_duration_ms=round((perf_counter() - started) * 1000, 2),
             )
 
         response_message = final_state.get("final_message") or final_state.get("tool_text") or final_state.get(
@@ -1467,7 +1972,30 @@ class SupportAgent:
         sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
         sources = self._resolve_sources(final_state)
 
-        self._record_history(user_id, "assistant", response_message)
+        self._record_history(
+            thread_id=thread,
+            user_id=user_id,
+            role="assistant",
+            content=response_message,
+            intent=final_state.get("intent", "other"),
+            active_agent=active_agent,
+            run_status="completed",
+            metadata={
+                "trace_id": trace_id,
+                "citations": citations,
+                "ticket_id": ticket_id,
+                "escalated": bool(final_state.get("escalated")),
+            },
+            thread_status="completed",
+            trace_id=trace_id,
+        )
+        clear_pending_conversation_state(
+            thread,
+            status="completed",
+            last_active_agent=active_agent,
+            trace_id=trace_id,
+        )
+        self._refresh_thread_summary_if_needed(thread)
         self._save_turn_memory(
             user_id=user_id,
             thread_id=thread,
@@ -1494,6 +2022,7 @@ class SupportAgent:
             route_path=final_state.get("route_path", []),
             validation_notes=final_state.get("validation_notes", []),
             trace_preview=self._trace_preview(final_state),
+            node_timings=final_state.get("node_timings", []),
             decision_summary=final_state.get("decision_summary", ""),
             approval=None,
             memory_debug=self._memory_debug_snapshot(thread),
@@ -1501,6 +2030,7 @@ class SupportAgent:
                 run_status="completed",
                 thread_id=thread,
             ),
+            total_duration_ms=round((perf_counter() - started) * 1000, 2),
         )
     def resume(
         self,
@@ -1508,10 +2038,8 @@ class SupportAgent:
         decisions: List[Dict[str, Any]],
     ) -> SupportResponse:
         """Resume a HITL-interrupted thread."""
-        user_id = self._thread_user.get(thread_id, "unknown_user")
-        trace_id = self._trace_by_thread.get(thread_id, str(uuid.uuid4()))
-        role = self._pending_role.get(thread_id)
-        pending_state = self._pending_state.get(thread_id, {})
+        started = perf_counter()
+        user_id, trace_id, role, pending_state = self._load_pending_context(thread_id)
         neutral_sentiment = build_neutral_sentiment()
 
         if role is None:
@@ -1534,6 +2062,7 @@ class SupportAgent:
                         status="error",
                     )
                 ],
+                node_timings=[],
                 decision_summary="恢复失败：未找到待审批线程。",
                 approval=None,
                 memory_debug=self._memory_debug_snapshot(thread_id),
@@ -1542,11 +2071,163 @@ class SupportAgent:
                     thread_id=thread_id,
                     error_message="未找到待审批线程，无法恢复。",
                 ),
+                total_duration_ms=round((perf_counter() - started) * 1000, 2),
+            )
+
+        decision_count_error = self._resume_decision_count_error(decisions, pending_state)
+        if decision_count_error:
+            approval = self._build_approval_payload(pending_state.get("interrupts", []))
+            return SupportResponse(
+                message=decision_count_error,
+                intent="resume",
+                sentiment=neutral_sentiment,
+                sources=["HITL Middleware"],
+                thread_id=thread_id,
+                run_status="error",
+                active_agent=role,
+                trace_id=trace_id,
+                route_path=pending_state.get("route_path", []),
+                validation_notes=pending_state.get("validation_notes", []),
+                trace_preview=self._trace_preview(pending_state),
+                node_timings=pending_state.get("node_timings", []),
+                decision_summary=pending_state.get("decision_summary", ""),
+                approval=approval,
+                memory_debug=self._memory_debug_snapshot(thread_id),
+                next_action=self._build_next_action(
+                    run_status="error",
+                    thread_id=thread_id,
+                    approval=approval,
+                    error_message=decision_count_error,
+                ),
+                total_duration_ms=round((perf_counter() - started) * 1000, 2),
+            )
+
+        deterministic_plan = pending_state.get("pending_approval_plan", {})
+        if isinstance(deterministic_plan, dict) and deterministic_plan.get("mode") == "deterministic_tool_call":
+            decision = decisions[0] if decisions else {}
+            decision_type = self._resume_decision_type(decision)
+            approval = self._build_approval_payload(pending_state.get("interrupts", []))
+
+            if decision_type not in {"approve", "edit", "reject"}:
+                return SupportResponse(
+                    message="恢复会话失败：decision.type 仅支持 approve、edit、reject。",
+                    intent="resume",
+                    sentiment=neutral_sentiment,
+                    sources=["HITL Middleware"],
+                    thread_id=thread_id,
+                    run_status="error",
+                    active_agent=role,
+                    trace_id=trace_id,
+                    route_path=pending_state.get("route_path", []),
+                    validation_notes=pending_state.get("validation_notes", []),
+                    trace_preview=self._trace_preview(pending_state),
+                    node_timings=pending_state.get("node_timings", []),
+                    decision_summary=pending_state.get("decision_summary", ""),
+                    approval=approval,
+                    memory_debug=self._memory_debug_snapshot(thread_id),
+                    next_action=self._build_next_action(
+                        run_status="error",
+                        thread_id=thread_id,
+                        approval=approval,
+                        error_message="decision.type 非法",
+                    ),
+                    total_duration_ms=round((perf_counter() - started) * 1000, 2),
+                )
+
+            tool_name = str(deterministic_plan.get("tool", "")).strip()
+            tool = get_tool_by_name(tool_name)
+            if tool is None:
+                return SupportResponse(
+                    message=f"恢复会话失败：未找到待执行工具 `{tool_name}`。",
+                    intent="resume",
+                    sentiment=neutral_sentiment,
+                    sources=["HITL Middleware"],
+                    thread_id=thread_id,
+                    run_status="error",
+                    active_agent=role,
+                    trace_id=trace_id,
+                    route_path=pending_state.get("route_path", []),
+                    validation_notes=pending_state.get("validation_notes", []),
+                    trace_preview=self._trace_preview(pending_state),
+                    node_timings=pending_state.get("node_timings", []),
+                    decision_summary=pending_state.get("decision_summary", ""),
+                    approval=approval,
+                    memory_debug=self._memory_debug_snapshot(thread_id),
+                    next_action=self._build_next_action(
+                        run_status="error",
+                        thread_id=thread_id,
+                        approval=approval,
+                        error_message=f"未找到待执行工具 {tool_name}",
+                    ),
+                    total_duration_ms=round((perf_counter() - started) * 1000, 2),
+                )
+
+            tool_args = dict(deterministic_plan.get("args", {}))
+            trace_summary = "审批完成，继续执行图流程。"
+            trace_details: Dict[str, Any] = {
+                "tool": deterministic_plan.get("tool_label") or self._tool_label(tool_name),
+                "decision": decision_type,
+            }
+            tool_source = "Approval Decision"
+            explicit_ticket_id: Optional[str] = None
+
+            role_started = perf_counter()
+            if decision_type == "reject":
+                resumed_text = str(
+                    deterministic_plan.get("reject_message")
+                    or f"已取消{self._tool_label(tool_name)}，本轮不会执行写操作。"
+                )
+                trace_summary = "审批已拒绝，本轮未执行写操作。"
+            else:
+                if decision_type == "edit":
+                    tool_args.update(self._edited_action_args(decision))
+                    trace_summary = "审批通过并带修改，已执行调整后的动作。"
+                    trace_details["edited_args"] = self._summarize_tool_args(tool_args)
+                else:
+                    trace_summary = "审批通过，已执行待审批动作。"
+
+                self._save_memory_item(
+                    user_id=user_id,
+                    payload={
+                        "kind": "tool_call",
+                        "role": role,
+                        "thread_id": thread_id,
+                        "tool_name": tool_name,
+                        "args": tool_args,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                resumed_text = str(tool.invoke(tool_args))
+                tool_source = "Support Tools"
+                explicit_ticket_id = self._tool_result_ticket_id(tool_name, resumed_text)
+
+            role_elapsed_ms = (perf_counter() - role_started) * 1000
+            return self._complete_resumed_turn(
+                thread_id=thread_id,
+                user_id=user_id,
+                trace_id=trace_id,
+                role=role,
+                pending_state=pending_state,
+                neutral_sentiment=neutral_sentiment,
+                resumed_text=resumed_text,
+                role_elapsed_ms=role_elapsed_ms,
+                started=started,
+                trace_summary=trace_summary,
+                trace_details=trace_details,
+                tool_source=tool_source,
+                explicit_ticket_id=explicit_ticket_id,
+                preserve_ticket_lookup=False,
             )
 
         if not self.llm_enabled or role not in self.role_agents:
             self._pending_role.pop(thread_id, None)
             self._pending_state.pop(thread_id, None)
+            clear_pending_conversation_state(
+                thread_id,
+                status="completed",
+                last_active_agent=role,
+                trace_id=trace_id,
+            )
             return SupportResponse(
                 message="当前处于无 LLM 模式，已跳过审批并结束流程。",
                 intent="resume",
@@ -1559,6 +2240,7 @@ class SupportAgent:
                 route_path=pending_state.get("route_path", []),
                 validation_notes=pending_state.get("validation_notes", []),
                 trace_preview=self._trace_preview(pending_state),
+                node_timings=pending_state.get("node_timings", []),
                 decision_summary=pending_state.get("decision_summary", ""),
                 approval=None,
                 memory_debug=self._memory_debug_snapshot(thread_id),
@@ -1566,6 +2248,7 @@ class SupportAgent:
                     run_status="completed",
                     thread_id=thread_id,
                 ),
+                total_duration_ms=round((perf_counter() - started) * 1000, 2),
             )
 
         agent = self.role_agents[role]
@@ -1579,11 +2262,13 @@ class SupportAgent:
         )
 
         try:
+            role_started = perf_counter()
             result = agent.invoke(
                 Command(resume={"decisions": decisions}),
                 config=config,
                 context=context,
             )
+            role_elapsed_ms = (perf_counter() - role_started) * 1000
         except Exception as error:
             logger.error(f"Resume failed: {error}")
             approval = self._build_approval_payload(pending_state.get("interrupts", []))
@@ -1608,6 +2293,7 @@ class SupportAgent:
                         details={"error": str(error)},
                     ),
                 ][-8:],
+                node_timings=pending_state.get("node_timings", []),
                 decision_summary=pending_state.get("decision_summary", ""),
                 approval=approval,
                 memory_debug=self._memory_debug_snapshot(thread_id),
@@ -1617,12 +2303,23 @@ class SupportAgent:
                     approval=approval,
                     error_message=str(error),
                 ),
+                total_duration_ms=round((perf_counter() - started) * 1000, 2),
             )
 
         interrupts = self._extract_interrupts(result)
         if interrupts:
+            resumed_state = dict(pending_state)
+            resumed_state.update(
+                append_node_timing(
+                    resumed_state,
+                    node=role,
+                    agent=role,
+                    duration_ms=role_elapsed_ms,
+                    status="interrupted",
+                )
+            )
             resumed_trace = [
-                *pending_state.get("trace_events", []),
+                *resumed_state.get("trace_events", []),
                 build_trace_event(
                     node=role,
                     agent=role,
@@ -1634,6 +2331,22 @@ class SupportAgent:
                     },
                 ),
             ]
+            updated_state = dict(resumed_state)
+            updated_state["interrupts"] = interrupts
+            updated_state["run_status"] = "interrupted"
+            updated_state["active_agent"] = role
+            updated_state["trace_events"] = resumed_trace
+            self._pending_role[thread_id] = role
+            self._pending_state[thread_id] = updated_state
+            save_pending_conversation_state(
+                thread_id=thread_id,
+                user_id=user_id,
+                pending_role=role,
+                pending_state=updated_state,
+                trace_id=trace_id,
+                status="interrupted",
+                last_active_agent=role,
+            )
             approval = self._build_approval_payload(interrupts)
             return SupportResponse(
                 message="仍有待审批动作，请继续提交决策。",
@@ -1648,6 +2361,7 @@ class SupportAgent:
                 route_path=pending_state.get("route_path", []),
                 validation_notes=pending_state.get("validation_notes", []),
                 trace_preview=resumed_trace[-8:],
+                node_timings=updated_state.get("node_timings", []),
                 decision_summary=pending_state.get("decision_summary", ""),
                 approval=approval,
                 memory_debug=self._memory_debug_snapshot(thread_id),
@@ -1656,75 +2370,23 @@ class SupportAgent:
                     thread_id=thread_id,
                     approval=approval,
                 ),
+                total_duration_ms=round((perf_counter() - started) * 1000, 2),
             )
 
         resumed_text = self._extract_ai_text(result)
-        merged_state: OrchestrationState = dict(pending_state)
-        merged_state["active_agent"] = role
-        merged_state["run_status"] = "completed"
-        merged_state["interrupts"] = []
-        merged_state["citations"] = self._merge_unique(
-            merged_state.get("citations", []),
-            self._extract_citations(resumed_text),
-        )
-        merged_state["trace_events"] = [
-            *merged_state.get("trace_events", []),
-            build_trace_event(
-                node=role,
-                agent=role,
-                summary="审批完成，继续执行图流程。",
-                status="completed",
-            ),
-        ]
-
-        if role == "knowledge":
-            merged_state["retrieval_text"] = resumed_text
-        if role in {"action", "escalation"}:
-            merged_state["tool_text"] = resumed_text
-            merged_state["ticket_id"] = merged_state.get("ticket_id") or self._ticket_id_from_text(resumed_text)
-            if role == "action" and self._is_positive_escalation_text(resumed_text):
-                merged_state["escalated"] = True
-        if role == "escalation":
-            merged_state["escalated"] = True
-
-        merged_state = self.orchestrator.finalize_after_execution(merged_state)
-        response_message = merged_state.get("final_message", resumed_text)
-
-        self._pending_role.pop(thread_id, None)
-        self._pending_state.pop(thread_id, None)
-        self._record_history(user_id, "assistant", response_message)
-        self._save_turn_memory(
+        return self._complete_resumed_turn(
+            thread_id=thread_id,
             user_id=user_id,
-            thread_id=thread_id,
-            intent=merged_state.get("intent", "resume"),
-            active_agent=merged_state.get("selected_agent", role),
-            user_message="[resume]",
-            assistant_message=response_message,
-            sentiment=neutral_sentiment,
-        )
-
-        return SupportResponse(
-            message=response_message,
-            intent=merged_state.get("intent", "resume"),
-            sentiment=neutral_sentiment,
-            sources=self._resolve_sources(merged_state),
-            escalated=bool(merged_state.get("escalated")),
-            ticket_created=merged_state.get("ticket_id"),
-            thread_id=thread_id,
-            run_status="completed",
-            citations=merged_state.get("citations", []),
-            active_agent=merged_state.get("selected_agent", role),
             trace_id=trace_id,
-            route_path=merged_state.get("route_path", []),
-            validation_notes=merged_state.get("validation_notes", []),
-            trace_preview=self._trace_preview(merged_state),
-            decision_summary=merged_state.get("decision_summary", ""),
-            approval=None,
-            memory_debug=self._memory_debug_snapshot(thread_id),
-            next_action=self._build_next_action(
-                run_status="completed",
-                thread_id=thread_id,
-            ),
+            role=role,
+            pending_state=pending_state,
+            neutral_sentiment=neutral_sentiment,
+            resumed_text=resumed_text,
+            role_elapsed_ms=role_elapsed_ms,
+            started=started,
+            trace_summary="审批完成，继续执行图流程。",
+            trace_details=None,
+            tool_source="Support Tools" if role in {"action", "escalation"} else None,
         )
 
     def stream_chat(
@@ -1760,7 +2422,6 @@ class SupportAgent:
 
     def reset_conversation(self, user_id: str) -> None:
         with self._lock:
-            self._history[user_id] = []
             to_remove = [thread for thread, owner in self._thread_user.items() if owner == user_id]
             for thread in to_remove:
                 self._pending_role.pop(thread, None)
@@ -1768,11 +2429,11 @@ class SupportAgent:
                 self._thread_user.pop(thread, None)
                 self._trace_by_thread.pop(thread, None)
                 self._memory_debug_by_thread.pop(thread, None)
+        delete_user_conversations(user_id)
 
-    def get_conversation_history(self, user_id: str, limit: int = 10) -> List[Dict[str, str]]:
-        with self._lock:
-            history = self._history.get(user_id, [])
-            return history[-max(1, limit):]
+    def get_conversation_history(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        messages = list_user_conversation_messages(user_id=user_id, limit=max(1, limit))
+        return messages
 
 
 _support_agent: Optional[SupportAgent] = None
