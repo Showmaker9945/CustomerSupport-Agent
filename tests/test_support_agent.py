@@ -12,7 +12,7 @@ def disable_llm(monkeypatch):
     monkeypatch.setenv("DISABLE_LLM", "true")
 
 
-def test_agent_chat_and_resume_smoke():
+def test_agent_chat_and_resume_smoke(isolated_business_db):
     agent = SupportAgent(enable_memory=True, enable_sentiment=True)
     response = agent.chat(user_id="it_user", message="请帮我创建工单")
     assert response.thread_id is not None
@@ -22,7 +22,7 @@ def test_agent_chat_and_resume_smoke():
     assert resumed.run_status == "error"
 
 
-def test_fastapi_core_flow():
+def test_fastapi_core_flow(isolated_business_db):
     client = TestClient(app)
     chat_resp = client.post(
         "/chat",

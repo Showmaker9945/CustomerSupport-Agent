@@ -116,3 +116,50 @@ class TicketRecord(Base):
     metadata_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
 
     user: Mapped[User] = relationship(back_populates="tickets")
+
+
+class ConversationThread(Base):
+    """短期对话线程，保存 thread 级元信息与滚动上下文摘要。"""
+
+    __tablename__ = "conversation_threads"
+
+    thread_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    title: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    rolling_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_active_agent: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    pending_role: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    pending_state_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    trace_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_message_at: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    messages: Mapped[List["ConversationMessage"]] = relationship(
+        back_populates="thread",
+        cascade="all, delete-orphan",
+        order_by="ConversationMessage.id",
+    )
+
+
+class ConversationMessage(Base):
+    """短期对话消息明细，按线程保存用户与助手的原始 transcript。"""
+
+    __tablename__ = "conversation_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    thread_id: Mapped[str] = mapped_column(ForeignKey("conversation_threads.thread_id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    intent: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    active_agent: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    run_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    estimated_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    thread: Mapped[ConversationThread] = relationship(back_populates="messages")

@@ -2,18 +2,31 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, select, text
 
 from .demo_seed import load_seed_bundle
-from .models import Base, Invoice, InvoiceItem, Subscription, TicketRecord, User
+from .models import (
+    Base,
+    ConversationMessage,
+    ConversationThread,
+    Invoice,
+    InvoiceItem,
+    Subscription,
+    TicketRecord,
+    User,
+)
 from .session import get_engine, session_scope
 
 _bootstrap_lock = Lock()
 _ticket_lock = Lock()
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_SPACE_PATTERN = re.compile(r"\s+")
 
 
 def _now_iso() -> str:
@@ -21,9 +34,60 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_ws(text: str) -> str:
+    """压缩文本中的多余空白，便于标题和 token 估算。"""
+    return _SPACE_PATTERN.sub(" ", (text or "").strip())
+
+
+def estimate_text_tokens(text: str) -> int:
+    """轻量估算 transcript token 数，避免引入额外 tokenizer 依赖。"""
+    normalized = _normalize_ws(text)
+    if not normalized:
+        return 0
+
+    chinese_tokens = len(_CJK_PATTERN.findall(normalized))
+    english_tokens = sum(max(1, (len(word) + 3) // 4) for word in _WORD_PATTERN.findall(normalized))
+
+    residual = _WORD_PATTERN.sub("", normalized)
+    residual = _CJK_PATTERN.sub("", residual)
+    residual = _SPACE_PATTERN.sub("", residual)
+    residual_tokens = (len(residual) + 3) // 4 if residual else 0
+
+    return chinese_tokens + english_tokens + residual_tokens
+
+
+def _conversation_title(content: str, limit: int = 48) -> str:
+    """从第一条用户消息生成简短线程标题。"""
+    normalized = _normalize_ws(content)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
+
+
+def _ensure_business_schema() -> None:
+    """为已有数据库补齐本轮新增的短期记忆列。"""
+    engine = get_engine()
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "conversation_threads" not in tables:
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("conversation_threads")}
+    ddl_by_column = {
+        "pending_role": "ALTER TABLE conversation_threads ADD COLUMN pending_role VARCHAR(64)",
+        "pending_state_json": "ALTER TABLE conversation_threads ADD COLUMN pending_state_json JSON",
+        "trace_id": "ALTER TABLE conversation_threads ADD COLUMN trace_id VARCHAR(64)",
+    }
+    with engine.begin() as connection:
+        for column, ddl in ddl_by_column.items():
+            if column not in columns:
+                connection.execute(text(ddl))
+
+
 def ensure_business_database(seed_demo: bool = True) -> None:
     """确保业务表存在，并在需要时自动注入演示数据。"""
     Base.metadata.create_all(get_engine())
+    _ensure_business_schema()
     if not seed_demo:
         return
 
@@ -221,6 +285,43 @@ def _ticket_to_record(ticket: TicketRecord) -> Dict[str, Any]:
     }
 
 
+def _thread_to_record(thread: ConversationThread) -> Dict[str, Any]:
+    """将对话线程 ORM 对象转换为字典。"""
+    return {
+        "thread_id": thread.thread_id,
+        "user_id": thread.user_id,
+        "status": thread.status,
+        "title": thread.title,
+        "rolling_summary": thread.rolling_summary or "",
+        "message_count": thread.message_count,
+        "last_active_agent": thread.last_active_agent,
+        "pending_role": thread.pending_role,
+        "pending_state": thread.pending_state_json or {},
+        "trace_id": thread.trace_id,
+        "created_at": thread.created_at,
+        "updated_at": thread.updated_at,
+        "last_message_at": thread.last_message_at,
+    }
+
+
+def _message_to_record(message: ConversationMessage) -> Dict[str, Any]:
+    """将对话消息 ORM 对象转换为字典。"""
+    return {
+        "id": message.id,
+        "thread_id": message.thread_id,
+        "user_id": message.user_id,
+        "role": message.role,
+        "content": message.content,
+        "timestamp": message.created_at,
+        "intent": message.intent,
+        "active_agent": message.active_agent,
+        "run_status": message.run_status,
+        "visible": message.visible,
+        "estimated_tokens": message.estimated_tokens,
+        "metadata": message.metadata_json or {},
+    }
+
+
 def get_user_record(user_id: str) -> Optional[Dict[str, Any]]:
     """按用户 ID 查询用户主档。"""
     ensure_business_database()
@@ -349,3 +450,342 @@ def list_ticket_records(user_id: str, status: Optional[str] = None) -> List[Dict
             query = query.where(TicketRecord.status == status)
         query = query.order_by(TicketRecord.created_at.desc(), TicketRecord.ticket_id.desc())
         return [_ticket_to_record(ticket) for ticket in session.scalars(query).all()]
+
+
+def create_or_touch_conversation_thread(
+    *,
+    thread_id: str,
+    user_id: str,
+    status: str = "active",
+    title: Optional[str] = None,
+    last_active_agent: Optional[str] = None,
+    rolling_summary: Optional[str] = None,
+    pending_role: Optional[str] = None,
+    pending_state: Optional[Dict[str, Any]] = None,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """创建或更新一条对话线程元数据。"""
+    ensure_business_database()
+    with session_scope() as session:
+        now = _now_iso()
+        thread = session.get(ConversationThread, thread_id)
+        if thread is None:
+            thread = ConversationThread(
+                thread_id=thread_id,
+                user_id=user_id,
+                status=status or "active",
+                title=_conversation_title(title or "") if title else "",
+                rolling_summary=(rolling_summary or "").strip(),
+                message_count=0,
+                last_active_agent=last_active_agent,
+                pending_role=pending_role,
+                pending_state_json=pending_state or {},
+                trace_id=trace_id,
+                created_at=now,
+                updated_at=now,
+                last_message_at=None,
+            )
+        else:
+            thread.user_id = user_id
+            if title and not thread.title:
+                thread.title = _conversation_title(title)
+            if rolling_summary is not None:
+                thread.rolling_summary = rolling_summary.strip()
+            if last_active_agent is not None:
+                thread.last_active_agent = last_active_agent
+            if pending_role is not None:
+                thread.pending_role = pending_role
+            if pending_state is not None:
+                thread.pending_state_json = pending_state
+            if trace_id is not None:
+                thread.trace_id = trace_id
+            if status:
+                thread.status = status
+            thread.updated_at = now
+        session.add(thread)
+        session.flush()
+        return _thread_to_record(thread)
+
+
+def append_conversation_message(
+    *,
+    thread_id: str,
+    user_id: str,
+    role: str,
+    content: str,
+    visible: bool = True,
+    intent: Optional[str] = None,
+    active_agent: Optional[str] = None,
+    run_status: Optional[str] = None,
+    estimated_tokens: Optional[int] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    thread_status: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """向短期 transcript 写入一条消息，并同步更新线程元数据。"""
+    ensure_business_database()
+    with session_scope() as session:
+        now = _now_iso()
+        thread = session.get(ConversationThread, thread_id)
+        if thread is None:
+            thread = ConversationThread(
+                thread_id=thread_id,
+                user_id=user_id,
+                status=thread_status or run_status or "active",
+                title=_conversation_title(content) if role == "user" else "",
+                rolling_summary="",
+                message_count=0,
+                last_active_agent=active_agent,
+                pending_role=None,
+                pending_state_json={},
+                trace_id=trace_id,
+                created_at=now,
+                updated_at=now,
+                last_message_at=now,
+            )
+        else:
+            thread.user_id = user_id
+            if role == "user" and not thread.title:
+                thread.title = _conversation_title(content)
+            if active_agent is not None:
+                thread.last_active_agent = active_agent
+            if trace_id is not None:
+                thread.trace_id = trace_id
+            if thread_status:
+                thread.status = thread_status
+            elif run_status in {"completed", "interrupted", "error"}:
+                thread.status = run_status
+            elif role == "user":
+                thread.status = "active"
+            thread.updated_at = now
+            thread.last_message_at = now
+
+        message = ConversationMessage(
+            thread_id=thread_id,
+            user_id=user_id,
+            role=role,
+            content=content,
+            visible=visible,
+            intent=intent,
+            active_agent=active_agent,
+            run_status=run_status,
+            estimated_tokens=estimated_tokens if estimated_tokens is not None else estimate_text_tokens(content),
+            metadata_json=metadata or {},
+            created_at=now,
+        )
+        thread.message_count = int(thread.message_count or 0) + 1
+        session.add(thread)
+        session.add(message)
+        session.flush()
+        return _message_to_record(message)
+
+
+def mark_conversation_thread_status(
+    thread_id: str,
+    *,
+    status: str,
+    last_active_agent: Optional[str] = None,
+    rolling_summary: Optional[str] = None,
+    pending_role: Optional[str] = None,
+    pending_state: Optional[Dict[str, Any]] = None,
+    trace_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """更新线程状态，不额外写入消息。"""
+    ensure_business_database()
+    with session_scope() as session:
+        thread = session.get(ConversationThread, thread_id)
+        if thread is None:
+            return None
+        thread.status = status
+        thread.updated_at = _now_iso()
+        if last_active_agent is not None:
+            thread.last_active_agent = last_active_agent
+        if rolling_summary is not None:
+            thread.rolling_summary = rolling_summary.strip()
+        if pending_role is not None:
+            thread.pending_role = pending_role
+        if pending_state is not None:
+            thread.pending_state_json = pending_state
+        if trace_id is not None:
+            thread.trace_id = trace_id
+        session.add(thread)
+        session.flush()
+        return _thread_to_record(thread)
+
+
+def list_thread_messages(
+    thread_id: str,
+    *,
+    limit: Optional[int] = None,
+    visible_only: bool = True,
+) -> List[Dict[str, Any]]:
+    """按线程读取消息，默认仅返回用户可见 transcript。"""
+    ensure_business_database()
+    with session_scope() as session:
+        query = select(ConversationMessage).where(ConversationMessage.thread_id == thread_id)
+        if visible_only:
+            query = query.where(ConversationMessage.visible.is_(True))
+        query = query.order_by(ConversationMessage.id.desc())
+        if limit is not None:
+            query = query.limit(max(1, int(limit)))
+        rows = list(session.scalars(query).all())
+        rows.reverse()
+        return [_message_to_record(message) for message in rows]
+
+
+def get_conversation_thread(thread_id: str) -> Optional[Dict[str, Any]]:
+    """读取单个对话线程元数据。"""
+    ensure_business_database()
+    with session_scope() as session:
+        thread = session.get(ConversationThread, thread_id)
+        return _thread_to_record(thread) if thread else None
+
+
+def list_user_conversation_messages(
+    user_id: str,
+    *,
+    limit: int = 20,
+    thread_id: Optional[str] = None,
+    visible_only: bool = True,
+) -> List[Dict[str, Any]]:
+    """按用户读取最近消息，可选限制在线程内。"""
+    ensure_business_database()
+    with session_scope() as session:
+        query = select(ConversationMessage).where(ConversationMessage.user_id == user_id)
+        if thread_id:
+            query = query.where(ConversationMessage.thread_id == thread_id)
+        if visible_only:
+            query = query.where(ConversationMessage.visible.is_(True))
+        query = query.order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc()).limit(
+            max(1, int(limit))
+        )
+        rows = list(session.scalars(query).all())
+        rows.reverse()
+        return [_message_to_record(message) for message in rows]
+
+
+def build_recent_context_window(
+    *,
+    thread_id: str,
+    recent_turns: int,
+    max_messages: int,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    """构建线程级短期上下文窗口，供主图提示词注入使用。"""
+    ensure_business_database()
+    with session_scope() as session:
+        thread = session.get(ConversationThread, thread_id)
+        if thread is None:
+            return {
+                "thread_id": thread_id,
+                "rolling_summary": "",
+                "messages": [],
+                "text": "",
+                "estimated_tokens": 0,
+            }
+
+        fetch_limit = max(24, max_messages * 2, recent_turns * 4)
+        query = (
+            select(ConversationMessage)
+            .where(
+                ConversationMessage.thread_id == thread_id,
+                ConversationMessage.visible.is_(True),
+            )
+            .order_by(ConversationMessage.id.desc())
+            .limit(fetch_limit)
+        )
+        rows = list(session.scalars(query).all())
+
+        effective_cap = max(2, min(max_messages, max(2, recent_turns * 2)))
+        kept: List[ConversationMessage] = []
+        token_total = 0
+        for message in rows:
+            message_tokens = max(1, int(message.estimated_tokens or estimate_text_tokens(message.content)))
+            if kept and len(kept) >= effective_cap:
+                break
+            if kept and token_total + message_tokens > max_tokens:
+                break
+            kept.append(message)
+            token_total += message_tokens
+
+        kept.reverse()
+        history_lines = []
+        role_map = {
+            "user": "用户",
+            "assistant": "客服",
+            "system": "系统",
+            "interrupt": "审批",
+        }
+        for message in kept:
+            label = role_map.get(message.role, message.role)
+            history_lines.append(f"{label}：{_normalize_ws(message.content)}")
+
+        rolling_summary = (thread.rolling_summary or "").strip()
+        parts: List[str] = []
+        if rolling_summary:
+            parts.append(f"更早对话摘要：{rolling_summary}")
+        if history_lines:
+            parts.append("最近对话：\n" + "\n".join(history_lines))
+
+        return {
+            "thread_id": thread_id,
+            "rolling_summary": rolling_summary,
+            "messages": [_message_to_record(message) for message in kept],
+            "text": "\n".join(parts).strip(),
+            "estimated_tokens": token_total,
+        }
+
+
+def save_pending_conversation_state(
+    *,
+    thread_id: str,
+    user_id: str,
+    pending_role: str,
+    pending_state: Dict[str, Any],
+    trace_id: Optional[str],
+    status: str = "interrupted",
+    last_active_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """持久化待审批线程状态，便于跨进程 resume。"""
+    return create_or_touch_conversation_thread(
+        thread_id=thread_id,
+        user_id=user_id,
+        status=status,
+        last_active_agent=last_active_agent or pending_role,
+        pending_role=pending_role,
+        pending_state=pending_state,
+        trace_id=trace_id,
+    )
+
+
+def clear_pending_conversation_state(
+    thread_id: str,
+    *,
+    status: str,
+    last_active_agent: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """清空线程中的待审批状态。"""
+    return mark_conversation_thread_status(
+        thread_id,
+        status=status,
+        last_active_agent=last_active_agent,
+        pending_role="",
+        pending_state={},
+        trace_id=trace_id,
+    )
+
+
+def delete_user_conversations(user_id: str) -> int:
+    """删除指定用户的全部短期 transcript，用于重置会话。"""
+    ensure_business_database()
+    with session_scope() as session:
+        thread_ids = list(
+            session.scalars(
+                select(ConversationThread.thread_id).where(ConversationThread.user_id == user_id)
+            ).all()
+        )
+        if thread_ids:
+            session.execute(delete(ConversationMessage).where(ConversationMessage.thread_id.in_(thread_ids)))
+        session.execute(delete(ConversationThread).where(ConversationThread.user_id == user_id))
+        return len(thread_ids)

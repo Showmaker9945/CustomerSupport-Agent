@@ -27,6 +27,11 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..config import settings
 from ..conversation.support_agent import get_support_agent, peek_support_agent
+from ..db.repositories import (
+    get_conversation_thread,
+    list_thread_messages,
+    list_user_conversation_messages,
+)
 from ..db.demo_seed import load_seed_tickets
 from ..tools.support_tools import (
     get_latest_invoice_record,
@@ -81,7 +86,9 @@ class DebugPayload(BaseModel):
     route_path: List[str]
     validation_notes: List[str]
     trace_preview: List[Dict[str, Any]]
+    node_timings: List[Dict[str, Any]] = Field(default_factory=list)
     decision_summary: str
+    total_duration_ms: Optional[float] = None
     memory: Optional[Dict[str, Any]] = None
 
 
@@ -139,6 +146,36 @@ class HealthResponse(BaseModel):
     components: Dict[str, str]
 
 
+class ThreadPayload(BaseModel):
+    thread_id: str
+    user_id: str
+    status: str
+    title: str
+    message_count: int
+    rolling_summary: str
+    last_active_agent: Optional[str]
+    pending_role: Optional[str]
+    pending_approval: bool
+    trace_id: Optional[str]
+    created_at: str
+    updated_at: str
+    last_message_at: Optional[str]
+
+
+class ThreadDetailResponse(BaseModel):
+    thread: ThreadPayload
+
+
+class ThreadMessagesResponse(BaseModel):
+    thread_id: str
+    title: str
+    status: str
+    visible_only: bool
+    limit: Optional[int]
+    count: int
+    messages: List[Dict[str, Any]]
+
+
 def _load_demo_tickets(user_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
     """只读接口的兜底数据源，避免本地数据库异常时接口长时间卡住。"""
     tickets = [ticket for ticket in load_seed_tickets() if ticket.get("user_id") == user_id]
@@ -154,6 +191,24 @@ def _load_demo_tickets(user_id: str, status: Optional[str] = None) -> List[Dict[
 def _build_chat_response(payload: Dict[str, Any]) -> ChatResponse:
     payload["timestamp"] = datetime.now(timezone.utc).isoformat()
     return ChatResponse(**payload)
+
+
+def _build_thread_payload(thread: Dict[str, Any]) -> ThreadPayload:
+    return ThreadPayload(
+        thread_id=thread["thread_id"],
+        user_id=thread["user_id"],
+        status=thread.get("status", "active"),
+        title=thread.get("title") or "",
+        message_count=int(thread.get("message_count") or 0),
+        rolling_summary=thread.get("rolling_summary") or "",
+        last_active_agent=thread.get("last_active_agent"),
+        pending_role=thread.get("pending_role") or None,
+        pending_approval=bool(thread.get("pending_role") and thread.get("pending_state")),
+        trace_id=thread.get("trace_id"),
+        created_at=thread.get("created_at") or "",
+        updated_at=thread.get("updated_at") or "",
+        last_message_at=thread.get("last_message_at"),
+    )
 
 
 class ConnectionManager:
@@ -424,11 +479,50 @@ async def get_user_latest_invoice(user_id: str):
 
 
 @app.get("/users/{user_id}/history")
-async def get_conversation_history(user_id: str, limit: int = 20):
-    # 历史查询不应为了返回空结果而触发整套 Agent/RAG 初始化。
-    agent = peek_support_agent()
-    messages = agent.get_conversation_history(user_id=user_id, limit=limit) if agent else []
+async def get_conversation_history(user_id: str, limit: int = 20, thread_id: Optional[str] = None):
+    messages = list_user_conversation_messages(
+        user_id=user_id,
+        limit=max(1, limit),
+        thread_id=thread_id,
+    )
     return {"user_id": user_id, "messages": messages, "count": len(messages)}
+
+
+@app.get("/threads/{thread_id}", response_model=ThreadDetailResponse)
+async def get_thread_detail(thread_id: str) -> ThreadDetailResponse:
+    """查询单个线程的摘要元数据，不触发 Agent 初始化。"""
+    thread = get_conversation_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="未找到对应线程")
+    return ThreadDetailResponse(thread=_build_thread_payload(thread))
+
+
+@app.get("/threads/{thread_id}/messages", response_model=ThreadMessagesResponse)
+async def get_thread_transcript(
+    thread_id: str,
+    limit: Optional[int] = None,
+    visible_only: bool = True,
+) -> ThreadMessagesResponse:
+    """按线程查询 transcript，默认只返回用户可见消息。"""
+    thread = get_conversation_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="未找到对应线程")
+
+    normalized_limit = max(1, limit) if limit is not None else None
+    messages = list_thread_messages(
+        thread_id,
+        limit=normalized_limit,
+        visible_only=visible_only,
+    )
+    return ThreadMessagesResponse(
+        thread_id=thread_id,
+        title=thread.get("title") or "",
+        status=thread.get("status", "active"),
+        visible_only=visible_only,
+        limit=normalized_limit,
+        count=len(messages),
+        messages=messages,
+    )
 
 
 @app.post("/feedback")
@@ -508,6 +602,8 @@ async def root():
             "subscription": "/users/{user_id}/subscription (GET)",
             "latest_invoice": "/users/{user_id}/invoices/latest (GET)",
             "history": "/users/{user_id}/history (GET)",
+            "thread_detail": "/threads/{thread_id} (GET)",
+            "thread_messages": "/threads/{thread_id}/messages (GET)",
             "health": "/health (GET)",
             "docs": "/docs",
         },

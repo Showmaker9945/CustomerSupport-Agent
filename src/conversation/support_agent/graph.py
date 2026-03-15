@@ -7,6 +7,7 @@ import re
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -98,6 +99,8 @@ class OrchestrationState(TypedDict, total=False):
     user_id: str
     thread_id: str
     current_message: str
+    recent_history_text: str
+    rolling_summary: str
     intent: str
     risk: str
     sentiment_label: str
@@ -108,6 +111,7 @@ class OrchestrationState(TypedDict, total=False):
     execution_steps: List[str]
     route_path: List[str]
     trace_events: List[Dict[str, Any]]
+    node_timings: List[Dict[str, Any]]
     decision_summary: str
     needs_knowledge: bool
     needs_action: bool
@@ -119,6 +123,8 @@ class OrchestrationState(TypedDict, total=False):
     validation_passed: bool
     final_message: str
     citations: List[str]
+    tool_source: str
+    pending_approval_plan: Dict[str, Any]
     run_status: Literal["completed", "interrupted", "error"]
     interrupts: List[Dict[str, Any]]
     ticket_id: Optional[str]
@@ -156,10 +162,12 @@ class SupportResponse:
     route_path: List[str] = field(default_factory=list)
     validation_notes: List[str] = field(default_factory=list)
     trace_preview: List[Dict[str, Any]] = field(default_factory=list)
+    node_timings: List[Dict[str, Any]] = field(default_factory=list)
     decision_summary: str = ""
     approval: Optional[Dict[str, Any]] = None
     memory_debug: Dict[str, Any] = field(default_factory=dict)
     next_action: str = ""
+    total_duration_ms: Optional[float] = None
 
     def to_dict(self, include_debug: bool = True) -> Dict[str, Any]:
         """Convert the dataclass into an API-friendly payload."""
@@ -190,11 +198,51 @@ class SupportResponse:
                 "route_path": self.route_path,
                 "validation_notes": self.validation_notes,
                 "trace_preview": self.trace_preview,
+                "node_timings": self.node_timings,
                 "decision_summary": self.decision_summary,
+                "total_duration_ms": self.total_duration_ms,
             }
             if self.memory_debug:
                 payload["debug"]["memory"] = self.memory_debug
         return payload
+
+
+def build_node_timing(
+    *,
+    node: str,
+    agent: str,
+    duration_ms: float,
+    status: str = "completed",
+) -> Dict[str, Any]:
+    """Build a lightweight node timing record for debug output."""
+    return {
+        "node": node,
+        "agent": agent,
+        "duration_ms": round(float(duration_ms), 2),
+        "status": status,
+    }
+
+
+def append_node_timing(
+    state: OrchestrationState,
+    *,
+    node: str,
+    agent: str,
+    duration_ms: float,
+    status: str = "completed",
+) -> Dict[str, Any]:
+    """Append a node timing entry to orchestration state."""
+    return {
+        "node_timings": [
+            *state.get("node_timings", []),
+            build_node_timing(
+                node=node,
+                agent=agent,
+                duration_ms=duration_ms,
+                status=status,
+            ),
+        ]
+    }
 
 
 def build_trace_event(
@@ -458,27 +506,36 @@ def build_role_system_prompt(role: str, memory_items: List[Dict[str, Any]]) -> s
 
 
 def compose_knowledge_prompt(state: OrchestrationState) -> str:
+    history_text = state.get("recent_history_text", "")
+    history_block = f"\n短期对话上下文：\n{history_text}\n" if history_text else ""
     return (
         f"用户问题：{state.get('current_message', '')}\n"
+        f"{history_block}"
         "任务：调用知识检索工具，输出关键结论，并附上来源行（格式：来源：xxx）。"
     )
 
 
 def compose_action_prompt(state: OrchestrationState) -> str:
+    history_text = state.get("recent_history_text", "")
+    history_block = f"\n短期对话上下文：\n{history_text}\n" if history_text else ""
     retrieval = state.get("retrieval_text", "")
     retrieval_block = f"\n可用检索证据：\n{retrieval}\n" if retrieval else ""
     return (
         f"用户请求：{state.get('current_message', '')}\n"
+        f"{history_block}"
         f"{retrieval_block}"
         "任务：判断是否需要调用订阅/账单/工单/账户类工具，必要时执行，输出执行结果。"
     )
 
 
 def compose_escalation_prompt(state: OrchestrationState) -> str:
+    history_text = state.get("recent_history_text", "")
+    history_block = f"\n短期对话上下文：\n{history_text}\n" if history_text else ""
     retrieval = state.get("retrieval_text", "")
     retrieval_block = f"\n可用检索证据：\n{retrieval}\n" if retrieval else ""
     return (
         f"用户消息：{state.get('current_message', '')}\n"
+        f"{history_block}"
         f"{retrieval_block}"
         "任务：按升级策略处理，高风险场景优先人工升级并给出交接摘要。"
     )
@@ -487,12 +544,14 @@ def compose_escalation_prompt(state: OrchestrationState) -> str:
 def compose_responder_prompt(state: OrchestrationState) -> str:
     notes = state.get("validation_notes", [])
     note_block = "\n".join(f"- {note}" for note in notes) if notes else "无"
+    history_text = state.get("recent_history_text") or "无"
     retrieval_text = state.get("retrieval_text") or "无"
     tool_text = state.get("tool_text") or "无"
     decision_summary = state.get("decision_summary") or "无"
     return (
         "请基于以下结构化上下文生成最终客服答复：\n"
         f"- 用户问题：{state.get('current_message', '')}\n"
+        f"- 短期对话上下文：\n{history_text}\n"
         f"- 识别意图：{state.get('intent', 'other')}\n"
         f"- 风险等级：{state.get('risk', 'low')}\n"
         f"- 情绪标签：{state.get('sentiment_label', 'neutral')}\n"
@@ -513,14 +572,93 @@ class SupportAgentOrchestrator:
     def __init__(self, owner: Any) -> None:
         self.owner = owner
 
+    def _run_timed_node(
+        self,
+        state: OrchestrationState,
+        *,
+        node: str,
+        agent: str,
+        handler: Any,
+    ) -> Dict[str, Any]:
+        started = perf_counter()
+        result = dict(handler(state) or {})
+        elapsed_ms = (perf_counter() - started) * 1000
+
+        status = "completed"
+        if result.get("run_status") == "interrupted":
+            status = "interrupted"
+        elif result.get("run_status") == "error":
+            status = "error"
+        elif node == "validate" and result.get("validation_passed") is False:
+            status = "needs_revision"
+
+        result.update(
+            append_node_timing(
+                state,
+                node=node,
+                agent=agent,
+                duration_ms=elapsed_ms,
+                status=status,
+            )
+        )
+        return result
+
     def build(self) -> Any:
         workflow = StateGraph(OrchestrationState)
-        workflow.add_node("analyze", self.node_analyze)
-        workflow.add_node("knowledge", self.node_knowledge)
-        workflow.add_node("action", self.node_action)
-        workflow.add_node("escalation", self.node_escalation)
-        workflow.add_node("validate", self.node_validate)
-        workflow.add_node("respond", self.node_respond)
+        workflow.add_node(
+            "analyze",
+            lambda state: self._run_timed_node(
+                state,
+                node="analyze",
+                agent="supervisor",
+                handler=self.node_analyze,
+            ),
+        )
+        workflow.add_node(
+            "knowledge",
+            lambda state: self._run_timed_node(
+                state,
+                node="knowledge",
+                agent="knowledge",
+                handler=self.node_knowledge,
+            ),
+        )
+        workflow.add_node(
+            "action",
+            lambda state: self._run_timed_node(
+                state,
+                node="action",
+                agent="action",
+                handler=self.node_action,
+            ),
+        )
+        workflow.add_node(
+            "escalation",
+            lambda state: self._run_timed_node(
+                state,
+                node="escalation",
+                agent="escalation",
+                handler=self.node_escalation,
+            ),
+        )
+        workflow.add_node(
+            "validate",
+            lambda state: self._run_timed_node(
+                state,
+                node="validate",
+                agent="validator",
+                handler=self.node_validate,
+            ),
+        )
+        workflow.add_node(
+            "respond",
+            lambda state: self._run_timed_node(
+                state,
+                node="respond",
+                agent="responder",
+                handler=self.node_respond,
+            ),
+        )
 
         workflow.set_entry_point("analyze")
         workflow.add_conditional_edges(
@@ -563,8 +701,18 @@ class SupportAgentOrchestrator:
 
     def finalize_after_execution(self, state: OrchestrationState) -> OrchestrationState:
         merged = dict(state)
-        for node in (self.node_validate, self.node_respond):
-            merged.update(node(merged))
+        for node_name, agent_name, handler in (
+            ("validate", "validator", self.node_validate),
+            ("respond", "responder", self.node_respond),
+        ):
+            merged.update(
+                self._run_timed_node(
+                    merged,
+                    node=node_name,
+                    agent=agent_name,
+                    handler=handler,
+                )
+            )
         return merged
 
     def _route_after_analyze(self, state: OrchestrationState) -> str:
@@ -708,6 +856,30 @@ class SupportAgentOrchestrator:
         intent = state.get("intent", "request")
         risk = state.get("risk", "medium")
 
+        if self.owner.llm_enabled and self.owner._is_billing_ticket_request(state.get("current_message", "")):
+            interrupt_payload = self.owner._build_billing_ticket_interrupt(
+                user_id=user_id,
+                message=state.get("current_message", ""),
+            )
+            interrupts = interrupt_payload.get("interrupts", [])
+            interrupt_tools = [item.get("tool_label") or item.get("tool") for item in interrupts]
+            trace_update = extend_trace(
+                state,
+                node="action",
+                agent="action",
+                summary=f"识别到显式写操作，请先审批：{'、'.join(interrupt_tools)}。",
+                status="interrupted",
+                details={"interrupt_count": len(interrupts), "tools": interrupt_tools},
+            )
+            return {
+                "active_agent": "action",
+                "run_status": "interrupted",
+                "interrupts": interrupts,
+                "citations": state.get("citations", []),
+                "pending_approval_plan": interrupt_payload.get("pending_approval_plan", {}),
+                **trace_update,
+            }
+
         structured_action = self.owner._run_structured_business_action(
             user_id=user_id,
             message=state.get("current_message", ""),
@@ -762,6 +934,7 @@ class SupportAgentOrchestrator:
         return {
             "active_agent": "action",
             "tool_text": tool_text,
+            "tool_source": "Support Tools",
             "ticket_id": ticket_id,
             "escalated": escalated,
             "run_status": "completed",
@@ -822,6 +995,7 @@ class SupportAgentOrchestrator:
         return {
             "active_agent": "escalation",
             "tool_text": tool_text,
+            "tool_source": "Support Tools",
             "ticket_id": ticket_id,
             "escalated": True,
             "run_status": "completed",

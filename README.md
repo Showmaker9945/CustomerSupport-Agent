@@ -2,19 +2,6 @@
 
 一个中文优先的客服 Agent Demo，基于 LangGraph 条件路由、多 Agent 协作、HITL 审批、混合检索 RAG、长短期记忆与 FastAPI 构建，适合作为实习简历里的工程化 Agent 项目。
 
-## 简历版摘要
-
-一句话版本：
-
-基于 LangGraph 和 FastAPI 实现中文客服 Agent 系统，支持条件路由、多 Agent 协作、HITL 审批、混合检索 RAG 与持久记忆，并完成可演示 API 与测试闭环。
-
-三点版本：
-
-- 使用 LangGraph 搭建中文客服多 Agent 图，按意图、风险和上下文在知识检索、业务执行、人工升级等路径间条件路由。
-- 实现 middleware、HITL 审批、线程级状态恢复与用户级长期记忆，保证高风险动作可中断、可恢复、可追踪。
-- 基于 FastAPI 提供 REST、SSE、WebSocket 与 Swagger Demo，并补齐单元测试，形成可直接展示的完整后端项目。
-
-
 ## 项目亮点
 
 - LangGraph 条件边编排：分析、路由、检索、执行、升级、校验、回复职责清晰
@@ -22,8 +9,9 @@
 - 中文优先：默认中文输出、中文情绪识别、中文 FAQ 与业务示例
 - 轻量增强 RAG：混合检索、查询规范化、分类推断、子问题拆分、一次改写兜底
 - Memory 治理：线程级短期记忆、用户级长期记忆、记忆抽取与召回
-- HITL：高风险工具先中断审批，再恢复同一线程执行
+- HITL：高风险工具先中断审批，再恢复同一线程执行；显式写操作支持确定性中断
 - FastAPI 演示友好：REST、WebSocket、SSE、Swagger、回归测试
+- Debug 可观测：返回路由轨迹、校验说明、节点耗时、审批工具摘要
 
 ## 适合展示的能力
 
@@ -109,7 +97,7 @@ cp .env.example .env
 LLM_API_KEY=你的千问 API Key
 LLM_PROVIDER=qwen
 LLM_MODEL=qwen-plus
-LLM_HIGH_QUALITY_MODEL=qwen-max
+LLM_HIGH_QUALITY_MODEL=qwen3-max
 ```
 
 说明：
@@ -171,7 +159,11 @@ uv run pytest --cov=src --cov-report=term-missing --cov-report=html
 4. HITL 中断与恢复
    - 问题：`帮我创建一个账单异常工单`
    - 预期：返回 `run_status = interrupted`
-   - 用响应里的 `thread_id` 调 `/runs/{thread_id}/resume`
+   - `approval.tools[0]` 中会明确显示待审批工具名、原因和参数摘要
+   - 用响应最外层的 `thread_id` 调 `/runs/{thread_id}/resume`
+   - `approve`：执行写操作
+   - `edit`：修改参数后执行
+   - `reject`：取消写操作并返回最终答复
 
 5. 升级人工
    - 问题：`我要投诉，现在就转人工`
@@ -225,6 +217,13 @@ LANGGRAPH_PERSISTENCE_BACKEND=postgres
 - Agent 图设计清晰，而不是把所有逻辑塞进单个 Agent
 - 中间件、审批流、持久化、RAG、业务工具能够协同工作
 - API、测试、文档齐全，适合作为简历 Demo 和现场演示项目
+
+## 最近更新
+
+- 修复显式高风险写操作在部分场景下无法正确触发 HITL 的问题
+- 为 `create_ticket` 等审批动作补齐确定性 `interrupt -> resume` 链路
+- `/chat` 与 `/resume` 调试信息增加节点耗时，便于演示和排障
+- 优化审批响应结构，待审批工具名称和参数预览更清晰
 
 ## 相关文档
 

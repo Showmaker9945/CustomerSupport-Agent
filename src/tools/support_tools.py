@@ -541,7 +541,7 @@ def create_ticket(
 
     except Exception as e:
         logger.error(f"Create ticket error: {e}")
-        return f"创建工单失败：{str(e)}"
+        return "创建工单失败：当前用户不存在，或工单写入数据库失败。请确认 user_id 是否有效后重试。"
 @tool
 def get_ticket_status(ticket_id: str) -> str:
     """
@@ -914,7 +914,7 @@ def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> s
 
     except Exception as e:
         logger.error(f"Escalation error: {e}")
-        return f"升级人工客服失败：{str(e)}"
+        return "升级人工客服失败：人工升级工单写入失败。请确认 user_id 是否有效后重试。"
 # LangChain Agent 可见的全部工具
 ALL_TOOLS = [
     search_faq,
