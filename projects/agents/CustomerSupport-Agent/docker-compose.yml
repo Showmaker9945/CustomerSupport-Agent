@@ -72,6 +72,17 @@
     networks:
       - support-network
 
+  adminer:
+    image: adminer
+    container_name: support-adminer
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    networks:
+      - support-network
+
 networks:
   support-network:
     driver: bridge
