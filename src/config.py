@@ -124,6 +124,14 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
 
+    # LangSmith 可观测性
+    langsmith_tracing: bool = False
+    langsmith_otel_enabled: bool = True
+    langsmith_api_key: str = Field(default="")
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+    langsmith_project: str = "customer-support-agent"
+    langsmith_workspace_id: str = Field(default="")
+
     # 默认语言
     default_response_language: str = "zh-CN"
 
@@ -184,6 +192,16 @@ class Settings(BaseSettings):
             "your_openai_api_key_here",
         }
         return key not in invalid_values
+
+    @property
+    def has_valid_langsmith_api_key(self) -> bool:
+        key = (self.langsmith_api_key or "").strip()
+        invalid_values = {"", "your_langsmith_api_key_here"}
+        return key not in invalid_values
+
+    @property
+    def langsmith_enabled(self) -> bool:
+        return self.langsmith_tracing and self.has_valid_langsmith_api_key
 
 
 @lru_cache

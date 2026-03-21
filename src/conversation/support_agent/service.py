@@ -9,7 +9,7 @@ import os
 import re
 import threading
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -17,6 +17,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.types import Command
+from langsmith import Client as LangSmithClient, trace, tracing_context
+from langsmith.run_helpers import get_current_run_tree
 
 from ...config import settings
 from ...db.repositories import (
@@ -144,6 +146,7 @@ class SupportAgent:
         self.basic_model: Optional[ChatOpenAI] = None
         self.advanced_model: Optional[ChatOpenAI] = None
         self.role_agents: Dict[str, Any] = {}
+        self.langsmith_client = self._create_langsmith_client()
 
         if self.llm_enabled:
             self.basic_model = self._create_model(self.model_name, self.temperature)
@@ -169,6 +172,293 @@ class SupportAgent:
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
         return ChatOpenAI(**kwargs)
+
+    def _create_langsmith_client(self) -> Optional[LangSmithClient]:
+        if not settings.langsmith_enabled:
+            return None
+
+        kwargs: Dict[str, Any] = {
+            "api_key": settings.langsmith_api_key,
+            "api_url": settings.langsmith_endpoint,
+        }
+        if settings.langsmith_workspace_id:
+            kwargs["workspace_id"] = settings.langsmith_workspace_id
+        if settings.langsmith_otel_enabled:
+            kwargs["otel_enabled"] = True
+
+        try:
+            return LangSmithClient(**kwargs)
+        except Exception as error:
+            logger.warning(f"LangSmith client init failed, tracing disabled: {error}")
+            return None
+
+    def _langsmith_disabled_reason(self) -> str:
+        if not settings.langsmith_tracing:
+            return "LANGSMITH_TRACING is disabled."
+        if not settings.has_valid_langsmith_api_key:
+            return "LANGSMITH_API_KEY is not configured."
+        if self.langsmith_client is None:
+            return "LangSmith client initialization failed."
+        return ""
+
+    def _default_langsmith_debug(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "enabled": bool(settings.langsmith_enabled and self.langsmith_client is not None),
+            "project": settings.langsmith_project,
+            "endpoint": settings.langsmith_endpoint,
+        }
+        if settings.langsmith_workspace_id:
+            payload["workspace_id"] = settings.langsmith_workspace_id
+
+        reason = self._langsmith_disabled_reason()
+        if reason:
+            payload["reason"] = reason
+        return payload
+
+    def _langsmith_tags(self, *, entrypoint: str, role: Optional[str] = None) -> List[str]:
+        tags = [
+            "customer-support-agent",
+            f"env:{settings.environment}",
+            f"entry:{entrypoint}",
+        ]
+        if role:
+            tags.append(f"role:{role}")
+        return tags
+
+    def _langsmith_metadata(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        trace_id: str,
+        role: Optional[str] = None,
+        intent: Optional[str] = None,
+        risk: Optional[str] = None,
+        resumed: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "app_name": settings.app_name,
+            "app_version": settings.app_version,
+            "environment": settings.environment,
+            "user_id": user_id,
+            "thread_id": thread_id,
+            "correlation_id": trace_id,
+            "langgraph_persistence_backend": self.persistence.backend,
+            "llm_enabled": self.llm_enabled,
+        }
+        if role:
+            metadata["role"] = role
+        if intent:
+            metadata["intent"] = intent
+        if risk:
+            metadata["risk"] = risk
+        if resumed is not None:
+            metadata["resumed"] = resumed
+        return metadata
+
+    def _build_runnable_config(
+        self,
+        *,
+        run_name: str,
+        entrypoint: str,
+        user_id: str,
+        thread_id: str,
+        trace_id: str,
+        checkpoint_thread_id: Optional[str] = None,
+        role: Optional[str] = None,
+        intent: Optional[str] = None,
+        risk: Optional[str] = None,
+        resumed: Optional[bool] = None,
+        extra_tags: Optional[List[str]] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        metadata = self._langsmith_metadata(
+            user_id=user_id,
+            thread_id=thread_id,
+            trace_id=trace_id,
+            role=role,
+            intent=intent,
+            risk=risk,
+            resumed=resumed,
+        )
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
+        tags: List[str] = []
+        for tag in [*self._langsmith_tags(entrypoint=entrypoint, role=role), *(extra_tags or [])]:
+            cleaned = str(tag).strip()
+            if cleaned and cleaned not in tags:
+                tags.append(cleaned)
+
+        config: Dict[str, Any] = {
+            "run_name": run_name,
+            "tags": tags,
+            "metadata": metadata,
+        }
+        if checkpoint_thread_id:
+            config["configurable"] = {"thread_id": checkpoint_thread_id}
+        return config
+
+    def _langsmith_payload_from_run(self, run_tree: Any) -> Dict[str, Any]:
+        payload = self._default_langsmith_debug()
+        if run_tree is None or self.langsmith_client is None or not settings.langsmith_enabled:
+            return payload
+
+        payload["enabled"] = True
+        payload.pop("reason", None)
+
+        run_id = getattr(run_tree, "id", None)
+        trace_id = getattr(run_tree, "trace_id", None)
+        if run_id is not None:
+            payload["run_id"] = str(run_id)
+        if trace_id is not None:
+            payload["trace_id"] = str(trace_id)
+
+        with suppress(Exception):
+            payload["run_url"] = self.langsmith_client.get_run_url(
+                run=run_tree,
+                project_name=settings.langsmith_project,
+            )
+        return payload
+
+    @contextmanager
+    def _langsmith_trace(
+        self,
+        *,
+        name: str,
+        entrypoint: str,
+        user_id: str,
+        thread_id: str,
+        trace_id: str,
+        role: Optional[str] = None,
+        intent: Optional[str] = None,
+        risk: Optional[str] = None,
+        resumed: Optional[bool] = None,
+        parent: Optional[Any] = None,
+    ):
+        payload = self._default_langsmith_debug()
+        if self.langsmith_client is None or not settings.langsmith_enabled:
+            yield payload
+            return
+
+        tags = self._langsmith_tags(entrypoint=entrypoint, role=role)
+        metadata = self._langsmith_metadata(
+            user_id=user_id,
+            thread_id=thread_id,
+            trace_id=trace_id,
+            role=role,
+            intent=intent,
+            risk=risk,
+            resumed=resumed,
+        )
+        with tracing_context(
+            enabled=True,
+            project_name=settings.langsmith_project,
+            tags=tags,
+            metadata=metadata,
+            parent=parent,
+            client=self.langsmith_client,
+        ):
+            with trace(
+                name=name,
+                run_type="chain",
+                project_name=settings.langsmith_project,
+                tags=tags,
+                metadata=metadata,
+                parent=parent,
+                client=self.langsmith_client,
+            ) as run_tree:
+                payload.update(self._langsmith_payload_from_run(run_tree))
+                try:
+                    yield payload
+                finally:
+                    payload.update(self._langsmith_payload_from_run(run_tree))
+
+    def _langsmith_current_parent_headers(self) -> Optional[Dict[str, str]]:
+        if self.langsmith_client is None or not settings.langsmith_enabled:
+            return None
+        with suppress(Exception):
+            run_tree = get_current_run_tree()
+            if run_tree is None:
+                return None
+            return dict(run_tree.to_headers())
+        return None
+
+    def _trace_resume_finalize_node(
+        self,
+        state: OrchestrationState,
+        *,
+        node: str,
+        agent: str,
+        handler: Any,
+        user_id: str,
+        thread_id: str,
+        trace_id: str,
+        intent: str,
+        risk: str,
+    ) -> Dict[str, Any]:
+        if self.langsmith_client is None or not settings.langsmith_enabled:
+            return self.orchestrator._run_timed_node(
+                state,
+                node=node,
+                agent=agent,
+                handler=handler,
+            )
+
+        tags = self._langsmith_tags(entrypoint="resume-node", role=agent)
+        metadata = self._langsmith_metadata(
+            user_id=user_id,
+            thread_id=thread_id,
+            trace_id=trace_id,
+            role=agent,
+            intent=intent,
+            risk=risk,
+            resumed=True,
+        )
+        with trace(
+            name=node,
+            run_type="chain",
+            project_name=settings.langsmith_project,
+            tags=tags,
+            metadata=metadata,
+            client=self.langsmith_client,
+        ):
+            return self.orchestrator._run_timed_node(
+                state,
+                node=node,
+                agent=agent,
+                handler=handler,
+            )
+
+    def _finalize_after_execution_with_langsmith(
+        self,
+        state: OrchestrationState,
+        *,
+        user_id: str,
+        thread_id: str,
+        trace_id: str,
+    ) -> OrchestrationState:
+        merged = dict(state)
+        intent = merged.get("intent", "resume")
+        risk = merged.get("risk", "medium")
+        for node_name, agent_name, handler in (
+            ("validate", "validator", self.orchestrator.node_validate),
+            ("respond", "responder", self.orchestrator.node_respond),
+        ):
+            merged.update(
+                self._trace_resume_finalize_node(
+                    merged,
+                    node=node_name,
+                    agent=agent_name,
+                    handler=handler,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    trace_id=trace_id,
+                    intent=intent,
+                    risk=risk,
+                )
+            )
+        return merged
 
     def _telemetry_memory_namespace(self, user_id: str) -> Tuple[str, str, str]:
         return (settings.long_term_memory_namespace, user_id, "telemetry")
@@ -1266,6 +1556,7 @@ class SupportAgent:
         tool_source: Optional[str] = None,
         explicit_ticket_id: Optional[str] = None,
         preserve_ticket_lookup: bool = True,
+        langsmith: Optional[Dict[str, Any]] = None,
     ) -> SupportResponse:
         merged_state: OrchestrationState = dict(pending_state)
         merged_state.update(
@@ -1312,7 +1603,12 @@ class SupportAgent:
             merged_state["escalated"] = True
 
         merged_state.pop("pending_approval_plan", None)
-        merged_state = self.orchestrator.finalize_after_execution(merged_state)
+        merged_state = self._finalize_after_execution_with_langsmith(
+            merged_state,
+            user_id=user_id,
+            thread_id=thread_id,
+            trace_id=trace_id,
+        )
         response_message = merged_state.get("final_message", resumed_text)
 
         self._pending_role.pop(thread_id, None)
@@ -1370,6 +1666,7 @@ class SupportAgent:
             decision_summary=merged_state.get("decision_summary", ""),
             approval=None,
             memory_debug=self._memory_debug_snapshot(thread_id),
+            langsmith=langsmith or {},
             next_action=self._build_next_action(
                 run_status="completed",
                 thread_id=thread_id,
@@ -1704,6 +2001,7 @@ class SupportAgent:
         role: str,
         user_id: str,
         thread_id: str,
+        trace_id: str,
         intent: str,
         risk: str,
         message: str,
@@ -1713,7 +2011,17 @@ class SupportAgent:
             return {"messages": [AIMessage(content=fallback)]}
 
         agent = self.role_agents[role]
-        config = {"configurable": {"thread_id": self._agent_thread_id(thread_id, role)}}
+        config = self._build_runnable_config(
+            run_name=f"{role}_agent_invoke",
+            entrypoint="agent",
+            user_id=user_id,
+            thread_id=thread_id,
+            trace_id=trace_id,
+            checkpoint_thread_id=self._agent_thread_id(thread_id, role),
+            role=role,
+            intent=intent,
+            risk=risk,
+        )
         context = AgentRuntimeContext(
             user_id=user_id,
             thread_id=thread_id,
@@ -1726,6 +2034,7 @@ class SupportAgent:
             config=config,
             context=context,
         )
+
     def _build_sentiment_result(
         self,
         baseline: SentimentResult,
@@ -1807,6 +2116,7 @@ class SupportAgent:
         initial_state: OrchestrationState = {
             "user_id": user_id,
             "thread_id": thread,
+            "trace_id": trace_id,
             "current_message": message,
             "recent_history_text": recent_context.get("text", ""),
             "rolling_summary": recent_context.get("rolling_summary", ""),
@@ -1838,64 +2148,220 @@ class SupportAgent:
             "ticket_id": None,
             "escalated": False,
         }
+        graph_config = self._build_runnable_config(
+            run_name="support_orchestration_graph",
+            entrypoint="graph",
+            user_id=user_id,
+            thread_id=thread,
+            trace_id=trace_id,
+            role="supervisor",
+            intent=initial_intent,
+            risk=initial_risk,
+        )
+        with self._langsmith_trace(
+            name="support.chat",
+            entrypoint="chat",
+            user_id=user_id,
+            thread_id=thread,
+            trace_id=trace_id,
+            role="supervisor",
+            intent=initial_intent,
+            risk=initial_risk,
+            resumed=False,
+        ) as langsmith_debug:
+            try:
+                final_state = self.orchestration_graph.invoke(initial_state, config=graph_config)
+            except Exception as error:
+                logger.error(f"Graph invocation failed, fallback to template: {error}")
+                fallback = self._fallback_response(
+                    role="supervisor",
+                    user_id=user_id,
+                    message=message,
+                    sentiment=baseline_sentiment,
+                )
+                self._record_history(
+                    thread_id=thread,
+                    user_id=user_id,
+                    role="assistant",
+                    content=fallback,
+                    intent=initial_state["intent"],
+                    active_agent=initial_state["selected_agent"],
+                    run_status="completed",
+                    metadata={"fallback": True, "trace_id": trace_id},
+                    thread_status="completed",
+                    trace_id=trace_id,
+                )
+                clear_pending_conversation_state(
+                    thread,
+                    status="completed",
+                    last_active_agent=initial_state["selected_agent"],
+                    trace_id=trace_id,
+                )
+                self._refresh_thread_summary_if_needed(thread)
+                return SupportResponse(
+                    message=fallback,
+                    intent=initial_state["intent"],
+                    sentiment=baseline_sentiment,
+                    sources=["Fallback Policy"],
+                    escalated=False,
+                    ticket_created=self._ticket_id_from_text(fallback),
+                    thread_id=thread,
+                    run_status="completed",
+                    interrupts=[],
+                    citations=self._extract_citations(fallback),
+                    active_agent=initial_state["selected_agent"],
+                    trace_id=trace_id,
+                    route_path=["fallback"],
+                    validation_notes=[],
+                    trace_preview=[
+                        build_trace_event(
+                            node="fallback",
+                            agent="supervisor",
+                            summary="图执行失败，已回退到模板回复。",
+                            status="error",
+                            details={"error": str(error)},
+                        )
+                    ],
+                    node_timings=initial_state.get("node_timings", []),
+                    decision_summary="图执行失败，已使用回退策略直接回复。",
+                    approval=None,
+                    memory_debug=self._memory_debug_snapshot(thread),
+                    langsmith=langsmith_debug,
+                    next_action=self._build_next_action(
+                        run_status="completed",
+                        thread_id=thread,
+                    ),
+                    total_duration_ms=round((perf_counter() - started) * 1000, 2),
+                )
 
-        try:
-            final_state = self.orchestration_graph.invoke(initial_state)
-        except Exception as error:
-            logger.error(f"Graph invocation failed, fallback to template: {error}")
-            fallback = self._fallback_response(
-                role="supervisor",
-                user_id=user_id,
-                message=message,
-                sentiment=baseline_sentiment,
-            )
+            if final_state.get("run_status") == "interrupted":
+                pending_role = final_state.get("active_agent", final_state.get("selected_agent", "action"))
+                parent_headers = self._langsmith_current_parent_headers()
+                if parent_headers:
+                    final_state["langsmith_parent_headers"] = parent_headers
+                self._pending_role[thread] = pending_role
+                self._pending_state[thread] = dict(final_state)
+                save_pending_conversation_state(
+                    thread_id=thread,
+                    user_id=user_id,
+                    pending_role=pending_role,
+                    pending_state=dict(final_state),
+                    trace_id=trace_id,
+                    status="interrupted",
+                    last_active_agent=pending_role,
+                )
+                wait_message = "检测到高风险动作，已暂停执行，等待人工审批（approve/edit/reject）。"
+                self._record_history(
+                    thread_id=thread,
+                    user_id=user_id,
+                    role="interrupt",
+                    content=wait_message,
+                    intent=final_state.get("intent", "other"),
+                    active_agent=pending_role,
+                    run_status="interrupted",
+                    metadata={
+                        "trace_id": trace_id,
+                        "interrupt_count": len(final_state.get("interrupts", [])),
+                    },
+                    thread_status="interrupted",
+                    trace_id=trace_id,
+                )
+                self._refresh_thread_summary_if_needed(thread)
+                sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
+                approval = self._build_approval_payload(final_state.get("interrupts", []))
+                return SupportResponse(
+                    message=wait_message,
+                    intent=final_state.get("intent", "other"),
+                    sentiment=sentiment,
+                    sources=["HITL Middleware"],
+                    escalated=pending_role == "escalation",
+                    ticket_created=None,
+                    thread_id=thread,
+                    run_status="interrupted",
+                    interrupts=final_state.get("interrupts", []),
+                    citations=final_state.get("citations", []),
+                    active_agent=pending_role,
+                    trace_id=trace_id,
+                    route_path=final_state.get("route_path", []),
+                    validation_notes=final_state.get("validation_notes", []),
+                    trace_preview=self._trace_preview(final_state),
+                    node_timings=final_state.get("node_timings", []),
+                    decision_summary=final_state.get("decision_summary", ""),
+                    approval=approval,
+                    memory_debug=self._memory_debug_snapshot(thread),
+                    langsmith=langsmith_debug,
+                    next_action=self._build_next_action(
+                        run_status="interrupted",
+                        thread_id=thread,
+                        approval=approval,
+                    ),
+                    total_duration_ms=round((perf_counter() - started) * 1000, 2),
+                )
+
+            response_message = final_state.get("final_message") or final_state.get("tool_text") or final_state.get(
+                "retrieval_text"
+            ) or "抱歉，我暂时无法给出有效回复。"
+            citations = final_state.get("citations", [])
+            ticket_id = final_state.get("ticket_id") or self._ticket_id_from_text(response_message)
+            active_agent = final_state.get("selected_agent", "supervisor")
+            sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
+            sources = self._resolve_sources(final_state)
+
             self._record_history(
                 thread_id=thread,
                 user_id=user_id,
                 role="assistant",
-                content=fallback,
-                intent=initial_state["intent"],
-                active_agent=initial_state["selected_agent"],
+                content=response_message,
+                intent=final_state.get("intent", "other"),
+                active_agent=active_agent,
                 run_status="completed",
-                metadata={"fallback": True, "trace_id": trace_id},
+                metadata={
+                    "trace_id": trace_id,
+                    "citations": citations,
+                    "ticket_id": ticket_id,
+                    "escalated": bool(final_state.get("escalated")),
+                },
                 thread_status="completed",
                 trace_id=trace_id,
             )
             clear_pending_conversation_state(
                 thread,
                 status="completed",
-                last_active_agent=initial_state["selected_agent"],
+                last_active_agent=active_agent,
                 trace_id=trace_id,
             )
             self._refresh_thread_summary_if_needed(thread)
+            self._save_turn_memory(
+                user_id=user_id,
+                thread_id=thread,
+                intent=final_state.get("intent", "other"),
+                active_agent=active_agent,
+                user_message=message,
+                assistant_message=response_message,
+                sentiment=sentiment,
+            )
+
             return SupportResponse(
-                message=fallback,
-                intent=initial_state["intent"],
-                sentiment=baseline_sentiment,
-                sources=["Fallback Policy"],
-                escalated=False,
-                ticket_created=self._ticket_id_from_text(fallback),
+                message=response_message,
+                intent=final_state.get("intent", "other"),
+                sentiment=sentiment,
+                sources=sources,
+                escalated=bool(final_state.get("escalated")),
+                ticket_created=ticket_id,
                 thread_id=thread,
                 run_status="completed",
                 interrupts=[],
-                citations=self._extract_citations(fallback),
-                active_agent=initial_state["selected_agent"],
+                citations=citations,
+                active_agent=active_agent,
                 trace_id=trace_id,
-                route_path=["fallback"],
-                validation_notes=[],
-                trace_preview=[
-                    build_trace_event(
-                        node="fallback",
-                        agent="supervisor",
-                        summary="图执行失败，已回退到模板回复。",
-                        status="error",
-                        details={"error": str(error)},
-                    )
-                ],
-                node_timings=initial_state.get("node_timings", []),
-                decision_summary="图执行失败，已使用回退策略直接回复。",
+                route_path=final_state.get("route_path", []),
+                validation_notes=final_state.get("validation_notes", []),
+                trace_preview=self._trace_preview(final_state),
+                node_timings=final_state.get("node_timings", []),
+                decision_summary=final_state.get("decision_summary", ""),
                 approval=None,
                 memory_debug=self._memory_debug_snapshot(thread),
+                langsmith=langsmith_debug,
                 next_action=self._build_next_action(
                     run_status="completed",
                     thread_id=thread,
@@ -1903,135 +2369,6 @@ class SupportAgent:
                 total_duration_ms=round((perf_counter() - started) * 1000, 2),
             )
 
-        if final_state.get("run_status") == "interrupted":
-            pending_role = final_state.get("active_agent", final_state.get("selected_agent", "action"))
-            self._pending_role[thread] = pending_role
-            self._pending_state[thread] = dict(final_state)
-            save_pending_conversation_state(
-                thread_id=thread,
-                user_id=user_id,
-                pending_role=pending_role,
-                pending_state=dict(final_state),
-                trace_id=trace_id,
-                status="interrupted",
-                last_active_agent=pending_role,
-            )
-            wait_message = "检测到高风险动作，已暂停执行，等待人工审批（approve/edit/reject）。"
-            self._record_history(
-                thread_id=thread,
-                user_id=user_id,
-                role="interrupt",
-                content=wait_message,
-                intent=final_state.get("intent", "other"),
-                active_agent=pending_role,
-                run_status="interrupted",
-                metadata={
-                    "trace_id": trace_id,
-                    "interrupt_count": len(final_state.get("interrupts", [])),
-                },
-                thread_status="interrupted",
-                trace_id=trace_id,
-            )
-            self._refresh_thread_summary_if_needed(thread)
-            sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
-            approval = self._build_approval_payload(final_state.get("interrupts", []))
-            return SupportResponse(
-                message=wait_message,
-                intent=final_state.get("intent", "other"),
-                sentiment=sentiment,
-                sources=["HITL Middleware"],
-                escalated=pending_role == "escalation",
-                ticket_created=None,
-                thread_id=thread,
-                run_status="interrupted",
-                interrupts=final_state.get("interrupts", []),
-                citations=final_state.get("citations", []),
-                active_agent=pending_role,
-                trace_id=trace_id,
-                route_path=final_state.get("route_path", []),
-                validation_notes=final_state.get("validation_notes", []),
-                trace_preview=self._trace_preview(final_state),
-                node_timings=final_state.get("node_timings", []),
-                decision_summary=final_state.get("decision_summary", ""),
-                approval=approval,
-                memory_debug=self._memory_debug_snapshot(thread),
-                next_action=self._build_next_action(
-                    run_status="interrupted",
-                    thread_id=thread,
-                    approval=approval,
-                ),
-                total_duration_ms=round((perf_counter() - started) * 1000, 2),
-            )
-
-        response_message = final_state.get("final_message") or final_state.get("tool_text") or final_state.get(
-            "retrieval_text"
-        ) or "抱歉，我暂时无法给出有效回复。"
-        citations = final_state.get("citations", [])
-        ticket_id = final_state.get("ticket_id") or self._ticket_id_from_text(response_message)
-        active_agent = final_state.get("selected_agent", "supervisor")
-        sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
-        sources = self._resolve_sources(final_state)
-
-        self._record_history(
-            thread_id=thread,
-            user_id=user_id,
-            role="assistant",
-            content=response_message,
-            intent=final_state.get("intent", "other"),
-            active_agent=active_agent,
-            run_status="completed",
-            metadata={
-                "trace_id": trace_id,
-                "citations": citations,
-                "ticket_id": ticket_id,
-                "escalated": bool(final_state.get("escalated")),
-            },
-            thread_status="completed",
-            trace_id=trace_id,
-        )
-        clear_pending_conversation_state(
-            thread,
-            status="completed",
-            last_active_agent=active_agent,
-            trace_id=trace_id,
-        )
-        self._refresh_thread_summary_if_needed(thread)
-        self._save_turn_memory(
-            user_id=user_id,
-            thread_id=thread,
-            intent=final_state.get("intent", "other"),
-            active_agent=active_agent,
-            user_message=message,
-            assistant_message=response_message,
-            sentiment=sentiment,
-        )
-
-        return SupportResponse(
-            message=response_message,
-            intent=final_state.get("intent", "other"),
-            sentiment=sentiment,
-            sources=sources,
-            escalated=bool(final_state.get("escalated")),
-            ticket_created=ticket_id,
-            thread_id=thread,
-            run_status="completed",
-            interrupts=[],
-            citations=citations,
-            active_agent=active_agent,
-            trace_id=trace_id,
-            route_path=final_state.get("route_path", []),
-            validation_notes=final_state.get("validation_notes", []),
-            trace_preview=self._trace_preview(final_state),
-            node_timings=final_state.get("node_timings", []),
-            decision_summary=final_state.get("decision_summary", ""),
-            approval=None,
-            memory_debug=self._memory_debug_snapshot(thread),
-            next_action=self._build_next_action(
-                run_status="completed",
-                thread_id=thread,
-            ),
-            total_duration_ms=round((perf_counter() - started) * 1000, 2),
-        )
     def resume(
         self,
         thread_id: str,
@@ -2041,6 +2378,10 @@ class SupportAgent:
         started = perf_counter()
         user_id, trace_id, role, pending_state = self._load_pending_context(thread_id)
         neutral_sentiment = build_neutral_sentiment()
+        effective_user_id = user_id or self._thread_user.get(thread_id, "unknown_user")
+        effective_trace_id = trace_id or str(uuid.uuid4())
+        effective_role = role or "unknown"
+        parent_headers = pending_state.get("langsmith_parent_headers") if pending_state else None
 
         if role is None:
             return SupportResponse(
@@ -2104,120 +2445,164 @@ class SupportAgent:
 
         deterministic_plan = pending_state.get("pending_approval_plan", {})
         if isinstance(deterministic_plan, dict) and deterministic_plan.get("mode") == "deterministic_tool_call":
-            decision = decisions[0] if decisions else {}
-            decision_type = self._resume_decision_type(decision)
-            approval = self._build_approval_payload(pending_state.get("interrupts", []))
-
-            if decision_type not in {"approve", "edit", "reject"}:
-                return SupportResponse(
-                    message="恢复会话失败：decision.type 仅支持 approve、edit、reject。",
-                    intent="resume",
-                    sentiment=neutral_sentiment,
-                    sources=["HITL Middleware"],
-                    thread_id=thread_id,
-                    run_status="error",
-                    active_agent=role,
-                    trace_id=trace_id,
-                    route_path=pending_state.get("route_path", []),
-                    validation_notes=pending_state.get("validation_notes", []),
-                    trace_preview=self._trace_preview(pending_state),
-                    node_timings=pending_state.get("node_timings", []),
-                    decision_summary=pending_state.get("decision_summary", ""),
-                    approval=approval,
-                    memory_debug=self._memory_debug_snapshot(thread_id),
-                    next_action=self._build_next_action(
-                        run_status="error",
-                        thread_id=thread_id,
-                        approval=approval,
-                        error_message="decision.type 非法",
-                    ),
-                    total_duration_ms=round((perf_counter() - started) * 1000, 2),
-                )
-
-            tool_name = str(deterministic_plan.get("tool", "")).strip()
-            tool = get_tool_by_name(tool_name)
-            if tool is None:
-                return SupportResponse(
-                    message=f"恢复会话失败：未找到待执行工具 `{tool_name}`。",
-                    intent="resume",
-                    sentiment=neutral_sentiment,
-                    sources=["HITL Middleware"],
-                    thread_id=thread_id,
-                    run_status="error",
-                    active_agent=role,
-                    trace_id=trace_id,
-                    route_path=pending_state.get("route_path", []),
-                    validation_notes=pending_state.get("validation_notes", []),
-                    trace_preview=self._trace_preview(pending_state),
-                    node_timings=pending_state.get("node_timings", []),
-                    decision_summary=pending_state.get("decision_summary", ""),
-                    approval=approval,
-                    memory_debug=self._memory_debug_snapshot(thread_id),
-                    next_action=self._build_next_action(
-                        run_status="error",
-                        thread_id=thread_id,
-                        approval=approval,
-                        error_message=f"未找到待执行工具 {tool_name}",
-                    ),
-                    total_duration_ms=round((perf_counter() - started) * 1000, 2),
-                )
-
-            tool_args = dict(deterministic_plan.get("args", {}))
-            trace_summary = "审批完成，继续执行图流程。"
-            trace_details: Dict[str, Any] = {
-                "tool": deterministic_plan.get("tool_label") or self._tool_label(tool_name),
-                "decision": decision_type,
-            }
-            tool_source = "Approval Decision"
-            explicit_ticket_id: Optional[str] = None
-
-            role_started = perf_counter()
-            if decision_type == "reject":
-                resumed_text = str(
-                    deterministic_plan.get("reject_message")
-                    or f"已取消{self._tool_label(tool_name)}，本轮不会执行写操作。"
-                )
-                trace_summary = "审批已拒绝，本轮未执行写操作。"
-            else:
-                if decision_type == "edit":
-                    tool_args.update(self._edited_action_args(decision))
-                    trace_summary = "审批通过并带修改，已执行调整后的动作。"
-                    trace_details["edited_args"] = self._summarize_tool_args(tool_args)
-                else:
-                    trace_summary = "审批通过，已执行待审批动作。"
-
-                self._save_memory_item(
-                    user_id=user_id,
-                    payload={
-                        "kind": "tool_call",
-                        "role": role,
-                        "thread_id": thread_id,
-                        "tool_name": tool_name,
-                        "args": tool_args,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-                resumed_text = str(tool.invoke(tool_args))
-                tool_source = "Support Tools"
-                explicit_ticket_id = self._tool_result_ticket_id(tool_name, resumed_text)
-
-            role_elapsed_ms = (perf_counter() - role_started) * 1000
-            return self._complete_resumed_turn(
+            with self._langsmith_trace(
+                name="support.resume",
+                entrypoint="resume",
+                user_id=effective_user_id,
                 thread_id=thread_id,
-                user_id=user_id,
-                trace_id=trace_id,
-                role=role,
-                pending_state=pending_state,
-                neutral_sentiment=neutral_sentiment,
-                resumed_text=resumed_text,
-                role_elapsed_ms=role_elapsed_ms,
-                started=started,
-                trace_summary=trace_summary,
-                trace_details=trace_details,
-                tool_source=tool_source,
-                explicit_ticket_id=explicit_ticket_id,
-                preserve_ticket_lookup=False,
-            )
+                trace_id=effective_trace_id,
+                role=effective_role,
+                intent=pending_state.get("intent", "resume"),
+                risk=pending_state.get("risk", "medium"),
+                resumed=True,
+                parent=parent_headers,
+            ) as resume_langsmith:
+                decision = decisions[0] if decisions else {}
+                decision_type = self._resume_decision_type(decision)
+                approval = self._build_approval_payload(pending_state.get("interrupts", []))
+
+                if decision_type not in {"approve", "edit", "reject"}:
+                    return SupportResponse(
+                        message="恢复会话失败：decision.type 仅支持 approve、edit、reject。",
+                        intent="resume",
+                        sentiment=neutral_sentiment,
+                        sources=["HITL Middleware"],
+                        thread_id=thread_id,
+                        run_status="error",
+                        active_agent=role,
+                        trace_id=effective_trace_id,
+                        route_path=pending_state.get("route_path", []),
+                        validation_notes=pending_state.get("validation_notes", []),
+                        trace_preview=self._trace_preview(pending_state),
+                        node_timings=pending_state.get("node_timings", []),
+                        decision_summary=pending_state.get("decision_summary", ""),
+                        approval=approval,
+                        memory_debug=self._memory_debug_snapshot(thread_id),
+                        langsmith=resume_langsmith,
+                        next_action=self._build_next_action(
+                            run_status="error",
+                            thread_id=thread_id,
+                            approval=approval,
+                            error_message="decision.type 非法",
+                        ),
+                        total_duration_ms=round((perf_counter() - started) * 1000, 2),
+                    )
+
+                tool_name = str(deterministic_plan.get("tool", "")).strip()
+                tool = get_tool_by_name(tool_name)
+                if tool is None:
+                    return SupportResponse(
+                        message=f"恢复会话失败：未找到待执行工具 `{tool_name}`。",
+                        intent="resume",
+                        sentiment=neutral_sentiment,
+                        sources=["HITL Middleware"],
+                        thread_id=thread_id,
+                        run_status="error",
+                        active_agent=role,
+                        trace_id=effective_trace_id,
+                        route_path=pending_state.get("route_path", []),
+                        validation_notes=pending_state.get("validation_notes", []),
+                        trace_preview=self._trace_preview(pending_state),
+                        node_timings=pending_state.get("node_timings", []),
+                        decision_summary=pending_state.get("decision_summary", ""),
+                        approval=approval,
+                        memory_debug=self._memory_debug_snapshot(thread_id),
+                        langsmith=resume_langsmith,
+                        next_action=self._build_next_action(
+                            run_status="error",
+                            thread_id=thread_id,
+                            approval=approval,
+                            error_message=f"未找到待执行工具 {tool_name}",
+                        ),
+                        total_duration_ms=round((perf_counter() - started) * 1000, 2),
+                    )
+
+                tool_args = dict(deterministic_plan.get("args", {}))
+                trace_summary = "审批完成，继续执行图流程。"
+                trace_details: Dict[str, Any] = {
+                    "tool": deterministic_plan.get("tool_label") or self._tool_label(tool_name),
+                    "decision": decision_type,
+                }
+                tool_source = "Approval Decision"
+                explicit_ticket_id: Optional[str] = None
+
+                role_started = perf_counter()
+                if decision_type == "reject":
+                    resumed_text = str(
+                        deterministic_plan.get("reject_message")
+                        or f"已取消{self._tool_label(tool_name)}，本轮不会执行写操作。"
+                    )
+                    trace_summary = "审批已拒绝，本轮未执行写操作。"
+                else:
+                    if decision_type == "edit":
+                        tool_args.update(self._edited_action_args(decision))
+                        trace_summary = "审批通过并带修改，已执行调整后的动作。"
+                        trace_details["edited_args"] = self._summarize_tool_args(tool_args)
+                    else:
+                        trace_summary = "审批通过，已执行待审批动作。"
+
+                    self._save_memory_item(
+                        user_id=user_id,
+                        payload={
+                            "kind": "tool_call",
+                            "role": role,
+                            "thread_id": thread_id,
+                            "tool_name": tool_name,
+                            "args": tool_args,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    tool_config = self._build_runnable_config(
+                        run_name=f"{tool_name}_resume_tool",
+                        entrypoint="resume-tool",
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        trace_id=effective_trace_id,
+                        role=role,
+                        intent=pending_state.get("intent", "resume"),
+                        risk=pending_state.get("risk", "medium"),
+                        resumed=True,
+                    )
+                    tool_metadata = self._langsmith_metadata(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        trace_id=effective_trace_id,
+                        role=role,
+                        intent=pending_state.get("intent", "resume"),
+                        risk=pending_state.get("risk", "medium"),
+                        resumed=True,
+                    )
+                    tool_metadata["tool_name"] = tool_name
+                    with trace(
+                        name=f"{tool_name}_resume_dispatch",
+                        run_type="chain",
+                        project_name=settings.langsmith_project,
+                        tags=self._langsmith_tags(entrypoint="resume-tool", role=role),
+                        metadata=tool_metadata,
+                        client=self.langsmith_client,
+                    ):
+                        resumed_text = str(tool.invoke(tool_args, config=tool_config))
+                    tool_source = "Support Tools"
+                    explicit_ticket_id = self._tool_result_ticket_id(tool_name, resumed_text)
+
+                role_elapsed_ms = (perf_counter() - role_started) * 1000
+                return self._complete_resumed_turn(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    trace_id=effective_trace_id,
+                    role=role,
+                    pending_state=pending_state,
+                    neutral_sentiment=neutral_sentiment,
+                    resumed_text=resumed_text,
+                    role_elapsed_ms=role_elapsed_ms,
+                    started=started,
+                    trace_summary=trace_summary,
+                    trace_details=trace_details,
+                    tool_source=tool_source,
+                    explicit_ticket_id=explicit_ticket_id,
+                    preserve_ticket_lookup=False,
+                    langsmith=resume_langsmith,
+                )
 
         if not self.llm_enabled or role not in self.role_agents:
             self._pending_role.pop(thread_id, None)
@@ -2252,7 +2637,18 @@ class SupportAgent:
             )
 
         agent = self.role_agents[role]
-        config = {"configurable": {"thread_id": self._agent_thread_id(thread_id, role)}}
+        config = self._build_runnable_config(
+            run_name=f"{role}_agent_resume",
+            entrypoint="resume-agent",
+            user_id=user_id,
+            thread_id=thread_id,
+            trace_id=trace_id,
+            checkpoint_thread_id=self._agent_thread_id(thread_id, role),
+            role=role,
+            intent=pending_state.get("intent", "resume"),
+            risk=pending_state.get("risk", "medium"),
+            resumed=True,
+        )
         context = AgentRuntimeContext(
             user_id=user_id,
             thread_id=thread_id,
