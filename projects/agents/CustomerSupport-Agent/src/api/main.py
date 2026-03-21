@@ -90,6 +90,7 @@ class DebugPayload(BaseModel):
     decision_summary: str
     total_duration_ms: Optional[float] = None
     memory: Optional[Dict[str, Any]] = None
+    langsmith: Optional[Dict[str, Any]] = None
 
 
 class ChatResponse(BaseModel):

@@ -14,6 +14,7 @@ dependencies = [
   "langchain-openai==1.1.10",
   "langgraph==1.0.10",
   "langgraph-checkpoint-postgres==3.0.4",
+  "langsmith==0.7.14",
   "nltk==3.8.1",
   "numpy<2",
   "psycopg[binary,pool]==3.3.3",

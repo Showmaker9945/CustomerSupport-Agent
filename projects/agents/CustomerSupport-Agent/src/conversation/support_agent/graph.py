@@ -98,6 +98,7 @@ class OrchestrationState(TypedDict, total=False):
 
     user_id: str
     thread_id: str
+    trace_id: str
     current_message: str
     recent_history_text: str
     rolling_summary: str
@@ -125,6 +126,7 @@ class OrchestrationState(TypedDict, total=False):
     citations: List[str]
     tool_source: str
     pending_approval_plan: Dict[str, Any]
+    langsmith_parent_headers: Dict[str, str]
     run_status: Literal["completed", "interrupted", "error"]
     interrupts: List[Dict[str, Any]]
     ticket_id: Optional[str]
@@ -166,6 +168,7 @@ class SupportResponse:
     decision_summary: str = ""
     approval: Optional[Dict[str, Any]] = None
     memory_debug: Dict[str, Any] = field(default_factory=dict)
+    langsmith: Dict[str, Any] = field(default_factory=dict)
     next_action: str = ""
     total_duration_ms: Optional[float] = None
 
@@ -204,6 +207,8 @@ class SupportResponse:
             }
             if self.memory_debug:
                 payload["debug"]["memory"] = self.memory_debug
+            if self.langsmith:
+                payload["debug"]["langsmith"] = self.langsmith
         return payload
 
 
@@ -822,6 +827,7 @@ class SupportAgentOrchestrator:
                 role="knowledge",
                 user_id=user_id,
                 thread_id=thread_id,
+                trace_id=state.get("trace_id", ""),
                 intent=intent,
                 risk=risk,
                 message=compose_knowledge_prompt(state),
@@ -891,6 +897,7 @@ class SupportAgentOrchestrator:
                 role="action",
                 user_id=user_id,
                 thread_id=thread_id,
+                trace_id=state.get("trace_id", ""),
                 intent=intent,
                 risk=risk,
                 message=compose_action_prompt(state),
@@ -953,6 +960,7 @@ class SupportAgentOrchestrator:
                 role="escalation",
                 user_id=user_id,
                 thread_id=thread_id,
+                trace_id=state.get("trace_id", ""),
                 intent=intent,
                 risk="high",
                 message=compose_escalation_prompt(state),
@@ -1071,6 +1079,7 @@ class SupportAgentOrchestrator:
                 role="responder",
                 user_id=state.get("user_id", "unknown_user"),
                 thread_id=state.get("thread_id", "unknown_thread"),
+                trace_id=state.get("trace_id", ""),
                 intent=state.get("intent", "other"),
                 risk=state.get("risk", "low"),
                 message=compose_responder_prompt(state),

@@ -12,6 +12,7 @@
 - HITL：高风险工具先中断审批，再恢复同一线程执行；显式写操作支持确定性中断
 - FastAPI 演示友好：REST、WebSocket、SSE、Swagger、回归测试
 - Debug 可观测：返回路由轨迹、校验说明、节点耗时、审批工具摘要
+- LangSmith Tracing：`/chat` 与 `/resume` 都可返回 `run_url`，便于排查图节点、工具调用与审批恢复链路
 
 ## 适合展示的能力
 
@@ -118,6 +119,26 @@ uv run uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 - ReDoc: [http://localhost:8000/redoc](http://localhost:8000/redoc)
 - Health: [http://localhost:8000/health](http://localhost:8000/health)
 
+## LangSmith 可观测性
+
+推荐在 `.env` 中打开 LangSmith，并保持当前项目默认的 OTel 兼容策略：
+
+```bash
+LANGSMITH_TRACING=true
+LANGSMITH_OTEL_ENABLED=false
+LANGSMITH_API_KEY=你的 LangSmith API Key
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGSMITH_PROJECT=customer-support-agent
+LANGSMITH_WORKSPACE_ID=你的 workspace uuid
+```
+
+说明：
+
+- 如果 API Key 只绑定一个 workspace，`LANGSMITH_WORKSPACE_ID` 可以留空
+- 如果 `list_projects` 或 `/runs/multipart` 返回 `403`，通常是 workspace 选错或未设置
+- 本项目现在会为 `/chat` 和 `/resume` 都返回 `debug.langsmith.run_url`
+- 更详细的配置、排障与 UI 阅读方式见 [docs/LANGSMITH_TRACING.md](./docs/LANGSMITH_TRACING.md)
+
 ## 测试命令
 
 常用回归：
@@ -157,13 +178,15 @@ uv run pytest --cov=src --cov-report=term-missing --cov-report=html
    - 预期：命中知识检索；开启 `debug=true` 时可看到更丰富的检索策略信息
 
 4. HITL 中断与恢复
-   - 问题：`帮我创建一个账单异常工单`
+   - 问题：`请创建一个账单异常工单`
    - 预期：返回 `run_status = interrupted`
    - `approval.tools[0]` 中会明确显示待审批工具名、原因和参数摘要
+   - `debug.langsmith.run_url` 可打开首次 `/chat` 的 trace
    - 用响应最外层的 `thread_id` 调 `/runs/{thread_id}/resume`
    - `approve`：执行写操作
    - `edit`：修改参数后执行
    - `reject`：取消写操作并返回最终答复
+   - `/resume` 成功后也会返回新的 `debug.langsmith.run_url`，可继续查看 `support.resume -> create_ticket_resume_tool -> validate -> respond`
 
 5. 升级人工
    - 问题：`我要投诉，现在就转人工`
@@ -224,11 +247,13 @@ LANGGRAPH_PERSISTENCE_BACKEND=postgres
 - 为 `create_ticket` 等审批动作补齐确定性 `interrupt -> resume` 链路
 - `/chat` 与 `/resume` 调试信息增加节点耗时，便于演示和排障
 - 优化审批响应结构，待审批工具名称和参数预览更清晰
+- 接入 LangSmith tracing，并补齐 `support.resume`、resume 工具调用与后续 `validate/respond` 的可观测性
 
 ## 相关文档
 
 - [PROJECT_OVERVIEW.md](./PROJECT_OVERVIEW.md)
 - [examples/README.md](./examples/README.md)
+- [docs/LANGSMITH_TRACING.md](./docs/LANGSMITH_TRACING.md)
 
 ## 备注
 
