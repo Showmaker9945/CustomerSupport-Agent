@@ -87,6 +87,7 @@ print(list(client.list_projects(limit=1)))
 - `active_agent = "action"`
 - `approval.tools[0].tool = "create_ticket"`
 - `debug.route_path = ["analyze", "action"]`
+- `debug.node_timings` 有值
 - `debug.langsmith.run_url` 有值
 
 此时说明系统只生成了待审批动作，还没有真正写入工单。
@@ -111,6 +112,7 @@ print(list(client.list_projects(limit=1)))
 - `run_status = "completed"`
 - `result.ticket_created = "TKT-..."`
 - `debug.route_path = ["analyze", "action", "validate", "respond"]`
+- `debug.node_timings` 有值
 - `debug.langsmith.run_url` 有值
 
 此时说明：
@@ -179,6 +181,18 @@ print(list(client.list_projects(limit=1)))
 - 先看 `thread_id`，确认是不是这次测试的 run
 - 再看 `correlation_id`，确认 `/chat` 和 `/resume` 是否属于同一条链路
 - 最后看 `role`、`intent`、`risk`，确认路由是否符合预期
+
+## 现在本地 `debug` 里还看什么
+
+为了避免接口响应里重复塞一份“迷你 trace”，当前 `debug=true` 只保留几项本地摘要：
+
+- `debug.trace_id`：本次请求的关联 ID
+- `debug.route_path`：实际经过的图节点路径
+- `debug.node_timings`：各节点耗时摘要
+- `debug.total_duration_ms`：整次请求总耗时
+- `debug.langsmith.run_url`：跳转到完整 trace
+
+如果你想看更细的节点输入输出、metadata、tool args、resume 衔接关系，优先直接打开 LangSmith。
 
 ## 当前限制
 

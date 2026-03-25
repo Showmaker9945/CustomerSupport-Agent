@@ -49,7 +49,7 @@ class ChatMessage(BaseModel):
     content: str = Field(..., min_length=1, max_length=6000)
     thread_id: Optional[str] = Field(None, description="LangGraph 线程 ID")
     session_id: Optional[str] = Field(None, description="向后兼容字段，将映射到 thread_id")
-    debug: bool = Field(False, description="是否返回调试信息（路由、校验、trace）。")
+    debug: bool = Field(False, description="是否返回轻量调试信息（路径、耗时、LangSmith 链接）。")
 
 
 class SentimentPayload(BaseModel):
@@ -84,12 +84,8 @@ class ApprovalPayload(BaseModel):
 class DebugPayload(BaseModel):
     trace_id: Optional[str]
     route_path: List[str]
-    validation_notes: List[str]
-    trace_preview: List[Dict[str, Any]]
     node_timings: List[Dict[str, Any]] = Field(default_factory=list)
-    decision_summary: str
     total_duration_ms: Optional[float] = None
-    memory: Optional[Dict[str, Any]] = None
     langsmith: Optional[Dict[str, Any]] = None
 
 
@@ -121,7 +117,7 @@ class ResumeRequest(BaseModel):
     """恢复请求体。"""
 
     decisions: List[ResumeDecision] = Field(default_factory=list)
-    debug: bool = Field(False, description="是否返回调试信息（路由、校验、trace）。")
+    debug: bool = Field(False, description="是否返回轻量调试信息（路径、耗时、LangSmith 链接）。")
 
 
 class ReindexRequest(BaseModel):

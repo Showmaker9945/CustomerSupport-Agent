@@ -71,12 +71,13 @@ def test_chat_contract_with_debug(client):
     data = response.json()
     assert "debug" in data
     assert data["debug"]["route_path"]
-    assert isinstance(data["debug"]["validation_notes"], list)
-    assert isinstance(data["debug"]["trace_preview"], list)
     assert isinstance(data["debug"]["node_timings"], list)
     assert data["debug"]["node_timings"]
     assert data["debug"]["total_duration_ms"] is not None
-    assert data["debug"]["decision_summary"]
+    assert "langsmith" in data["debug"]
+    assert "trace_preview" not in data["debug"]
+    assert "validation_notes" not in data["debug"]
+    assert "decision_summary" not in data["debug"]
 
 
 def test_resume_endpoint(client):
@@ -90,7 +91,7 @@ def test_resume_endpoint(client):
     assert data["run_status"] == "error"
     assert data["next_action"] == "请确认使用的是上一次 /chat 返回的 thread_id。"
     assert data["debug"]["route_path"] == ["resume"]
-    assert data["debug"]["decision_summary"] == "恢复失败：未找到待审批线程。"
+    assert "decision_summary" not in data["debug"]
 
 
 def test_sse_stream(client):

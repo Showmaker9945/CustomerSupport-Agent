@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from src.config import settings
 from src.knowledge.faq_store import FAQResult, FAQStore, create_faq_store
 
 
@@ -26,11 +27,36 @@ class FakeSentenceTransformer:
     def __init__(self, model_name: str):
         self.model_name = model_name
 
-    def encode(self, text: str):
+    def encode(self, text: str, normalize_embeddings: bool = False):
         lowered = (text or "").lower()
         vector = FakeEmbedding(float(lowered.count(token.lower())) for token in _FAKE_VOCAB)
         vector.append(float(len(lowered)))
+        if normalize_embeddings:
+            norm = sum(value * value for value in vector) ** 0.5
+            if norm:
+                vector = FakeEmbedding(value / norm for value in vector)
         return vector
+
+
+class FakeCrossEncoder:
+    def __init__(self, model_name: str, max_length: int | None = None):
+        self.model_name = model_name
+        self.max_length = max_length
+
+    def predict(self, pairs):
+        scores = []
+        for query, document in pairs:
+            query_lower = (query or "").lower()
+            document_lower = (document or "").lower()
+            score = 0.0
+            for token in _FAKE_VOCAB:
+                lowered_token = token.lower()
+                if lowered_token in query_lower and lowered_token in document_lower:
+                    score += 1.0
+            if query_lower and query_lower in document_lower:
+                score += 1.5
+            scores.append(score)
+        return scores
 
 
 class FakeCollection:
@@ -114,7 +140,16 @@ def fake_faq_dependencies(monkeypatch):
 
     faq_store_module.FAQStore._EMBEDDING_MODEL_CACHE.clear()
     faq_store_module.FAQStore._RERANKER_MODEL_CACHE.clear()
+    monkeypatch.setattr(faq_store_module.settings, "embedding_model", "BAAI/bge-large-zh-v1.5")
+    monkeypatch.setattr(faq_store_module.settings, "reranker_model", "BAAI/bge-reranker-v2-m3")
+    monkeypatch.setattr(faq_store_module.settings, "enable_reranker", True)
+    monkeypatch.setattr(
+        faq_store_module.settings,
+        "embedding_query_instruction",
+        "为这个句子生成表示以用于检索相关文章：",
+    )
     monkeypatch.setattr(faq_store_module, "SentenceTransformer", FakeSentenceTransformer)
+    monkeypatch.setattr(faq_store_module, "CrossEncoder", FakeCrossEncoder)
     monkeypatch.setattr(faq_store_module.chromadb, "PersistentClient", FakePersistentClient)
     yield
 
@@ -222,7 +257,15 @@ class TestFAQStore:
         assert "categories" in stats
         assert "category_count" in stats
         assert "embedding_model" in stats
+        assert "embedding_query_instruction" in stats
+        assert "reranker_model" in stats
+        assert "reranker_enabled" in stats
+        assert "reranker_loaded" in stats
         assert stats["total_faqs"] > 0
+        assert stats["embedding_model"] == settings.embedding_model
+        assert stats["reranker_model"] == settings.reranker_model
+        assert stats["reranker_enabled"] is True
+        assert stats["reranker_loaded"] is True
 
     def test_delete_faq(self, temp_faq_store):
         temp_faq_store.clear_all()
@@ -326,6 +369,24 @@ Another CSV?,Another CSV answer,csv_test,csv"""
         assert result.answer
         assert not result.answer.startswith("Question:")
 
+    def test_query_and_document_embeddings_use_bge_prompt(self, temp_faq_store, monkeypatch):
+        captured_calls = []
+
+        def fake_encode(text: str, normalize_embeddings: bool = False):
+            captured_calls.append((text, normalize_embeddings))
+            return FakeEmbedding([1.0, 0.0, 0.0])
+
+        monkeypatch.setattr(temp_faq_store.embedding_model, "encode", fake_encode)
+
+        temp_faq_store._create_query_embedding("账单异常")
+        temp_faq_store._create_document_embedding("Question: 账单异常\nAnswer: 请核对订阅")
+
+        assert captured_calls[0][0].startswith(settings.embedding_query_instruction)
+        assert captured_calls[0][1] is True
+        assert captured_calls[1][0].startswith("Question:")
+        assert not captured_calls[1][0].startswith(settings.embedding_query_instruction)
+        assert captured_calls[1][1] is True
+
     def test_normalize_query_supports_english_and_synonyms(self, temp_faq_store):
         normalized = temp_faq_store._normalize_query("cancel subscription plan")
         assert "取消" in normalized
@@ -356,6 +417,14 @@ Another CSV?,Another CSV answer,csv_test,csv"""
         assert trace["effective_category"] == "billing"
         assert trace["retrieval_rounds"]
         assert trace["final_result_count"] == len(results)
+
+    def test_search_records_rerank_metadata(self, temp_faq_store):
+        result = temp_faq_store.search("如何取消订阅？", top_k=1)[0]
+
+        assert "fusion_confidence" in result.metadata
+        assert "fusion_score" in result.metadata
+        assert "rerank_score" in result.metadata
+        assert "rerank_confidence" in result.metadata
 
     def test_search_hybrid_rewrite_fallback(self, temp_faq_store, monkeypatch):
         rewritten = "如何取消订阅？"

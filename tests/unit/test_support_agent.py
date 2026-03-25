@@ -239,7 +239,8 @@ def test_stream_chat_events(agent):
     assert events[0]["type"] == "node"
     assert events[-1]["type"] == "done"
     assert events[-1]["payload"]["debug"]["route_path"]
-    assert "decision_summary" in events[-1]["payload"]["debug"]
+    assert "node_timings" in events[-1]["payload"]["debug"]
+    assert "decision_summary" not in events[-1]["payload"]["debug"]
 
 
 def test_structured_memory_writes_preferences_and_profile(agent):
@@ -249,11 +250,7 @@ def test_structured_memory_writes_preferences_and_profile(agent):
     )
 
     debug_payload = response.to_dict(include_debug=True)["debug"]
-    assert "memory" in debug_payload
-    write_ids = {item["memory_id"] for item in debug_payload["memory"]["writes"]}
-    assert "profile:name" in write_ids
-    assert "preference:language" in write_ids
-    assert "preference:contact_channel" in write_ids
+    assert "memory" not in debug_payload
 
     memory_hits = agent._search_memory("memory_user", "中文 邮件 小王", limit=5)
     hit_ids = {item["memory_id"] for item in memory_hits}
@@ -272,7 +269,7 @@ def test_open_issue_memory_can_be_closed(agent):
     stored_after = {item["memory_id"] for item in agent._list_structured_memory(user_id)}
     assert "open_issue:billing_anomaly" not in stored_after
     assert "resolved_issue:billing_anomaly" in stored_after
-    assert "memory" in resolved.to_dict(include_debug=True)["debug"]
+    assert "memory" not in resolved.to_dict(include_debug=True)["debug"]
 
 
 def test_resume_without_pending(agent):
