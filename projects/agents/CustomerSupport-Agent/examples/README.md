@@ -61,8 +61,8 @@ uv run uvicorn src.api.main:app --reload --port 8000
 关注点：
 
 - 应返回取消订阅相关 FAQ
-- 如果 `DEBUG=true`，工具调试摘要里会展示检索策略
-- `debug.route_path` 仍然保持清晰，不会破坏主图结构
+- `debug.route_path` 与 `debug.node_timings` 可以快速判断本地执行路径
+- 更细的节点过程建议直接打开 `debug.langsmith.run_url`
 
 ### 4. HITL 中断
 
@@ -164,5 +164,5 @@ uv run python examples/websocket_client.py
 - `approval.count`: 当前还需要几条人工审批决定
 - `approval.tools`: 待审批工具摘要
 - `debug.route_path`: 实际执行过的图路径
-- `debug.trace_preview`: 最近几个节点事件摘要
-- `debug.validation_notes`: 校验节点补充的信息
+- `debug.node_timings`: 各节点轻量耗时摘要
+- `debug.langsmith.run_url`: 打开完整 trace

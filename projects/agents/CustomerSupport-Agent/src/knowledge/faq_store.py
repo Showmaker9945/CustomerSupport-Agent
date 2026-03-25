@@ -8,6 +8,7 @@
 import copy
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 from rank_bm25 import BM25Okapi
 
 from ..config import settings
@@ -263,6 +264,8 @@ class FAQStore:
         """
         self.chroma_path = chroma_path or settings.chroma_persist_dir
         self.embedding_model_name = embedding_model or settings.embedding_model
+        self.embedding_query_instruction = settings.embedding_query_instruction.strip()
+        self.reranker_model_name = settings.reranker_model
         self.collection_name = collection_name
         self._last_query_trace: Dict[str, Any] = {}
 
@@ -305,11 +308,13 @@ class FAQStore:
             self.reranker = None
             if settings.enable_reranker:
                 try:
-                    from sentence_transformers import CrossEncoder  # local import to avoid hard fail
-                    if settings.reranker_model not in self._RERANKER_MODEL_CACHE:
-                        self._RERANKER_MODEL_CACHE[settings.reranker_model] = CrossEncoder(settings.reranker_model)
-                        logger.info(f"Loaded reranker model: {settings.reranker_model}")
-                    self.reranker = self._RERANKER_MODEL_CACHE[settings.reranker_model]
+                    if self.reranker_model_name not in self._RERANKER_MODEL_CACHE:
+                        self._RERANKER_MODEL_CACHE[self.reranker_model_name] = CrossEncoder(
+                            self.reranker_model_name,
+                            max_length=512,
+                        )
+                        logger.info(f"Loaded reranker model: {self.reranker_model_name}")
+                    self.reranker = self._RERANKER_MODEL_CACHE[self.reranker_model_name]
                 except Exception as rerank_error:
                     self.reranker = None
                     logger.warning(f"Reranker unavailable, fallback to fusion-only search: {rerank_error}")
@@ -323,9 +328,32 @@ class FAQStore:
             logger.error(f"Failed to initialize ChromaDB: {e}")
             raise
 
-    def _create_embedding(self, text: str) -> List[float]:
-        """为文本生成 embedding。"""
-        return self.embedding_model.encode(text).tolist()
+    def _encode_embedding_text(self, text: str) -> List[float]:
+        """Encode one text chunk with normalized embeddings for cosine retrieval."""
+        embedding = self.embedding_model.encode(
+            text,
+            normalize_embeddings=True,
+        )
+        if hasattr(embedding, "tolist"):
+            return embedding.tolist()
+        return list(embedding)
+
+    def _create_query_embedding(self, text: str) -> List[float]:
+        """Create a query embedding with the BGE retrieval instruction."""
+        query_text = (text or "").strip()
+        if self.embedding_query_instruction and query_text:
+            query_text = f"{self.embedding_query_instruction}{query_text}"
+        return self._encode_embedding_text(query_text)
+
+    def _create_document_embedding(self, text: str) -> List[float]:
+        """Create a document embedding without the query-side instruction prefix."""
+        return self._encode_embedding_text(text or "")
+
+    @staticmethod
+    def _normalize_rerank_score(score: float) -> float:
+        """Map reranker logits into a stable 0-1 range for display and thresholds."""
+        clipped_score = max(min(float(score), 20.0), -20.0)
+        return 1.0 / (1.0 + math.exp(-clipped_score))
 
     def _load_sample_faqs(self) -> None:
         """将样本 FAQ 写入知识库。"""
@@ -531,6 +559,8 @@ class FAQStore:
             )
             result.metadata = {
                 **result.metadata,
+                "fusion_score": round(float(item["score"]), 6),
+                "fusion_confidence": round(float(result.confidence), 6),
                 "retrieval_queries": list(item.get("queries", [])),
                 "retrieval_round_types": list(item.get("round_types", [])),
             }
@@ -546,10 +576,15 @@ class FAQStore:
                     reverse=True,
                 )
                 normalized_results: List[FAQResult] = []
-                max_rerank = float(max(rerank_scores)) if len(rerank_scores) > 0 else 0.0
                 for result, score in reranked:
-                    if max_rerank > 0:
-                        result.confidence = max(0.0, min(1.0, float(score / max_rerank)))
+                    rerank_score = float(score)
+                    rerank_confidence = self._normalize_rerank_score(rerank_score)
+                    result.metadata = {
+                        **result.metadata,
+                        "rerank_score": round(rerank_score, 6),
+                        "rerank_confidence": round(rerank_confidence, 6),
+                    }
+                    result.confidence = rerank_confidence
                     normalized_results.append(result)
                 merged_results = normalized_results
             except Exception as rerank_error:
@@ -672,7 +707,7 @@ class FAQStore:
     ) -> List[FAQResult]:
         """Run lightweight hybrid retrieval with normalization, splitting, and rewrite fallback."""
         final_top_k = top_k or settings.rag_top_k
-        candidate_k = max(final_top_k * 3, 8)
+        candidate_k = max(final_top_k * 4, 12)
 
         normalized_query = self._normalize_query(query)
         rewritten_query = self._rewrite_query(query)
@@ -724,11 +759,15 @@ class FAQStore:
             candidate_k=candidate_k,
             min_confidence=min_confidence,
         )
+        top_result_gate_confidence = (
+            float(merged_results[0].metadata.get("fusion_confidence", merged_results[0].confidence))
+            if merged_results else 0.0
+        )
 
         should_retry_with_rewrite = (
             rewritten_query
             and rewritten_query not in seen_queries
-            and (not merged_results or merged_results[0].confidence < 0.45)
+            and (not merged_results or top_result_gate_confidence < 0.45)
         )
         if should_retry_with_rewrite:
             round_candidates, round_trace = self._run_retrieval_round(
@@ -794,7 +833,7 @@ class FAQStore:
                 combined_text += f"\nKeywords: {keyword_text}"
 
             # Create embedding
-            embedding = self._create_embedding(combined_text)
+            embedding = self._create_document_embedding(combined_text)
 
             # Prepare metadata (ChromaDB doesn't allow lists)
             faq_metadata = {
@@ -909,7 +948,7 @@ class FAQStore:
     ) -> List[FAQResult]:
         """Run vector retrieval against the FAQ collection."""
         try:
-            query_embedding = self._create_embedding(query)
+            query_embedding = self._create_query_embedding(query)
             where_clause = {"category": category} if category else None
             results = self.collection.query(
                 query_embeddings=[query_embedding],
@@ -1004,6 +1043,10 @@ class FAQStore:
                 "categories": categories,
                 "category_count": len(categories),
                 "embedding_model": self.embedding_model_name,
+                "embedding_query_instruction": self.embedding_query_instruction,
+                "reranker_model": self.reranker_model_name,
+                "reranker_enabled": settings.enable_reranker,
+                "reranker_loaded": self.reranker is not None,
                 "collection_name": self.collection_name
             }
 

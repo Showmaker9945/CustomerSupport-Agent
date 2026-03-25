@@ -60,9 +60,10 @@ class Settings(BaseSettings):
     # 向量知识库（Chroma）
     chroma_persist_dir: Path = Field(default=Path("./data/chroma_db"))
     collection_name: str = "faq_knowledge_base"
-    embedding_model: str = "all-MiniLM-L6-v2"
-    reranker_model: str = "BAAI/bge-reranker-base"
-    enable_reranker: bool = False
+    embedding_model: str = "BAAI/bge-large-zh-v1.5"
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    enable_reranker: bool = True
+    embedding_query_instruction: str = "为这个句子生成表示以用于检索相关文章："
 
     # 知识库检索参数
     knowledge_base_path: Path = Field(default=Path("./data/knowledge_base"))
@@ -71,8 +72,8 @@ class Settings(BaseSettings):
     top_k_results: int = 3
     rag_top_k: int = 4
     rag_fusion_k: int = 60
-    rag_vector_weight: float = 0.6
-    rag_keyword_weight: float = 0.4
+    rag_vector_weight: float = 0.55
+    rag_keyword_weight: float = 0.45
 
     # 短期对话上下文
     transcript_backend: str = "database"

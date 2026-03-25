@@ -469,6 +469,9 @@ class SupportAgent:
     def _reset_memory_debug(self, thread_id: str) -> None:
         if not thread_id:
             return
+        if not settings.debug:
+            self._memory_debug_by_thread.pop(thread_id, None)
+            return
         self._memory_debug_by_thread[thread_id] = {
             "reads": [],
             "writes": [],
@@ -476,7 +479,7 @@ class SupportAgent:
         }
 
     def _memory_debug_snapshot(self, thread_id: Optional[str]) -> Dict[str, Any]:
-        if not thread_id:
+        if not thread_id or not settings.debug:
             return {}
         snapshot = self._memory_debug_by_thread.get(thread_id, {})
         return {

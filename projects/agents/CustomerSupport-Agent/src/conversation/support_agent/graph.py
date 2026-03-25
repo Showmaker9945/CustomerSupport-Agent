@@ -199,14 +199,9 @@ class SupportResponse:
             payload["debug"] = {
                 "trace_id": self.trace_id,
                 "route_path": self.route_path,
-                "validation_notes": self.validation_notes,
-                "trace_preview": self.trace_preview,
                 "node_timings": self.node_timings,
-                "decision_summary": self.decision_summary,
                 "total_duration_ms": self.total_duration_ms,
             }
-            if self.memory_debug:
-                payload["debug"]["memory"] = self.memory_debug
             if self.langsmith:
                 payload["debug"]["langsmith"] = self.langsmith
         return payload
