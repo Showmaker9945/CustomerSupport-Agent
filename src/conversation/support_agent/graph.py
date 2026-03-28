@@ -466,7 +466,7 @@ def build_neutral_sentiment() -> SentimentResult:
 def build_role_system_prompt(role: str, memory_items: List[Dict[str, Any]]) -> str:
     role_rules = {
         "supervisor": "你是客服总调度，负责判断问题类型并给出决策建议。",
-        "knowledge": "你是知识检索专家，优先调用 search_faq，负责回答套餐规则、取消订阅、帮助文档与常见问题。",
+        "knowledge": "你是知识检索专家，优先调用 search_knowledge_base，负责回答帮助中心文档、订阅规则、操作说明与常见问题。",
         "action": "你是客服执行专家，负责订阅状态、账单解释、工单与账户类动作，必要时调用工具。",
         "escalation": "你是升级专员，负责人工介入、风险沟通与交接摘要。",
         "responder": "你是最终回答代理，负责融合证据与工具结果，生成最终答复。",

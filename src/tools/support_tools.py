@@ -24,7 +24,7 @@ from ..db.repositories import (
     list_ticket_records,
     update_ticket_record,
 )
-from ..knowledge.faq_store import FAQStore, create_faq_store
+from ..knowledge.document_store import DocumentStore, create_document_store
 
 logger = logging.getLogger(__name__)
 
@@ -385,22 +385,27 @@ def _ticket_next_step(ticket: Ticket) -> str:
     return "下一步：如需继续处理，可补充说明后重新联系支持团队。"
 
 
-# FAQ Store 全局单例
-_faq_store: Optional[FAQStore] = None
+# Knowledge Store 全局单例
+_knowledge_store: Optional[DocumentStore] = None
 
 
-def get_faq_store() -> FAQStore:
-    """获取或创建 FAQ Store 全局实例。"""
-    global _faq_store
-    if _faq_store is None:
-        _faq_store = create_faq_store()
-    return _faq_store
+def get_knowledge_store() -> DocumentStore:
+    """获取或创建帮助中心知识库全局实例。"""
+    global _knowledge_store
+    if _knowledge_store is None:
+        _knowledge_store = create_document_store()
+    return _knowledge_store
 
 
-def reset_faq_store() -> None:
-    """重置 FAQ Store 全局实例，主要用于测试。"""
-    global _faq_store
-    _faq_store = None
+def reset_knowledge_store() -> None:
+    """重置帮助中心知识库全局实例，主要用于测试。"""
+    global _knowledge_store
+    _knowledge_store = None
+
+
+# 向后兼容旧命名，避免历史测试或脚本直接失效。
+get_faq_store = get_knowledge_store
+reset_faq_store = reset_knowledge_store
 
 
 # TicketStore 全局单例
@@ -425,10 +430,38 @@ def reset_ticket_store() -> None:
 # LangChain 工具定义
 # ============================================================================
 
+def _knowledge_source_label(result: Any) -> str:
+    metadata = result.metadata or {}
+    section_path = str(metadata.get("section_path") or "").strip()
+    document_title = str(metadata.get("document_title") or "").strip()
+    if section_path:
+        return f"帮助中心::{section_path}"
+    if document_title:
+        return f"帮助中心::{document_title}"
+    return f"帮助中心::{result.category}"
+
+
+def _normalize_knowledge_category(category: Optional[str]) -> Optional[str]:
+    raw = str(category or "").strip()
+    if not raw:
+        return None
+    normalized = raw.lower()
+    alias_map = {
+        "account": "账户与登录",
+        "billing": "订阅与账单",
+        "workspace": "团队与权限",
+        "security": "安全与合规",
+        "technical": "开发者与集成",
+        "support": "支持与服务",
+        "product": "产品更新与发布节奏",
+    }
+    return alias_map.get(normalized, raw)
+
+
 @tool
-def search_faq(query: str, category: Optional[str] = None) -> str:
+def search_knowledge_base(query: str, category: Optional[str] = None) -> str:
     """
-    查询/搜索知识库中的常见问题答案。
+    查询帮助中心知识库中的相关文档与操作说明。
 
     Args:
         query: 用户问题或关键词
@@ -438,45 +471,54 @@ def search_faq(query: str, category: Optional[str] = None) -> str:
         带相关度的格式化检索结果
     """
     try:
-        store = get_faq_store()
-        results = store.search_hybrid(query, category=category, top_k=settings.rag_top_k)
+        store = get_knowledge_store()
+        normalized_category = _normalize_knowledge_category(category)
+        results = store.search_hybrid(query, category=normalized_category, top_k=settings.rag_top_k)
         trace = store.get_last_query_trace()
 
         if not results:
-            return f"未找到与该问题相关的知识：{query}"
+            return f"未在帮助中心中找到与该问题相关的内容：{query}"
 
-        output_parts = [f"找到 {len(results)} 条相关知识（混合检索+重排）：\n"]
+        output_parts = [f"帮助中心共找到 {len(results)} 条相关内容（混合检索+重排）：\n"]
 
         if settings.debug:
             strategy_parts = []
             if trace.get("effective_category"):
-                strategy_parts.append(f"分类推断：{trace['effective_category']}")
-            if trace.get("sub_queries"):
-                strategy_parts.append(f"子问题：{len(trace['sub_queries'])} 个")
-            if trace.get("rewrite_used"):
-                strategy_parts.append("启用改写兜底")
+                strategy_parts.append(f"分类过滤：{trace['effective_category']}")
+            if trace.get("vector_hits") is not None:
+                strategy_parts.append(f"向量召回：{trace['vector_hits']}")
+            if trace.get("keyword_hits") is not None:
+                strategy_parts.append(f"关键词召回：{trace['keyword_hits']}")
+            if trace.get("candidate_count") is not None:
+                strategy_parts.append(f"候选块：{trace['candidate_count']}")
+            if trace.get("documents_indexed") is not None:
+                strategy_parts.append(f"已索引文档：{trace['documents_indexed']}")
             if strategy_parts:
-                output_parts.append("检索策略：" + " | ".join(strategy_parts))
+                output_parts.append("检索摘要：" + " | ".join(strategy_parts))
 
         for i, result in enumerate(results, 1):
             output_parts.append(
                 f"\n{i}. {result.question}\n"
                 f"   答案：{result.answer}\n"
                 f"   分类：{result.category} | 相关度：{result.confidence:.0%}\n"
-                f"   来源：FAQ::{result.category}"
+                f"   来源：{_knowledge_source_label(result)}"
             )
 
         return "\n".join(output_parts)
 
     except Exception as e:
-        logger.error(f"FAQ search error: {e}")
+        logger.error(f"Knowledge base search error: {e}")
         return f"知识检索失败：{str(e)}"
+
+
+# 向后兼容旧工具引用；底层真实工具名已统一为 search_knowledge_base。
+search_faq = search_knowledge_base
 
 
 @tool
 def reindex_knowledge_base(clear_existing: bool = False) -> str:
     """
-    重建并更新 FAQ 知识库索引。
+    重建并更新帮助中心知识库索引。
 
     Args:
         clear_existing: 是否先清空现有集合再重建
@@ -485,11 +527,13 @@ def reindex_knowledge_base(clear_existing: bool = False) -> str:
         重建结果摘要
     """
     try:
-        store = get_faq_store()
+        store = get_knowledge_store()
         stats = store.reindex(clear_existing=clear_existing)
         return (
-            f"知识库索引已刷新。\n"
-            f"FAQ 总量：{stats.get('total_faqs', 0)}\n"
+            "帮助中心知识库索引已刷新。\n"
+            f"文档数量：{stats.get('total_documents', 0)}\n"
+            f"父块数量：{stats.get('total_parent_chunks', 0)}\n"
+            f"子块数量：{stats.get('total_child_chunks', 0)}\n"
             f"分类数：{stats.get('category_count', 0)}\n"
             f"集合：{stats.get('collection_name', settings.collection_name)}"
         )
@@ -917,7 +961,7 @@ def escalate_to_human(user_id: str, reason: str, conversation_summary: str) -> s
         return "升级人工客服失败：人工升级工单写入失败。请确认 user_id 是否有效后重试。"
 # LangChain Agent 可见的全部工具
 ALL_TOOLS = [
-    search_faq,
+    search_knowledge_base,
     reindex_knowledge_base,
     create_ticket,
     get_ticket_status,
@@ -933,8 +977,11 @@ ALL_TOOLS = [
 
 def get_tool_by_name(name: str) -> Optional[Any]:
     """按工具名获取工具对象。"""
+    normalized_name = {
+        "search_faq": "search_knowledge_base",
+    }.get(name, name)
     for tool in ALL_TOOLS:
-        if tool.name == name:
+        if tool.name == normalized_name:
             return tool
     return None
 
@@ -949,9 +996,9 @@ if __name__ == "__main__":
     print("Support Tools Demo")
     print("=" * 60)
 
-    # FAQ 检索示例
-    print("\n1. FAQ Search:")
-    result = search_faq.invoke({"query": "password reset", "category": None})
+    # 帮助中心检索示例
+    print("\n1. Help Center Search:")
+    result = search_knowledge_base.invoke({"query": "password reset", "category": None})
     print(result[:200] + "...")
 
     # 工单创建示例
@@ -970,4 +1017,3 @@ if __name__ == "__main__":
     print(result[:300] + "...")
 
     print("\n" + "=" * 60)
-

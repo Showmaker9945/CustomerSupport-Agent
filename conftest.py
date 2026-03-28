@@ -24,11 +24,36 @@ class FakeSentenceTransformer:
     def __init__(self, model_name: str):
         self.model_name = model_name
 
-    def encode(self, text: str):
+    def encode(self, text: str, normalize_embeddings: bool = False):
         lowered = (text or "").lower()
         vector = FakeEmbedding(float(lowered.count(token.lower())) for token in _FAKE_VOCAB)
         vector.append(float(len(lowered)))
+        if normalize_embeddings:
+            norm = sum(value * value for value in vector) ** 0.5
+            if norm:
+                vector = FakeEmbedding(value / norm for value in vector)
         return vector
+
+
+class FakeCrossEncoder:
+    def __init__(self, model_name: str, max_length: int | None = None):
+        self.model_name = model_name
+        self.max_length = max_length
+
+    def predict(self, pairs):
+        scores = []
+        for query, document in pairs:
+            query_lower = (query or "").lower()
+            document_lower = (document or "").lower()
+            score = 0.0
+            for token in _FAKE_VOCAB:
+                lowered_token = token.lower()
+                if lowered_token in query_lower and lowered_token in document_lower:
+                    score += 1.0
+            if query_lower and query_lower in document_lower:
+                score += 1.5
+            scores.append(score)
+        return scores
 
 
 class FakeCollection:
@@ -111,23 +136,41 @@ class FakePersistentClient:
 @pytest.fixture(autouse=True)
 def fake_faq_dependencies(monkeypatch):
     import src.knowledge.faq_store as faq_store_module
+    import src.knowledge.document_store as document_store_module
+    import src.memory.semantic_store as semantic_store_module
 
     faq_store_module.FAQStore._EMBEDDING_MODEL_CACHE.clear()
     faq_store_module.FAQStore._RERANKER_MODEL_CACHE.clear()
     monkeypatch.setattr(faq_store_module, "SentenceTransformer", FakeSentenceTransformer)
     monkeypatch.setattr(faq_store_module.chromadb, "PersistentClient", FakePersistentClient)
+    monkeypatch.setattr(document_store_module, "SentenceTransformer", FakeSentenceTransformer)
+    monkeypatch.setattr(document_store_module, "CrossEncoder", FakeCrossEncoder)
+    monkeypatch.setattr(document_store_module.chromadb, "PersistentClient", FakePersistentClient)
+    monkeypatch.setattr(semantic_store_module, "SentenceTransformer", FakeSentenceTransformer)
+    monkeypatch.setattr(semantic_store_module.chromadb, "PersistentClient", FakePersistentClient)
     yield
 
 
 @pytest.fixture
 def isolated_business_db(monkeypatch, tmp_path):
     from src.config import settings
+    from src.conversation.support_agent import service as support_service
     from src.db.repositories import reset_business_database
     from src.db.session import reset_database_connection
+    from src.tools.support_tools import reset_faq_store
 
     db_path = (tmp_path / "business.db").resolve()
     monkeypatch.setattr(settings, "database_url", f"sqlite+pysqlite:///{db_path.as_posix()}", raising=False)
+    monkeypatch.setattr(settings, "chroma_persist_dir", (tmp_path / "chroma").resolve(), raising=False)
+    reset_faq_store()
+    if support_service._support_agent is not None:
+        support_service._support_agent.close()
+        support_service._support_agent = None
     reset_database_connection()
     reset_business_database(seed_demo=True)
     yield
+    reset_faq_store()
+    if support_service._support_agent is not None:
+        support_service._support_agent.close()
+        support_service._support_agent = None
     reset_database_connection()

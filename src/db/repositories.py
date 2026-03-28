@@ -16,9 +16,12 @@ from .models import (
     ConversationThread,
     Invoice,
     InvoiceItem,
+    KnowledgeChunk,
+    KnowledgeDocument,
     Subscription,
     TicketRecord,
     User,
+    UserMemoryRecord,
 )
 from .session import get_engine, session_scope
 
@@ -320,6 +323,57 @@ def _message_to_record(message: ConversationMessage) -> Dict[str, Any]:
         "estimated_tokens": message.estimated_tokens,
         "metadata": message.metadata_json or {},
     }
+
+
+def _knowledge_document_to_record(document: KnowledgeDocument) -> Dict[str, Any]:
+    return {
+        "doc_id": document.doc_id,
+        "source_path": document.source_path,
+        "title": document.title,
+        "doc_type": document.doc_type,
+        "checksum": document.checksum,
+        "status": document.status,
+        "version": document.version,
+        "metadata": document.metadata_json or {},
+        "ingested_at": document.ingested_at,
+        "updated_at": document.updated_at,
+    }
+
+
+def _knowledge_chunk_to_record(chunk: KnowledgeChunk) -> Dict[str, Any]:
+    return {
+        "chunk_id": chunk.chunk_id,
+        "doc_id": chunk.doc_id,
+        "parent_chunk_id": chunk.parent_chunk_id,
+        "chunk_level": chunk.chunk_level,
+        "chunk_index": chunk.chunk_index,
+        "child_index": chunk.child_index,
+        "section_path": chunk.section_path,
+        "title": chunk.title,
+        "category": chunk.category,
+        "content": chunk.content,
+        "char_count": chunk.char_count,
+        "token_count": chunk.token_count,
+        "metadata": chunk.metadata_json or {},
+    }
+
+
+def _memory_record_to_payload(memory: UserMemoryRecord) -> Dict[str, Any]:
+    payload = dict(memory.payload_json or {})
+    payload.setdefault("memory_id", memory.memory_id)
+    payload.setdefault("user_id", memory.user_id)
+    payload.setdefault("memory_type", memory.memory_type)
+    payload.setdefault("status", memory.status)
+    payload.setdefault("category", memory.category)
+    payload.setdefault("field", memory.field)
+    payload.setdefault("value", memory.value_text)
+    payload.setdefault("summary", memory.summary)
+    payload.setdefault("content", memory.content)
+    payload.setdefault("issue_code", memory.issue_code)
+    payload.setdefault("importance", memory.importance)
+    payload.setdefault("created_at", memory.created_at)
+    payload.setdefault("updated_at", memory.updated_at)
+    return payload
 
 
 def get_user_record(user_id: str) -> Optional[Dict[str, Any]]:
@@ -789,3 +843,161 @@ def delete_user_conversations(user_id: str) -> int:
             session.execute(delete(ConversationMessage).where(ConversationMessage.thread_id.in_(thread_ids)))
         session.execute(delete(ConversationThread).where(ConversationThread.user_id == user_id))
         return len(thread_ids)
+
+
+def replace_knowledge_corpus(
+    *,
+    documents: List[Dict[str, Any]],
+    chunks: List[Dict[str, Any]],
+    clear_existing: bool = True,
+) -> Dict[str, int]:
+    """Replace the persisted document knowledge metadata with the latest corpus snapshot."""
+    ensure_business_database(seed_demo=False)
+    with session_scope() as session:
+        if clear_existing:
+            session.execute(delete(KnowledgeChunk))
+            session.execute(delete(KnowledgeDocument))
+
+        for payload in documents:
+            document = session.get(KnowledgeDocument, payload["doc_id"]) or KnowledgeDocument(doc_id=payload["doc_id"])
+            document.source_path = payload["source_path"]
+            document.title = payload["title"]
+            document.doc_type = payload.get("doc_type", "markdown")
+            document.checksum = payload["checksum"]
+            document.status = payload.get("status", "active")
+            document.version = int(payload.get("version", 1))
+            document.metadata_json = payload.get("metadata", {})
+            document.ingested_at = payload["ingested_at"]
+            document.updated_at = payload.get("updated_at", payload["ingested_at"])
+            session.add(document)
+
+        if documents and not clear_existing:
+            doc_ids = [payload["doc_id"] for payload in documents]
+            session.execute(delete(KnowledgeChunk).where(KnowledgeChunk.doc_id.in_(doc_ids)))
+
+        for payload in chunks:
+            session.add(
+                KnowledgeChunk(
+                    chunk_id=payload["chunk_id"],
+                    doc_id=payload["doc_id"],
+                    parent_chunk_id=payload.get("parent_chunk_id"),
+                    chunk_level=payload.get("chunk_level", "child"),
+                    chunk_index=int(payload.get("chunk_index", 0)),
+                    child_index=payload.get("child_index"),
+                    section_path=payload.get("section_path", ""),
+                    title=payload.get("title", ""),
+                    category=payload.get("category", "general"),
+                    content=payload["content"],
+                    char_count=int(payload.get("char_count", len(payload["content"]))),
+                    token_count=int(payload.get("token_count", estimate_text_tokens(payload["content"]))),
+                    metadata_json=payload.get("metadata", {}),
+                )
+            )
+
+    return {
+        "documents": len(documents),
+        "chunks": len(chunks),
+        "parent_chunks": sum(1 for chunk in chunks if chunk.get("chunk_level") == "parent"),
+        "child_chunks": sum(1 for chunk in chunks if chunk.get("chunk_level") == "child"),
+    }
+
+
+def list_knowledge_documents() -> List[Dict[str, Any]]:
+    ensure_business_database(seed_demo=False)
+    with session_scope() as session:
+        rows = list(session.scalars(select(KnowledgeDocument).order_by(KnowledgeDocument.title.asc())).all())
+        return [_knowledge_document_to_record(row) for row in rows]
+
+
+def list_knowledge_chunks(
+    *,
+    doc_id: Optional[str] = None,
+    chunk_level: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    ensure_business_database(seed_demo=False)
+    with session_scope() as session:
+        query = select(KnowledgeChunk)
+        if doc_id:
+            query = query.where(KnowledgeChunk.doc_id == doc_id)
+        if chunk_level:
+            query = query.where(KnowledgeChunk.chunk_level == chunk_level)
+        query = query.order_by(KnowledgeChunk.doc_id.asc(), KnowledgeChunk.chunk_index.asc(), KnowledgeChunk.child_index.asc())
+        rows = list(session.scalars(query).all())
+        return [_knowledge_chunk_to_record(row) for row in rows]
+
+
+def upsert_user_memory_record(
+    *,
+    user_id: str,
+    memory_id: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    ensure_business_database(seed_demo=False)
+    now = _now_iso()
+    with session_scope() as session:
+        memory = session.get(UserMemoryRecord, memory_id)
+        created_at = now
+        if memory is None:
+            memory = UserMemoryRecord(memory_id=memory_id, created_at=now, updated_at=now)
+        else:
+            created_at = memory.created_at
+
+        memory.user_id = user_id
+        memory.memory_type = payload.get("memory_type", "memory")
+        memory.status = payload.get("status", "active")
+        memory.category = payload.get("category")
+        memory.field = payload.get("field")
+        value = payload.get("value")
+        memory.value_text = "" if value is None else str(value)
+        memory.summary = payload.get("summary", "")
+        memory.content = payload.get("content", "")
+        memory.issue_code = payload.get("issue_code")
+        memory.importance = float(payload.get("importance", 0.0) or 0.0)
+        stored_payload = dict(payload)
+        stored_payload.setdefault("memory_id", memory_id)
+        stored_payload.setdefault("user_id", user_id)
+        stored_payload.setdefault("created_at", created_at)
+        stored_payload.setdefault("updated_at", now)
+        memory.payload_json = stored_payload
+        memory.created_at = stored_payload["created_at"]
+        memory.updated_at = stored_payload["updated_at"]
+        session.add(memory)
+        session.flush()
+        return _memory_record_to_payload(memory)
+
+
+def get_user_memory_record(user_id: str, memory_id: str) -> Optional[Dict[str, Any]]:
+    ensure_business_database(seed_demo=False)
+    with session_scope() as session:
+        memory = session.get(UserMemoryRecord, memory_id)
+        if memory is None or memory.user_id != user_id:
+            return None
+        return _memory_record_to_payload(memory)
+
+
+def list_user_memory_records(
+    user_id: str,
+    *,
+    limit: Optional[int] = None,
+    memory_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    ensure_business_database(seed_demo=False)
+    with session_scope() as session:
+        query = select(UserMemoryRecord).where(UserMemoryRecord.user_id == user_id)
+        if memory_type:
+            query = query.where(UserMemoryRecord.memory_type == memory_type)
+        query = query.order_by(UserMemoryRecord.updated_at.desc(), UserMemoryRecord.memory_id.asc())
+        if limit is not None:
+            query = query.limit(max(1, int(limit)))
+        rows = list(session.scalars(query).all())
+        return [_memory_record_to_payload(row) for row in rows]
+
+
+def delete_user_memory_record(user_id: str, memory_id: str) -> bool:
+    ensure_business_database(seed_demo=False)
+    with session_scope() as session:
+        memory = session.get(UserMemoryRecord, memory_id)
+        if memory is None or memory.user_id != user_id:
+            return False
+        session.delete(memory)
+        return True

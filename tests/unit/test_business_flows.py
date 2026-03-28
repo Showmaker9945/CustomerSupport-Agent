@@ -113,7 +113,7 @@ def test_agent_routes_subscription_cancel_question_to_knowledge(agent):
     assert response.route_path == ["analyze", "knowledge", "validate", "respond"]
     assert response.active_agent == "knowledge"
     assert "取消" in response.message
-    assert any("FAQ::billing" in citation for citation in response.citations)
+    assert any("帮助中心::" in citation for citation in response.citations)
 
 
 def test_subscription_endpoint(client):

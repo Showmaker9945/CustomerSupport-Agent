@@ -6,12 +6,12 @@
 
 - LangGraph 条件边编排：分析、路由、检索、执行、升级、校验、回复职责清晰
 - LangChain v1 / LangGraph v1：对齐 `create_agent` 与 middleware 体系
-- 中文优先：默认中文输出、中文情绪识别、中文 FAQ 与业务示例
+- 中文优先：默认中文输出、中文情绪识别、中文帮助中心知识库与业务示例
 - 轻量增强 RAG：混合检索、查询规范化、分类推断、子问题拆分、一次改写兜底
 - Memory 治理：线程级短期记忆、用户级长期记忆、记忆抽取与召回
 - HITL：高风险工具先中断审批，再恢复同一线程执行；显式写操作支持确定性中断
 - FastAPI 演示友好：REST、WebSocket、SSE、Swagger、回归测试
-- Debug 可观测：返回路由轨迹、校验说明、节点耗时、审批工具摘要
+- Debug 轻量化：接口仅返回路径、耗时与 LangSmith 链接，详细链路放到 LangSmith 查看
 - LangSmith Tracing：`/chat` 与 `/resume` 都可返回 `run_url`，便于排查图节点、工具调用与审批恢复链路
 
 ## 适合展示的能力
@@ -30,7 +30,7 @@
 关键模块：
 
 - `src/conversation/support_agent/`：Support Agent 图、服务层、中间件、持久化适配
-- `src/knowledge/faq_store.py`：FAQ 知识库、混合检索、融合与轻量增强 RAG
+- `src/knowledge/document_store.py`：帮助中心文档知识库、结构化切分、混合检索与重排
 - `src/tools/support_tools.py`：账户、订阅、账单、工单、人工升级等业务工具
 - `src/api/main.py`：FastAPI、Swagger、SSE、WebSocket、恢复接口
 - `src/sentiment/analyzer.py`：中文优先情绪识别
@@ -53,7 +53,7 @@ CustomerSupport-Agent/
 ├─ src/
 │  ├─ api/                    # FastAPI / SSE / WebSocket
 │  ├─ conversation/           # SupportAgent 图与服务层
-│  ├─ knowledge/              # FAQStore / RAG
+│  ├─ knowledge/              # 文档知识库 / 结构化 chunk / RAG
 │  ├─ sentiment/              # 中文优先情绪分析
 │  ├─ tools/                  # 工单、账户、账单、升级等工具
 │  └─ config.py               # 配置中心
@@ -144,7 +144,7 @@ LANGSMITH_WORKSPACE_ID=你的 workspace uuid
 常用回归：
 
 ```bash
-uv run pytest tests/unit/test_faq_store.py
+uv run pytest tests/unit/test_document_store.py
 uv run pytest tests/unit/test_support_agent.py tests/unit/test_api.py
 uv run pytest tests/unit/test_sentiment_analyzer.py tests/unit/test_business_flows.py
 ```
@@ -165,17 +165,18 @@ uv run pytest --cov=src --cov-report=term-missing --cov-report=html
 
 建议在 `/docs` 里按下面顺序验证：
 
-1. FAQ 路径
+1. 帮助中心检索路径
    - 问题：`如何重置密码？`
    - 预期：`active_agent = knowledge`
+   - 预期引用：`帮助中心::Customer Support Help Center > 账户与登录 > 重置密码`
 
 2. 真实业务查询
    - 问题：`帮我查一下当前套餐和下次续费时间`
    - 预期：走 action 路径，返回订阅摘要
 
-3. RAG 复合问题
+3. 文档型 RAG 复合问题
    - 问题：`怎么取消套餐，取消后什么时候生效？`
-   - 预期：命中知识检索；开启 `debug=true` 时可看到更丰富的检索策略信息
+   - 预期：命中帮助中心文档；本地只看轻量 `route_path/node_timings`，详细过程到 LangSmith 看
 
 4. HITL 中断与恢复
    - 问题：`请创建一个账单异常工单`
@@ -192,12 +193,12 @@ uv run pytest --cov=src --cov-report=term-missing --cov-report=html
    - 问题：`我要投诉，现在就转人工`
    - 预期：升级路径触发，必要时进入审批
 
-更详细的验证脚本和场景见 [examples/README.md](./examples/README.md)。
+更详细的验证脚本和场景见 [examples/README.md](./examples/README.md) 与 [docs/HELP_CENTER_VALIDATION.md](./docs/HELP_CENTER_VALIDATION.md)。
 
 ## 业务数据说明
 
 - 结构化业务数据默认使用 PostgreSQL：`users`、`subscriptions`、`invoices`、`invoice_items`、`tickets`
-- FAQ / RAG 检索继续使用 Chroma
+- 帮助中心文档检索继续使用 Chroma
 - `data/demo_seed/` 中的 JSON 只作为演示初始化数据，不再作为运行时主存储
 
 ### 初始化 PostgreSQL 演示数据
@@ -245,7 +246,7 @@ LANGGRAPH_PERSISTENCE_BACKEND=postgres
 
 - 修复显式高风险写操作在部分场景下无法正确触发 HITL 的问题
 - 为 `create_ticket` 等审批动作补齐确定性 `interrupt -> resume` 链路
-- `/chat` 与 `/resume` 调试信息增加节点耗时，便于演示和排障
+- `/chat` 与 `/resume` 的调试输出改为轻量摘要，详细节点分析统一通过 LangSmith 查看
 - 优化审批响应结构，待审批工具名称和参数预览更清晰
 - 接入 LangSmith tracing，并补齐 `support.resume`、resume 工具调用与后续 `validate/respond` 的可观测性
 
@@ -253,6 +254,7 @@ LANGGRAPH_PERSISTENCE_BACKEND=postgres
 
 - [PROJECT_OVERVIEW.md](./PROJECT_OVERVIEW.md)
 - [examples/README.md](./examples/README.md)
+- [docs/HELP_CENTER_VALIDATION.md](./docs/HELP_CENTER_VALIDATION.md)
 - [docs/LANGSMITH_TRACING.md](./docs/LANGSMITH_TRACING.md)
 
 ## 备注

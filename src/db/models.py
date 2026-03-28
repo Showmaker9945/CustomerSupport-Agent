@@ -118,6 +118,72 @@ class TicketRecord(Base):
     user: Mapped[User] = relationship(back_populates="tickets")
 
 
+class KnowledgeDocument(Base):
+    """Knowledge document metadata persisted for the document-backed RAG index."""
+
+    __tablename__ = "knowledge_documents"
+
+    doc_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    source_path: Mapped[str] = mapped_column(String(512), nullable=False, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    doc_type: Mapped[str] = mapped_column(String(32), nullable=False, default="markdown")
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    ingested_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    chunks: Mapped[List["KnowledgeChunk"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="KnowledgeChunk.chunk_index",
+    )
+
+
+class KnowledgeChunk(Base):
+    """Persisted parent/child chunk metadata for the document knowledge base."""
+
+    __tablename__ = "knowledge_chunks"
+
+    chunk_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    doc_id: Mapped[str] = mapped_column(ForeignKey("knowledge_documents.doc_id"), index=True)
+    parent_chunk_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    chunk_level: Mapped[str] = mapped_column(String(16), nullable=False, default="child")
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    child_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    section_path: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    title: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    category: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    char_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    document: Mapped[KnowledgeDocument] = relationship(back_populates="chunks")
+
+
+class UserMemoryRecord(Base):
+    """Persistent structured long-term memory for each user."""
+
+    __tablename__ = "user_memories"
+
+    memory_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    memory_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    category: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    field: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    value_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    issue_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    importance: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    payload_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
 class ConversationThread(Base):
     """短期对话线程，保存 thread 级元信息与滚动上下文摘要。"""
 

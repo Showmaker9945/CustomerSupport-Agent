@@ -44,7 +44,7 @@ def test_route_to_knowledge_agent(agent):
     assert response.active_agent == "knowledge"
     assert response.intent in {"question", "other"}
     assert response.route_path == ["analyze", "knowledge", "validate", "respond"]
-    assert any(source in {"Hybrid RAG", "FAQ Knowledge Base", "Fallback Policy"} for source in response.sources)
+    assert any(source in {"Hybrid RAG", "Help Center Knowledge Base", "Fallback Policy"} for source in response.sources)
 
 
 def test_route_to_action_agent(agent):

@@ -59,14 +59,17 @@ class Settings(BaseSettings):
 
     # 向量知识库（Chroma）
     chroma_persist_dir: Path = Field(default=Path("./data/chroma_db"))
-    collection_name: str = "faq_knowledge_base"
+    collection_name: str = "document_knowledge_base"
     embedding_model: str = "BAAI/bge-large-zh-v1.5"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     enable_reranker: bool = True
+    memory_collection_name: str = "user_memory_semantic"
     embedding_query_instruction: str = "为这个句子生成表示以用于检索相关文章："
 
     # 知识库检索参数
     knowledge_base_path: Path = Field(default=Path("./data/knowledge_base"))
+    parent_chunk_size: int = 1000
+    parent_chunk_overlap: int = 120
     chunk_size: int = 500
     chunk_overlap: int = 50
     top_k_results: int = 3

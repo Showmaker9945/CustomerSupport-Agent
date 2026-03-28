@@ -15,7 +15,7 @@ uv run uvicorn src.api.main:app --reload --port 8000
 
 ## 推荐验证顺序
 
-### 1. FAQ 问答
+### 1. 帮助中心知识检索
 
 `POST /chat`
 
@@ -32,6 +32,7 @@ uv run uvicorn src.api.main:app --reload --port 8000
 - `active_agent` 应为 `knowledge`
 - `run_status` 应为 `completed`
 - `debug.route_path` 应包含 `analyze -> knowledge -> validate -> respond`
+- `result.citations` 应包含 `帮助中心::Customer Support Help Center > 账户与登录 > 重置密码`
 
 ### 2. 真实业务查询
 
@@ -60,7 +61,7 @@ uv run uvicorn src.api.main:app --reload --port 8000
 
 关注点：
 
-- 应返回取消订阅相关 FAQ
+- 应返回取消订阅相关帮助中心内容
 - `debug.route_path` 与 `debug.node_timings` 可以快速判断本地执行路径
 - 更细的节点过程建议直接打开 `debug.langsmith.run_url`
 

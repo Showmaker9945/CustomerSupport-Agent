@@ -33,6 +33,7 @@ from ...db.repositories import (
     list_thread_messages,
     save_pending_conversation_state,
 )
+from ...memory import SemanticMemoryStore
 from ...sentiment.analyzer import SentimentResult, get_sentiment_analyzer
 from ...tools.support_tools import (
     create_ticket,
@@ -46,7 +47,7 @@ from ...tools.support_tools import (
     get_user_tickets,
     lookup_account,
     reindex_knowledge_base,
-    search_faq,
+    search_knowledge_base,
     update_ticket,
 )
 from .graph import (
@@ -91,7 +92,8 @@ TOOL_LABELS: Dict[str, str] = {
     "get_subscription_status": "查询订阅状态",
     "get_latest_invoice": "查询最近账单",
     "explain_invoice_charge": "解释账单扣费",
-    "search_faq": "检索知识库",
+    "search_knowledge_base": "检索帮助中心知识库",
+    "search_faq": "检索帮助中心知识库",
     "escalate_to_human": "升级人工客服",
     "reindex_knowledge_base": "重建知识库索引",
 }
@@ -134,6 +136,7 @@ class SupportAgent:
         disable_llm = os.getenv("DISABLE_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
         self.llm_enabled = settings.has_valid_llm_api_key and not disable_llm
         self.persistence = LangGraphPersistence()
+        self.structured_memory_store = SemanticMemoryStore() if enable_memory else None
         self.sentiment_analyzer = get_sentiment_analyzer() if enable_sentiment else None
 
         self._lock = threading.Lock()
@@ -161,6 +164,8 @@ class SupportAgent:
     def close(self) -> None:
         """Release backend resources."""
         self.persistence.close()
+        if self.structured_memory_store is not None:
+            self.structured_memory_store.close()
 
     def _create_model(self, model_name: str, temperature: float) -> ChatOpenAI:
         kwargs: Dict[str, Any] = {
@@ -546,24 +551,16 @@ class SupportAgent:
         self.persistence.store.put(self._telemetry_memory_namespace(user_id), digest, payload)
 
     def _list_structured_memory(self, user_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        if not self.enable_memory or self.persistence.store is None:
+        if not self.enable_memory or self.structured_memory_store is None:
             return []
         try:
-            items = self.persistence.store.search(
-                self._structured_memory_namespace(user_id),
-                query=None,
+            return self.structured_memory_store.list_memories(
+                user_id=user_id,
                 limit=limit or settings.max_memory_items_per_user,
             )
         except Exception as error:
             logger.warning(f"Memory list failed: {error}")
             return []
-
-        results: List[Dict[str, Any]] = []
-        for item in items:
-            payload = dict(item.value)
-            payload.setdefault("memory_id", item.key)
-            results.append(payload)
-        return results
 
     def _upsert_structured_memory(
         self,
@@ -573,17 +570,20 @@ class SupportAgent:
         payload: Dict[str, Any],
         thread_id: Optional[str] = None,
     ) -> None:
-        if not self.enable_memory or self.persistence.store is None:
+        if not self.enable_memory or self.structured_memory_store is None:
             return
         clean_payload = dict(payload)
         clean_payload["memory_id"] = memory_id
         clean_payload.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
-        self.persistence.store.put(
-            self._structured_memory_namespace(user_id),
-            memory_id,
-            clean_payload,
-        )
-        self._record_memory_write(thread_id, "upsert", clean_payload)
+        try:
+            stored = self.structured_memory_store.upsert_memory(
+                user_id=user_id,
+                memory_id=memory_id,
+                payload=clean_payload,
+            )
+            self._record_memory_write(thread_id, "upsert", stored)
+        except Exception as error:
+            logger.warning(f"Memory upsert failed: {error}")
 
     def _delete_structured_memory(
         self,
@@ -593,10 +593,10 @@ class SupportAgent:
         thread_id: Optional[str] = None,
         reason: str = "delete",
     ) -> None:
-        if not self.enable_memory or self.persistence.store is None:
+        if not self.enable_memory or self.structured_memory_store is None:
             return
         with suppress(Exception):
-            self.persistence.store.delete(self._structured_memory_namespace(user_id), memory_id)
+            self.structured_memory_store.delete_memory(user_id=user_id, memory_id=memory_id)
         self._record_memory_write(
             thread_id,
             reason,
@@ -604,15 +604,10 @@ class SupportAgent:
         )
 
     def _load_structured_memory_item(self, user_id: str, memory_id: str) -> Optional[Dict[str, Any]]:
-        if not self.enable_memory or self.persistence.store is None:
+        if not self.enable_memory or self.structured_memory_store is None:
             return None
         try:
-            item = self.persistence.store.get(self._structured_memory_namespace(user_id), memory_id)
-            if item is None:
-                return None
-            payload = dict(item.value)
-            payload.setdefault("memory_id", memory_id)
-            return payload
+            return self.structured_memory_store.get_memory(user_id=user_id, memory_id=memory_id)
         except Exception as error:
             logger.warning(f"Memory get failed: {error}")
             return None
@@ -666,39 +661,41 @@ class SupportAgent:
         limit: int = 5,
         thread_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        if not self.enable_memory or self.persistence.store is None:
+        if not self.enable_memory or self.structured_memory_store is None:
             return []
-
         items = self._list_structured_memory(user_id, limit=settings.max_memory_items_per_user)
         if not items:
             self._record_memory_skip(thread_id, "no_memory_available", query)
             return []
-
-        ranked = sorted(
-            items,
-            key=lambda payload: (
-                self._memory_score(payload, query),
-                payload.get("updated_at", ""),
-            ),
-            reverse=True,
-        )
-        filtered = [payload for payload in ranked if self._memory_score(payload, query) > 0.12][:limit]
+        try:
+            filtered = self.structured_memory_store.search_memories(
+                user_id=user_id,
+                query=query,
+                limit=limit,
+            )
+        except Exception as error:
+            logger.warning(f"Memory search failed: {error}")
+            filtered = []
         if not filtered:
             self._record_memory_skip(thread_id, "no_relevant_memory", query)
             return []
-
         self._record_memory_hit(thread_id, query, filtered)
         return filtered
 
     def _build_role_agents(self) -> None:
         self.role_agents = {
             "supervisor": create_role_agent(owner=self, role="supervisor", tools=[], enable_hitl=False),
-            "knowledge": create_role_agent(owner=self, role="knowledge", tools=[search_faq], enable_hitl=False),
+            "knowledge": create_role_agent(
+                owner=self,
+                role="knowledge",
+                tools=[search_knowledge_base],
+                enable_hitl=False,
+            ),
             "action": create_role_agent(
                 owner=self,
                 role="action",
                 tools=[
-                    search_faq,
+                    search_knowledge_base,
                     create_ticket,
                     update_ticket,
                     get_ticket_status,
@@ -797,14 +794,14 @@ class SupportAgent:
                     "你可以在“设置 > 账单 > 订阅管理”中升级或降级套餐。\n"
                     "升级会立即生效并按比例补差价；降级会在下一个计费周期开始时生效。\n"
                     "下一步：如果你告诉我想升级还是降级，我可以继续指导你操作。\n"
-                    "来源：FAQ::billing"
+                    "来源：帮助中心::Customer Support Help Center > 订阅与账单 > 套餐升级、降级与席位变更"
                 )
             return (
                 "取消订阅说明：\n"
                 "你可以在“设置 > 账单 > 订阅管理”中取消套餐。\n"
                 "取消后服务会持续到当前计费周期结束，已使用周期通常不支持按天退款。\n"
                 "下一步：如果你想先确认当前套餐和续费时间，我也可以继续帮你查询。\n"
-                "来源：FAQ::billing"
+                "来源：帮助中心::Customer Support Help Center > 订阅与账单 > 取消订阅与退款规则"
             )
         return None
 
@@ -1696,7 +1693,7 @@ class SupportAgent:
             if structured_lookup is not None:
                 return intro + structured_lookup
             try:
-                return intro + search_faq.invoke({"query": message, "category": None})
+                return intro + search_knowledge_base.invoke({"query": message, "category": None})
             except Exception as error:
                 return intro + f"知识检索失败：{error}"
 
@@ -2057,7 +2054,7 @@ class SupportAgent:
     def _resolve_sources(self, state: OrchestrationState) -> List[str]:
         sources: List[str] = []
         if state.get("retrieval_text"):
-            sources.extend(["Hybrid RAG", "FAQ Knowledge Base"])
+            sources.extend(["Hybrid RAG", "Help Center Knowledge Base"])
         if state.get("tool_text"):
             sources.append(state.get("tool_source") or "Support Tools")
         if state.get("selected_agent") == "escalation" or state.get("escalated"):

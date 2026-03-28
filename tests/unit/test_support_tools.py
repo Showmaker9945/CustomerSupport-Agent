@@ -11,7 +11,7 @@ from src.tools.support_tools import (
     TicketStatus,
     TicketPriority,
     TicketStore,
-    search_faq,
+    search_knowledge_base,
     create_ticket,
     get_ticket_status,
     update_ticket,
@@ -251,15 +251,15 @@ class TestSupportTools:
         assert match is not None
         return match.group(0)
 
-    def test_search_faq(self):
-        """Test FAQ search tool."""
-        result = search_faq.invoke({"query": "如何重置密码", "category": None})
-        assert ("找到" in result) or ("未找到" in result)
+    def test_search_knowledge_base(self):
+        """Test help-center knowledge-base search tool."""
+        result = search_knowledge_base.invoke({"query": "如何重置密码", "category": None})
+        assert ("帮助中心共找到" in result) or ("未在帮助中心中找到" in result)
 
-    def test_search_faq_with_category(self):
-        """Test FAQ search with category filter."""
-        result = search_faq.invoke({"query": "付款方式", "category": "billing"})
-        assert ("billing" in result.lower()) or ("分类：" in result) or ("未找到" in result)
+    def test_search_knowledge_base_with_category(self):
+        """Test help-center knowledge-base search with category filter."""
+        result = search_knowledge_base.invoke({"query": "付款方式", "category": "billing"})
+        assert ("billing" in result.lower()) or ("分类：" in result) or ("未在帮助中心中找到" in result)
 
     def test_create_ticket_tool(self):
         """Test create ticket tool."""

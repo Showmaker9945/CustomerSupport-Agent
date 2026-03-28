@@ -33,7 +33,7 @@ uv run python -m textblob.download_corpora >/dev/null 2>&1 || true
 
 echo
 echo "4) 创建本地数据目录"
-mkdir -p data/knowledge_base data/chroma_db data/user_memory
+mkdir -p data/knowledge_base data/chroma_db
 
 echo
 echo "完成。常用命令："

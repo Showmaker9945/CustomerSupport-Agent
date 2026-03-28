@@ -22,7 +22,7 @@ COPY src/ ./src/
 COPY data/ ./data/
 COPY .env.example ./
 
-RUN mkdir -p data/knowledge_base data/chroma_db data/user_memory && \
+RUN mkdir -p data/knowledge_base data/chroma_db && \
     (python -c "from textblob import TextBlob; TextBlob('test')" || python -m textblob.download_corpora || echo "TextBlob corpora download skipped")
 
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app

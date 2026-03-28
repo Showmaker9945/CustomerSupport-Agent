@@ -29,7 +29,6 @@ htmlcov/
 
 # Data (will be created in container)
 data/chroma_db/*
-data/user_memory/*
 data/tickets.json
 
 # Git
