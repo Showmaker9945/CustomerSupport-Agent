@@ -36,6 +36,40 @@ def test_document_store_reindexes_markdown_corpus(tmp_path, isolated_business_db
     assert results[0].metadata["document_title"] == "Support Manual"
 
 
+def test_document_store_parent_child_chunking_creates_finer_grained_children(tmp_path, isolated_business_db):
+    knowledge_dir = tmp_path / "knowledge"
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    long_section = "\n\n".join(
+        [
+            "收到账单异常投诉后，客服要先核对账单周期、支付方式、套餐变更、席位变更和附加存储。"
+            "如果用户无法提供账单号，应该先补充材料，而不是立刻创建工单。"
+            "当用户已经说明是重复扣款、退款争议或历史账单更正时，再进入人工复核路径。"
+            for _ in range(10)
+        ]
+    )
+    (knowledge_dir / "billing.md").write_text(
+        (
+            "# Billing Playbook\n\n"
+            "## Billing\n\n"
+            "### 账单异常核查\n\n"
+            f"{long_section}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    store = create_document_store(
+        knowledge_base_path=knowledge_dir,
+        chroma_path=tmp_path / "chroma",
+    )
+    stats = store.reindex(clear_existing=True)
+    results = store.search_hybrid("重复扣款时创建什么工单", top_k=3)
+
+    assert stats["total_parent_chunks"] > 0
+    assert stats["total_child_chunks"] > stats["total_parent_chunks"]
+    assert results
+    assert "账单异常" in results[0].question or "账单异常" in results[0].answer
+
+
 def test_semantic_memory_store_persists_and_searches(tmp_path, isolated_business_db):
     store = SemanticMemoryStore(chroma_path=tmp_path / "chroma")
     store.upsert_memory(

@@ -7,8 +7,10 @@
 当前默认测试文档位于：
 
 - `data/knowledge_base/customer_support_handbook.md`
+- `data/knowledge_base/billing_exception_playbook.md`
+- `data/knowledge_base/account_access_admin_guide.md`
 
-这份文档已经覆盖以下高频主题：
+这一组文档已经覆盖以下高频主题：
 
 - 重置密码
 - 双重身份验证（2FA）
@@ -32,6 +34,12 @@
 - 工单响应时效（SLA）
 - 人工审核与恢复流程
 - 产品更新节奏
+
+这些文档刻意写成“总览页 + 专项运营手册”的形式，而不是短 FAQ 卡片。这样 reindex 后通常会出现：
+
+- `total_child_chunks > total_parent_chunks`
+- 查询命中的 section path 更细，例如命中“账单异常核查”下面的某个步骤或证据清单
+- 同一主题下既能保留完整政策上下文，也能返回局部操作片段
 
 ## 2. 启动前检查
 
@@ -96,6 +104,7 @@ uv run uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 - `status = success`
 - `message` 中包含 `帮助中心知识库索引已刷新`
 - 返回文档数量、父块数量、子块数量和集合名
+- 在当前默认语料下，建议关注 `子块数量是否明显高于父块数量`
 
 ## 4. 验证帮助中心检索
 
@@ -123,6 +132,7 @@ uv run uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 - `analyze` 节点是否把请求路由到 `knowledge`
 - `knowledge` 节点是否调用了 `search_knowledge_base`
 - tool 输出里是否包含帮助中心 section path
+- 如果你打开 tool 输入输出细节，通常还能看到命中的 section path 已经细到具体小节，而不是停留在整篇文档标题
 
 ## 5. 验证复合文档检索
 
@@ -149,6 +159,7 @@ uv run uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 - `knowledge` 节点耗时
 - `search_knowledge_base` 的输入 query
 - tool 输出中的引用来源是否清晰
+- 如果命中了账单专项手册，说明当前已经不再依赖旧 FAQ 兼容层
 
 ## 6. 验证业务工具查询
 
@@ -245,12 +256,25 @@ uv run uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 3. 再看工具输入输出
    - 知识类关注 `search_knowledge_base`
    - 业务类关注 `get_subscription_status`、`get_latest_invoice`、`create_ticket`
+   - 当前代码里旧的 `search_faq` 兼容入口已经移除，如果 trace 中仍出现它，通常意味着你运行的不是最新代码
 
 4. 最后看恢复链路
    - 首次 `/chat` 看中断点
    - `/resume` 看写操作真正发生在哪个节点
 
-## 10. 常见问题
+## 10. 如何验证父块/子块的意义
+
+可以在完成 `POST /knowledge/reindex` 后先看返回统计：
+
+1. 如果 `子块数量 <= 父块数量`，说明文档还是偏短，长上下文优势不明显。
+2. 如果 `子块数量 > 父块数量`，说明至少一部分章节已经被切成“一个父块 + 多个子块”。
+3. 再去问复合问题，例如：
+   - `重复扣款时要先补哪些信息？`
+   - `邮箱不可用时还能怎么重置密码？`
+   - `取消订阅后什么时候生效，会自动退款吗？`
+4. 在 LangSmith 里看 `search_knowledge_base` 输出，如果引用已经细到专项文档中的某个步骤、条件或证据清单，就说明子块检索起作用了；如果同时回答里还能保留完整政策边界，则说明父块上下文也参与了生成。
+
+## 11. 常见问题
 
 ### Q1. 为什么我改了文档，但回答没变化？
 

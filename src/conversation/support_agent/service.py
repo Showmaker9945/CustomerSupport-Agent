@@ -93,7 +93,6 @@ TOOL_LABELS: Dict[str, str] = {
     "get_latest_invoice": "查询最近账单",
     "explain_invoice_charge": "解释账单扣费",
     "search_knowledge_base": "检索帮助中心知识库",
-    "search_faq": "检索帮助中心知识库",
     "escalate_to_human": "升级人工客服",
     "reindex_knowledge_base": "重建知识库索引",
 }

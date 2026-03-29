@@ -134,18 +134,30 @@ class FakePersistentClient:
 
 
 @pytest.fixture(autouse=True)
-def fake_faq_dependencies(monkeypatch):
-    import src.knowledge.faq_store as faq_store_module
+def fake_embedding_dependencies(monkeypatch):
+    from src.config import settings
     import src.knowledge.document_store as document_store_module
     import src.memory.semantic_store as semantic_store_module
 
-    faq_store_module.FAQStore._EMBEDDING_MODEL_CACHE.clear()
-    faq_store_module.FAQStore._RERANKER_MODEL_CACHE.clear()
-    monkeypatch.setattr(faq_store_module, "SentenceTransformer", FakeSentenceTransformer)
-    monkeypatch.setattr(faq_store_module.chromadb, "PersistentClient", FakePersistentClient)
+    monkeypatch.setattr(settings, "embedding_model", "BAAI/bge-large-zh-v1.5", raising=False)
+    monkeypatch.setattr(settings, "reranker_model", "BAAI/bge-reranker-v2-m3", raising=False)
+    monkeypatch.setattr(settings, "enable_reranker", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "embedding_query_instruction",
+        "为这个句子生成表示以用于检索相关文章：",
+        raising=False,
+    )
+    monkeypatch.setattr(settings, "collection_name", "document_knowledge_base", raising=False)
+    monkeypatch.setattr(settings, "memory_collection_name", "user_memory_semantic", raising=False)
+
+    document_store_module.DocumentStore._EMBEDDING_MODEL_CACHE.clear()
+    document_store_module.DocumentStore._RERANKER_MODEL_CACHE.clear()
     monkeypatch.setattr(document_store_module, "SentenceTransformer", FakeSentenceTransformer)
     monkeypatch.setattr(document_store_module, "CrossEncoder", FakeCrossEncoder)
     monkeypatch.setattr(document_store_module.chromadb, "PersistentClient", FakePersistentClient)
+
+    semantic_store_module.SemanticMemoryStore._EMBEDDING_MODEL_CACHE.clear()
     monkeypatch.setattr(semantic_store_module, "SentenceTransformer", FakeSentenceTransformer)
     monkeypatch.setattr(semantic_store_module.chromadb, "PersistentClient", FakePersistentClient)
     yield
@@ -157,19 +169,21 @@ def isolated_business_db(monkeypatch, tmp_path):
     from src.conversation.support_agent import service as support_service
     from src.db.repositories import reset_business_database
     from src.db.session import reset_database_connection
-    from src.tools.support_tools import reset_faq_store
+    from src.tools.support_tools import reset_knowledge_store
 
     db_path = (tmp_path / "business.db").resolve()
     monkeypatch.setattr(settings, "database_url", f"sqlite+pysqlite:///{db_path.as_posix()}", raising=False)
     monkeypatch.setattr(settings, "chroma_persist_dir", (tmp_path / "chroma").resolve(), raising=False)
-    reset_faq_store()
+    monkeypatch.setattr(settings, "collection_name", "document_knowledge_base", raising=False)
+    monkeypatch.setattr(settings, "memory_collection_name", "user_memory_semantic", raising=False)
+    reset_knowledge_store()
     if support_service._support_agent is not None:
         support_service._support_agent.close()
         support_service._support_agent = None
     reset_database_connection()
     reset_business_database(seed_demo=True)
     yield
-    reset_faq_store()
+    reset_knowledge_store()
     if support_service._support_agent is not None:
         support_service._support_agent.close()
         support_service._support_agent = None

@@ -403,11 +403,6 @@ def reset_knowledge_store() -> None:
     _knowledge_store = None
 
 
-# 向后兼容旧命名，避免历史测试或脚本直接失效。
-get_faq_store = get_knowledge_store
-reset_faq_store = reset_knowledge_store
-
-
 # TicketStore 全局单例
 _ticket_store: Optional[TicketStore] = None
 
@@ -509,10 +504,6 @@ def search_knowledge_base(query: str, category: Optional[str] = None) -> str:
     except Exception as e:
         logger.error(f"Knowledge base search error: {e}")
         return f"知识检索失败：{str(e)}"
-
-
-# 向后兼容旧工具引用；底层真实工具名已统一为 search_knowledge_base。
-search_faq = search_knowledge_base
 
 
 @tool
@@ -977,11 +968,8 @@ ALL_TOOLS = [
 
 def get_tool_by_name(name: str) -> Optional[Any]:
     """按工具名获取工具对象。"""
-    normalized_name = {
-        "search_faq": "search_knowledge_base",
-    }.get(name, name)
     for tool in ALL_TOOLS:
-        if tool.name == normalized_name:
+        if tool.name == name:
             return tool
     return None
 

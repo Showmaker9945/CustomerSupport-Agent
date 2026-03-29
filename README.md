@@ -7,7 +7,7 @@
 - LangGraph 条件边编排：分析、路由、检索、执行、升级、校验、回复职责清晰
 - LangChain v1 / LangGraph v1：对齐 `create_agent` 与 middleware 体系
 - 中文优先：默认中文输出、中文情绪识别、中文帮助中心知识库与业务示例
-- 轻量增强 RAG：混合检索、查询规范化、分类推断、子问题拆分、一次改写兜底
+- 轻量增强 RAG：文档型知识库、父块/子块结构化切分、混合检索、查询规范化、分类推断、一次改写兜底
 - Memory 治理：线程级短期记忆、用户级长期记忆、记忆抽取与召回
 - HITL：高风险工具先中断审批，再恢复同一线程执行；显式写操作支持确定性中断
 - FastAPI 演示友好：REST、WebSocket、SSE、Swagger、回归测试
@@ -34,6 +34,8 @@
 - `src/tools/support_tools.py`：账户、订阅、账单、工单、人工升级等业务工具
 - `src/api/main.py`：FastAPI、Swagger、SSE、WebSocket、恢复接口
 - `src/sentiment/analyzer.py`：中文优先情绪识别
+
+默认知识库语料位于 `data/knowledge_base/*.md`，当前包含帮助中心首页、账单异常运营手册和账户安全管理手册。文档已按更接近正式企业文档的方式补长，方便你在 reindex 后直接观察到 `子块数量 > 父块数量`，并在 LangSmith 里看到更细的 section path 命中。
 
 ## 当前技术栈
 
@@ -168,7 +170,7 @@ uv run pytest --cov=src --cov-report=term-missing --cov-report=html
 1. 帮助中心检索路径
    - 问题：`如何重置密码？`
    - 预期：`active_agent = knowledge`
-   - 预期引用：`帮助中心::Customer Support Help Center > 账户与登录 > 重置密码`
+   - 预期引用：`帮助中心::... > 重置密码`
 
 2. 真实业务查询
    - 问题：`帮我查一下当前套餐和下次续费时间`
@@ -176,7 +178,9 @@ uv run pytest --cov=src --cov-report=term-missing --cov-report=html
 
 3. 文档型 RAG 复合问题
    - 问题：`怎么取消套餐，取消后什么时候生效？`
-   - 预期：命中帮助中心文档；本地只看轻量 `route_path/node_timings`，详细过程到 LangSmith 看
+   - 预期：命中帮助中心长文档；本地只看轻量 `route_path/node_timings`，详细过程到 LangSmith 看
+
+在执行 `POST /knowledge/reindex` 后，建议顺手观察一次返回统计。当前默认语料应该更容易出现“父块承接完整政策上下文、子块命中具体步骤/条件”的结构效果，而不是过去短 FAQ 常见的 1:1 切分。
 
 4. HITL 中断与恢复
    - 问题：`请创建一个账单异常工单`
@@ -249,6 +253,7 @@ LANGGRAPH_PERSISTENCE_BACKEND=postgres
 - `/chat` 与 `/resume` 的调试输出改为轻量摘要，详细节点分析统一通过 LangSmith 查看
 - 优化审批响应结构，待审批工具名称和参数预览更清晰
 - 接入 LangSmith tracing，并补齐 `support.resume`、resume 工具调用与后续 `validate/respond` 的可观测性
+- 移除旧 FAQ 兼容层，知识检索统一收口到 document knowledge base
 
 ## 相关文档
 
