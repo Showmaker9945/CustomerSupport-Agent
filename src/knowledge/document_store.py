@@ -54,23 +54,182 @@ class ParsedSection:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class QueryAnalysis:
+    original_query: str
+    expanded_query: str
+    query_tokens: List[str]
+    focus_terms: List[str] = field(default_factory=list)
+    matched_intents: List[str] = field(default_factory=list)
+    inferred_category: Optional[str] = None
+
+
 class DocumentStore:
     """Hybrid document retriever with structure-aware parent/child chunking."""
 
     SUPPORTED_SUFFIXES = {".md", ".markdown", ".txt", ".json"}
     _EMBEDDING_MODEL_CACHE: Dict[str, SentenceTransformer] = {}
     _RERANKER_MODEL_CACHE: Dict[str, Any] = {}
-    QUERY_EXPANSIONS: Dict[str, str] = {
-        "重置密码": "重置密码 忘记密码 登录密码 密码重置",
-        "忘记密码": "忘记密码 重置密码 登录密码 密码重置",
-        "付款方式": "付款方式 支付方式 结算方式 支付",
-        "支付方式": "支付方式 付款方式 结算方式 支付",
-        "取消套餐": "取消套餐 取消订阅 退订 退款规则",
-        "取消订阅": "取消订阅 取消套餐 退订 退款规则",
-        "邀请成员": "邀请成员 邀请团队成员 团队成员 邀请",
-        "api": "API 开发者 接口 API Key 集成",
-        "账单异常": "账单异常 扣费异常 重复扣款 财务复核",
-        "转人工": "转人工 人工客服 人工审核 升级人工",
+    QUERY_EXPANSIONS: Dict[str, Tuple[str, ...]] = {
+        "重置密码": ("忘记密码", "找回密码", "密码恢复", "登录恢复"),
+        "忘记密码": ("重置密码", "找回密码", "密码恢复", "登录恢复"),
+        "邮箱不可用": ("注册邮箱不可用", "原邮箱不可用", "原邮箱停用", "邮箱失效", "无法访问注册邮箱"),
+        "付款方式": ("支付方式", "结算方式", "扣费方式", "支付"),
+        "支付方式": ("付款方式", "结算方式", "扣费方式", "支付"),
+        "取消套餐": ("取消订阅", "关闭自动续费", "退订", "退款规则"),
+        "取消订阅": ("取消套餐", "关闭自动续费", "退订", "退款规则"),
+        "邀请成员": ("邀请团队成员", "团队成员", "新增成员", "成员邀请"),
+        "api": ("开发者", "接口", "API Key", "集成"),
+        "账单异常": ("扣费异常", "重复扣款", "异常收费", "财务复核"),
+        "转人工": ("人工客服", "人工审核", "人工复核", "升级人工"),
+    }
+    QUERY_INTENTS: Tuple[Dict[str, Any], ...] = (
+        {
+            "name": "account_recovery",
+            "triggers": (
+                "重置密码",
+                "忘记密码",
+                "找回密码",
+                "密码恢复",
+                "登录失败",
+                "无法登录",
+                "登不上",
+                "邮箱不可用",
+                "注册邮箱不可用",
+                "原邮箱不可用",
+                "原邮箱停用",
+                "邮箱失效",
+                "收不到重置邮件",
+            ),
+            "expansions": (
+                "密码重置",
+                "找回密码",
+                "登录恢复",
+                "账号恢复",
+                "无法访问注册邮箱",
+                "身份核验",
+                "恢复链接",
+            ),
+            "focus_terms": (
+                "重置密码",
+                "密码恢复",
+                "登录恢复",
+                "邮箱不可用",
+                "注册邮箱不可用",
+                "原邮箱不可用",
+                "身份核验",
+            ),
+            "categories": ("登录恢复",),
+        },
+        {
+            "name": "two_factor_recovery",
+            "triggers": (
+                "2fa",
+                "双重身份验证",
+                "验证码",
+                "验证器",
+                "短信验证",
+                "恢复码",
+                "谷歌验证",
+            ),
+            "expansions": (
+                "验证码 App",
+                "短信验证",
+                "双重验证",
+                "恢复码",
+                "身份核验",
+            ),
+            "focus_terms": ("2FA", "双重身份验证", "验证码", "恢复码", "身份核验"),
+            "categories": ("双重身份验证与恢复码",),
+        },
+        {
+            "name": "permissions_and_transfer",
+            "triggers": (
+                "管理员",
+                "编辑者",
+                "访客",
+                "角色",
+                "提权",
+                "所有权",
+                "owner",
+                "转移",
+                "权限",
+            ),
+            "expansions": (
+                "角色提升",
+                "权限变更",
+                "管理员权限",
+                "账户所有权转移",
+            ),
+            "focus_terms": ("管理员", "角色提升", "权限变更", "所有权转移"),
+            "categories": ("权限与角色变更",),
+        },
+        {
+            "name": "billing_review",
+            "triggers": (
+                "账单",
+                "扣费",
+                "重复扣款",
+                "退款",
+                "续费",
+                "发票",
+                "金额异常",
+                "多扣",
+            ),
+            "expansions": (
+                "账单异常",
+                "扣费异常",
+                "费用构成",
+                "人工复核",
+                "账单核查",
+            ),
+            "focus_terms": ("账单异常", "扣费异常", "重复扣款", "退款", "人工复核"),
+            "categories": ("账单异常分诊", "对账与金额解释", "退款与补偿判断"),
+        },
+        {
+            "name": "ticket_review",
+            "triggers": ("工单", "人工审核", "人工复核", "审批", "升级人工", "转人工"),
+            "expansions": ("工单创建", "人工审核", "人工复核", "升级人工"),
+            "focus_terms": ("工单创建", "人工审核", "人工复核", "升级人工"),
+            "categories": ("工单创建与人工审核", "支持与服务"),
+        },
+    )
+    QUERY_STOPWORDS = {
+        "的",
+        "了",
+        "吗",
+        "呢",
+        "啊",
+        "呀",
+        "吧",
+        "和",
+        "与",
+        "及",
+        "并",
+        "还",
+        "时",
+        "后",
+        "前",
+        "再",
+        "又",
+        "都",
+        "将",
+        "把",
+        "被",
+        "请问",
+        "怎么",
+        "如何",
+        "一下",
+        "一下子",
+        "可以",
+        "能够",
+        "当前",
+        "现在",
+        "问题",
+        "用户",
+        "客服",
+        "你们",
+        "我们",
     }
 
     def __init__(
@@ -197,19 +356,101 @@ class DocumentStore:
             return normalized
         return normalized[: limit - 1].rstrip() + "…"
 
-    def _expand_query(self, query: str) -> str:
+    def _unique_phrases(self, phrases: List[str]) -> List[str]:
+        ordered: List[str] = []
+        for phrase in phrases:
+            cleaned = str(phrase or "").strip()
+            if cleaned and cleaned not in ordered:
+                ordered.append(cleaned)
+        return ordered
+
+    def _analyze_query(self, query: str) -> QueryAnalysis:
         normalized = str(query or "").strip()
         if not normalized:
-            return normalized
-        expanded_parts = [normalized]
-        lowered = normalized.lower()
-        for needle, expansion in self.QUERY_EXPANSIONS.items():
-            if needle.lower() in lowered and expansion not in expanded_parts:
-                expanded_parts.append(expansion)
-        return " ".join(expanded_parts)
+            return QueryAnalysis(original_query="", expanded_query="", query_tokens=[])
 
-    def _title_match_bonus(self, query: str, payload: Dict[str, Any]) -> float:
-        query_tokens = set(self._tokenize_for_bm25(query))
+        lowered = normalized.lower()
+        expanded_terms: List[str] = [normalized]
+        focus_terms: List[str] = []
+        matched_intents: List[str] = []
+        category_scores: Dict[str, int] = {}
+
+        for needle, expansions in self.QUERY_EXPANSIONS.items():
+            if needle.lower() not in lowered:
+                continue
+            expanded_terms.extend(list(expansions))
+            focus_terms.append(needle)
+
+        for intent in self.QUERY_INTENTS:
+            triggers = [str(item or "").lower() for item in intent.get("triggers", ())]
+            if not any(trigger in lowered for trigger in triggers):
+                continue
+            matched_intents.append(str(intent.get("name") or "unknown"))
+            expanded_terms.extend([str(item) for item in intent.get("expansions", ())])
+            focus_terms.extend([str(item) for item in intent.get("focus_terms", ())])
+            for category in intent.get("categories", ()):
+                normalized_category = str(category or "").strip()
+                if normalized_category:
+                    category_scores[normalized_category] = category_scores.get(normalized_category, 0) + 1
+
+        query_tokens = self._tokenize_for_bm25(normalized)
+        if not focus_terms:
+            focus_terms = [token for token in query_tokens if len(token) >= 2]
+
+        inferred_category = None
+        if category_scores:
+            inferred_category = max(
+                category_scores.items(),
+                key=lambda item: (item[1], len(item[0])),
+            )[0]
+
+        expanded_query = " ".join(self._unique_phrases(expanded_terms))
+        return QueryAnalysis(
+            original_query=normalized,
+            expanded_query=expanded_query,
+            query_tokens=query_tokens,
+            focus_terms=self._unique_phrases([term for term in focus_terms if len(term) >= 2]),
+            matched_intents=self._unique_phrases(matched_intents),
+            inferred_category=inferred_category,
+        )
+
+    def _expand_query(self, query: str) -> str:
+        return self._analyze_query(query).expanded_query
+
+    def _focus_match_bonus(self, analysis: QueryAnalysis, payload: Dict[str, Any]) -> float:
+        if not analysis.focus_terms:
+            return 0.0
+        section_text = " ".join(
+            [
+                str(payload.get("title", "") or ""),
+                str(payload.get("section_path", "") or ""),
+                str(payload.get("category", "") or ""),
+            ]
+        ).lower()
+        content_text = str(payload.get("content", "") or "").lower()
+        section_hits = 0
+        content_hits = 0
+        for term in analysis.focus_terms:
+            lowered_term = term.lower()
+            if lowered_term in section_text:
+                section_hits += 1
+                continue
+            if lowered_term in content_text:
+                content_hits += 1
+        total_hits = section_hits + content_hits
+        if total_hits == 0:
+            return 0.0
+        coverage = total_hits / max(1, len(analysis.focus_terms))
+        section_coverage = section_hits / max(1, len(analysis.focus_terms))
+        bonus = coverage * 0.18 + section_coverage * 0.16
+        if section_hits and content_hits:
+            bonus += 0.04
+        if coverage >= 0.95 and len(analysis.focus_terms) > 1:
+            bonus += 0.08
+        return min(0.46, bonus)
+
+    def _title_match_bonus(self, analysis: QueryAnalysis, payload: Dict[str, Any]) -> float:
+        query_tokens = set(analysis.query_tokens)
         if not query_tokens:
             return 0.0
         title_text = " ".join(
@@ -220,10 +461,17 @@ class DocumentStore:
         ).strip()
         title_tokens = set(self._tokenize_for_bm25(title_text))
         overlap = len(query_tokens & title_tokens) / max(1, len(query_tokens))
-        compact_query = re.sub(r"\s+", "", query)
+        compact_query = re.sub(r"\s+", "", analysis.original_query)
         compact_title = re.sub(r"\s+", "", title_text)
         exact_bonus = 0.18 if compact_query and compact_query in compact_title else 0.0
         return min(0.36, overlap * 0.24 + exact_bonus)
+
+    def _category_match_bonus(self, analysis: QueryAnalysis, payload: Dict[str, Any]) -> float:
+        inferred_category = str(analysis.inferred_category or "").strip()
+        payload_category = str(payload.get("category", "") or "").strip()
+        if not inferred_category or not payload_category:
+            return 0.0
+        return 0.14 if inferred_category == payload_category else 0.0
 
     def _stable_doc_id(self, source_path: str) -> str:
         return hashlib.md5(source_path.encode("utf-8")).hexdigest()
@@ -463,8 +711,9 @@ class DocumentStore:
         title = chunk.get("title", "")
         section_path = chunk.get("section_path", "")
         document_title = chunk.get("metadata", {}).get("document_title", "")
+        category = chunk.get("category", "")
         content = chunk.get("content", "")
-        parts = [part for part in [document_title, section_path, title, content] if part]
+        parts = [part for part in [document_title, category, section_path, title, content] if part]
         return "\n".join(parts)
 
     def _refresh_keyword_index(self) -> None:
@@ -484,10 +733,14 @@ class DocumentStore:
             "".join(chinese_chars[index : index + 2])
             for index in range(max(0, len(chinese_chars) - 1))
         ]
+        chinese_trigrams = [
+            "".join(chinese_chars[index : index + 3])
+            for index in range(max(0, len(chinese_chars) - 2))
+        ]
         ordered: List[str] = []
-        for token in [*english_tokens, *chinese_chars, *chinese_bigrams]:
+        for token in [*english_tokens, *chinese_chars, *chinese_bigrams, *chinese_trigrams]:
             cleaned = token.strip()
-            if cleaned and cleaned not in ordered:
+            if cleaned and cleaned not in self.QUERY_STOPWORDS and cleaned not in ordered:
                 ordered.append(cleaned)
         return ordered
 
@@ -568,6 +821,8 @@ class DocumentStore:
                 + settings.rag_keyword_weight * candidate["keyword_score"]
                 + candidate["rrf_score"]
                 + candidate.get("title_bonus", 0.0)
+                + candidate.get("focus_bonus", 0.0)
+                + candidate.get("category_bonus", 0.0)
                 + 0.25 * rerank_score
             )
             group = grouped.setdefault(
@@ -583,6 +838,7 @@ class DocumentStore:
                 {
                     "chunk_id": chunk_id,
                     "score": combined,
+                    "title": payload.get("title", ""),
                     "preview": self._preview_text(payload.get("content", ""), limit=120),
                 }
             )
@@ -595,12 +851,14 @@ class DocumentStore:
         results: List[KnowledgeResult] = []
         for row in rows:
             parent = row["parent"]
+            matched_chunks = sorted(row["matched_chunks"], key=lambda item: item["score"], reverse=True)
+            best_match_preview = matched_chunks[0]["preview"] if matched_chunks else self._preview_text(parent.get("content", ""))
             leaf_title = parent.get("title") or parent.get("section_path") or parent.get("metadata", {}).get("document_title", "Knowledge")
             confidence = min(0.99, max(0.15, row["best_score"] / best_score))
             results.append(
                 KnowledgeResult(
                     question=leaf_title,
-                    answer=self._preview_text(parent.get("content", "")),
+                    answer=best_match_preview,
                     category=parent.get("category", "general"),
                     confidence=confidence,
                     metadata={
@@ -608,7 +866,7 @@ class DocumentStore:
                         "source_path": parent.get("metadata", {}).get("source_path", ""),
                         "section_path": parent.get("section_path", ""),
                         "parent_chunk_id": parent.get("chunk_id"),
-                        "matched_chunks": row["matched_chunks"],
+                        "matched_chunks": matched_chunks,
                     },
                 )
             )
@@ -725,59 +983,109 @@ class DocumentStore:
             }
             return []
 
-        expanded_query = self._expand_query(normalized_query)
+        analysis = self._analyze_query(normalized_query)
+        search_plans: List[Dict[str, Any]] = []
+        if category:
+            search_plans.append({"label": "explicit", "category": category, "bonus": 0.18})
+        else:
+            inferred_category = str(analysis.inferred_category or "").strip()
+            if inferred_category:
+                search_plans.append({"label": "inferred", "category": inferred_category, "bonus": 0.14})
+            search_plans.append({"label": "global", "category": None, "bonus": 0.0})
 
         candidate_map: Dict[str, Dict[str, Any]] = {}
-        vector_hits = self._vector_search(expanded_query, category=category, top_n=max(8, top_k * 4))
-        keyword_hits = self._keyword_search(expanded_query, category=category, top_n=max(8, top_k * 4))
+        total_vector_hits = 0
+        total_keyword_hits = 0
+        plan_trace: List[Dict[str, Any]] = []
 
-        for rank, (payload, score) in enumerate(vector_hits, 1):
-            row = candidate_map.setdefault(
-                payload["chunk_id"],
-                {
-                    "payload": payload,
-                    "vector_score": 0.0,
-                    "keyword_score": 0.0,
-                    "rrf_score": 0.0,
-                    "title_bonus": self._title_match_bonus(expanded_query, payload),
-                },
+        for plan in search_plans:
+            plan_category = plan["category"]
+            plan_bonus = float(plan.get("bonus", 0.0))
+            vector_hits = self._vector_search(
+                analysis.expanded_query,
+                category=plan_category,
+                top_n=max(8, top_k * 4),
             )
-            row["vector_score"] = max(row["vector_score"], score)
-            row["rrf_score"] += settings.rag_vector_weight * (1.0 / (settings.rag_fusion_k + rank))
+            keyword_hits = self._keyword_search(
+                analysis.expanded_query,
+                category=plan_category,
+                top_n=max(8, top_k * 4),
+            )
+            total_vector_hits += len(vector_hits)
+            total_keyword_hits += len(keyword_hits)
+            plan_trace.append(
+                {
+                    "label": plan["label"],
+                    "category": plan_category,
+                    "vector_hits": len(vector_hits),
+                    "keyword_hits": len(keyword_hits),
+                }
+            )
 
-        for rank, (payload, score) in enumerate(keyword_hits, 1):
-            row = candidate_map.setdefault(
-                payload["chunk_id"],
-                {
-                    "payload": payload,
-                    "vector_score": 0.0,
-                    "keyword_score": 0.0,
-                    "rrf_score": 0.0,
-                    "title_bonus": self._title_match_bonus(expanded_query, payload),
-                },
-            )
-            row["keyword_score"] = max(row["keyword_score"], score)
-            row["rrf_score"] += settings.rag_keyword_weight * (1.0 / (settings.rag_fusion_k + rank))
+            for rank, (payload, score) in enumerate(vector_hits, 1):
+                row = candidate_map.setdefault(
+                    payload["chunk_id"],
+                    {
+                        "payload": payload,
+                        "vector_score": 0.0,
+                        "keyword_score": 0.0,
+                        "rrf_score": 0.0,
+                        "title_bonus": self._title_match_bonus(analysis, payload),
+                        "focus_bonus": self._focus_match_bonus(analysis, payload),
+                        "category_bonus": self._category_match_bonus(analysis, payload),
+                    },
+                )
+                row["vector_score"] = max(row["vector_score"], score)
+                row["rrf_score"] += settings.rag_vector_weight * (1.0 / (settings.rag_fusion_k + rank))
+                if plan_category and payload.get("category") == plan_category:
+                    row["category_bonus"] = max(row["category_bonus"], plan_bonus)
+
+            for rank, (payload, score) in enumerate(keyword_hits, 1):
+                row = candidate_map.setdefault(
+                    payload["chunk_id"],
+                    {
+                        "payload": payload,
+                        "vector_score": 0.0,
+                        "keyword_score": 0.0,
+                        "rrf_score": 0.0,
+                        "title_bonus": self._title_match_bonus(analysis, payload),
+                        "focus_bonus": self._focus_match_bonus(analysis, payload),
+                        "category_bonus": self._category_match_bonus(analysis, payload),
+                    },
+                )
+                row["keyword_score"] = max(row["keyword_score"], score)
+                row["rrf_score"] += settings.rag_keyword_weight * (1.0 / (settings.rag_fusion_k + rank))
+                if plan_category and payload.get("category") == plan_category:
+                    row["category_bonus"] = max(row["category_bonus"], plan_bonus)
 
         ranked_candidates = sorted(
             candidate_map.values(),
             key=lambda item: (
-                item["rrf_score"] + item["vector_score"] + item["keyword_score"] + item.get("title_bonus", 0.0),
+                item["rrf_score"]
+                + item["vector_score"]
+                + item["keyword_score"]
+                + item.get("title_bonus", 0.0)
+                + item.get("focus_bonus", 0.0)
+                + item.get("category_bonus", 0.0),
                 item["payload"].get("chunk_id", ""),
             ),
             reverse=True,
         )
-        results = self._group_to_parent_results(expanded_query, ranked_candidates)
+        results = self._group_to_parent_results(analysis.expanded_query, ranked_candidates)
         limited = results[: max(1, top_k)]
         self._last_query_trace = {
             "query": normalized_query,
-            "expanded_query": expanded_query if expanded_query != normalized_query else "",
-            "effective_category": category,
-            "vector_hits": len(vector_hits),
-            "keyword_hits": len(keyword_hits),
+            "expanded_query": analysis.expanded_query if analysis.expanded_query != normalized_query else "",
+            "effective_category": category or analysis.inferred_category,
+            "inferred_category": analysis.inferred_category or "",
+            "matched_intents": analysis.matched_intents,
+            "focus_terms": analysis.focus_terms,
+            "vector_hits": total_vector_hits,
+            "keyword_hits": total_keyword_hits,
             "candidate_count": len(ranked_candidates),
             "results": len(limited),
             "documents_indexed": len(list_knowledge_documents()),
+            "search_plans": plan_trace,
         }
         return limited
 

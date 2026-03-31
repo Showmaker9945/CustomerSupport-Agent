@@ -70,6 +70,42 @@ def test_document_store_parent_child_chunking_creates_finer_grained_children(tmp
     assert "账单异常" in results[0].question or "账单异常" in results[0].answer
 
 
+def test_document_store_prefers_account_recovery_section_for_unavailable_email_query(tmp_path, isolated_business_db):
+    knowledge_dir = tmp_path / "knowledge"
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    (knowledge_dir / "account.md").write_text(
+        (
+            "# 账户访问与安全管理指南\n\n"
+            "## 登录恢复\n\n"
+            "### 注册邮箱不可用时的身份核验\n\n"
+            "如果用户原邮箱不可用、原邮箱停用、邮箱失效，或离职后收不到重置邮件，"
+            "不能直接改绑邮箱或直接发送新密码。客服应先收集身份核验材料，再进入人工审核。\n"
+        ),
+        encoding="utf-8",
+    )
+    (knowledge_dir / "billing.md").write_text(
+        (
+            "# 账单异常处理手册\n\n"
+            "## 工单创建与人工审核\n\n"
+            "### 创建账单异常核查工单\n\n"
+            "如果用户认为账单金额异常，可以补充账单号、金额和支付方式，再进入人工审核流程。\n"
+        ),
+        encoding="utf-8",
+    )
+
+    store = create_document_store(
+        knowledge_base_path=knowledge_dir,
+        chroma_path=tmp_path / "chroma",
+    )
+    store.reindex(clear_existing=True)
+    results = store.search_hybrid("邮箱不可用时还能怎么重置密码？", top_k=3)
+
+    assert results
+    assert results[0].metadata["document_title"] == "账户访问与安全管理指南"
+    assert "注册邮箱不可用时的身份核验" in results[0].metadata["section_path"]
+    assert "身份核验" in results[0].answer or "原邮箱不可用" in results[0].answer
+
+
 def test_semantic_memory_store_persists_and_searches(tmp_path, isolated_business_db):
     store = SemanticMemoryStore(chroma_path=tmp_path / "chroma")
     store.upsert_memory(
