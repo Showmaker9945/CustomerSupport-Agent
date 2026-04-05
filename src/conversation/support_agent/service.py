@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.types import Command
 from langsmith import Client as LangSmithClient, trace, tracing_context
@@ -48,11 +48,13 @@ from ...tools.support_tools import (
     lookup_account,
     reindex_knowledge_base,
     search_knowledge_base,
+    search_knowledge_base_bundle,
     update_ticket,
 )
 from .graph import (
     ACCOUNT_HINTS,
     ESCALATION_HINTS,
+    EvidenceItem,
     QUESTION_HINTS,
     REQUEST_HINTS,
     TICKET_HINTS,
@@ -62,19 +64,21 @@ from .graph import (
     SupportResponse,
     as_bool,
     append_node_timing,
+    build_citations_from_evidence_items,
     build_trace_event,
     build_execution_steps,
     build_neutral_sentiment,
-    extract_citations,
     extract_json_payload,
     infer_intent,
     infer_risk,
+    merge_evidence_items,
     merge_unique,
     normalize_intent,
     normalize_risk,
     normalize_sentiment_label,
     normalize_execution_steps,
     safe_float,
+    strip_source_annotations,
     ticket_id_from_text,
     is_positive_escalation_text,
 )
@@ -763,10 +767,29 @@ class SupportAgent:
     def _is_billing_ticket_request(self, message: str) -> bool:
         lowered = message.lower()
         billing_tokens = ("账单", "发票", "扣费", "扣款", "invoice", "billing", "charge")
-        ticket_tokens = ("工单", "创建", "新建", "异常", "申请", "ticket")
-        return any(token in lowered for token in billing_tokens) and any(
-            token in lowered for token in ticket_tokens
+        if not any(token in lowered for token in billing_tokens):
+            return False
+        if self._is_billing_ticket_process_query(message):
+            return False
+        has_ticket_context = any(token in lowered for token in ("工单", "ticket", "异常"))
+        direct_request_tokens = (
+            "帮我创建",
+            "请创建",
+            "给我创建",
+            "帮我新建",
+            "请帮我新建",
+            "帮我提交",
+            "请帮我提交",
+            "帮我开",
+            "开一个",
+            "新建一个",
+            "提交一个",
+            "发起一个",
         )
+        has_direct_request = any(token in lowered for token in direct_request_tokens)
+        has_request_intent = any(token in lowered for token in ("帮我", "请", "现在", "立刻", "马上"))
+        has_create_verb = any(token in lowered for token in ("创建", "新建", "提交", "发起", "申请", "开"))
+        return has_ticket_context and (has_direct_request or (has_request_intent and has_create_verb))
 
     def _is_invoice_explanation_query(self, message: str) -> bool:
         lowered = message.lower()
@@ -784,57 +807,182 @@ class SupportAgent:
             token in lowered for token in lookup_tokens
         )
 
-    def _run_structured_knowledge_lookup(self, message: str) -> Optional[str]:
-        if self._is_subscription_policy_query(message):
-            lowered = message.lower()
-            if any(token in lowered for token in ("升级", "降级", "变更", "切换")):
-                return (
-                    "套餐变更说明：\n"
-                    "你可以在“设置 > 账单 > 订阅管理”中升级或降级套餐。\n"
-                    "升级会立即生效并按比例补差价；降级会在下一个计费周期开始时生效。\n"
-                    "下一步：如果你告诉我想升级还是降级，我可以继续指导你操作。\n"
-                    "来源：帮助中心::Customer Support Help Center > 订阅与账单 > 套餐升级、降级与席位变更"
-                )
-            return (
-                "取消订阅说明：\n"
-                "你可以在“设置 > 账单 > 订阅管理”中取消套餐。\n"
-                "取消后服务会持续到当前计费周期结束，已使用周期通常不支持按天退款。\n"
-                "下一步：如果你想先确认当前套餐和续费时间，我也可以继续帮你查询。\n"
-                "来源：帮助中心::Customer Support Help Center > 订阅与账单 > 取消订阅与退款规则"
+    def _is_billing_ticket_process_query(self, message: str) -> bool:
+        lowered = message.lower()
+        billing_tokens = ("账单", "发票", "扣费", "扣款", "invoice", "billing", "charge")
+        if not any(token in lowered for token in billing_tokens):
+            return False
+        if not any(token in lowered for token in ("工单", "ticket")):
+            return False
+        process_tokens = (
+            "创建后",
+            "提交后",
+            "通过后",
+            "之后",
+            "流程",
+            "说明",
+            "会发生什么",
+            "会怎么样",
+            "多久",
+            "审核",
+            "审批",
+            "状态",
+            "进度",
+            "需要多久",
+        )
+        question_tokens = ("什么", "如何", "怎么", "为什么", "吗", "？", "?")
+        return any(token in lowered for token in process_tokens) or any(
+            token in message for token in question_tokens
+        )
+
+    def _run_knowledge_lookup_bundle(self, message: str) -> Dict[str, Any]:
+        try:
+            bundle = search_knowledge_base_bundle(query=message, category=None)
+        except Exception as error:
+            logger.error(f"Structured knowledge lookup failed: {error}")
+            return {
+                "text": f"知识检索失败：{error}",
+                "evidence_items": [],
+                "trace": {},
+                "result_count": 0,
+            }
+
+        return {
+            "text": strip_source_annotations(str(bundle.get("text", "") or "")),
+            "evidence_items": list(bundle.get("evidence_items", [])),
+            "trace": dict(bundle.get("trace", {}) or {}),
+            "result_count": int(bundle.get("result_count", 0) or 0),
+        }
+
+    def _tool_source_label(self, tool_name: str) -> str:
+        return f"Support Tools::{self._tool_label(tool_name)}"
+
+    def _build_tool_evidence_item(
+        self,
+        *,
+        tool_name: str,
+        text: str,
+        tool_args: Optional[Dict[str, Any]] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> Optional[EvidenceItem]:
+        snippet = strip_source_annotations(str(text or "")).strip()
+        if not snippet:
+            return None
+        return {
+            "evidence_id": f"tool:{tool_name}:{tool_call_id or hashlib.md5(snippet.encode('utf-8')).hexdigest()[:12]}",
+            "kind": "tool",
+            "source_type": "support_tool",
+            "source_label": self._tool_source_label(tool_name),
+            "snippet": snippet[:220],
+            "tool_name": tool_name,
+            "tool_label": self._tool_label(tool_name),
+            "metadata": {
+                "tool_call_id": tool_call_id,
+                "tool_args": dict(tool_args or {}),
+            },
+        }
+
+    def _tool_bundle(
+        self,
+        *,
+        tool_name: str,
+        text: str,
+        tool_args: Optional[Dict[str, Any]] = None,
+        tool_source: str = "Support Tools",
+        ticket_id: Optional[str] = None,
+        escalated: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        evidence_item = self._build_tool_evidence_item(
+            tool_name=tool_name,
+            text=text,
+            tool_args=tool_args,
+        )
+        bundle: Dict[str, Any] = {
+            "text": strip_source_annotations(text),
+            "evidence_items": [evidence_item] if evidence_item else [],
+            "tool_source": tool_source,
+        }
+        if ticket_id is not None:
+            bundle["ticket_id"] = ticket_id
+        if escalated is not None:
+            bundle["escalated"] = escalated
+        return bundle
+
+    def _extract_tool_evidence_items(self, result: Dict[str, Any]) -> List[EvidenceItem]:
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        evidence_items: List[EvidenceItem] = []
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            tool_name = str(getattr(message, "name", "") or "unknown_tool")
+            evidence_item = self._build_tool_evidence_item(
+                tool_name=tool_name,
+                text=str(message.content or ""),
+                tool_call_id=str(getattr(message, "tool_call_id", "") or ""),
             )
-        return None
+            if evidence_item:
+                evidence_items.append(evidence_item)
+        return self._merge_evidence_items([], evidence_items)
 
     def _run_structured_business_action(
         self,
         *,
         user_id: str,
         message: str,
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, Any]]:
         if self._is_subscription_status_query(message):
-            return get_subscription_status.invoke({"user_id": user_id})
+            text = get_subscription_status.invoke({"user_id": user_id})
+            return self._tool_bundle(
+                tool_name="get_subscription_status",
+                text=text,
+                tool_args={"user_id": user_id},
+            )
 
         if self._is_billing_ticket_request(message):
             # 写操作必须走带 HITL 的 action agent，避免绕过审批中间件。
             if self.llm_enabled:
                 return None
-            return create_ticket.invoke(
-                {
-                    "user_id": user_id,
-                    "subject": "账单异常核查",
-                    "description": message,
-                    "priority": "high",
-                    "category": "billing",
-                }
+            tool_args = {
+                "user_id": user_id,
+                "subject": "账单异常核查",
+                "description": message,
+                "priority": "high",
+                "category": "billing",
+            }
+            text = create_ticket.invoke(tool_args)
+            return self._tool_bundle(
+                tool_name="create_ticket",
+                text=text,
+                tool_args=tool_args,
+                ticket_id=self._tool_result_ticket_id("create_ticket", text),
             )
 
         if self._is_invoice_explanation_query(message):
             latest_invoice = get_latest_invoice_record(user_id)
             if latest_invoice:
-                return explain_invoice_charge.invoke({"invoice_id": latest_invoice["invoice_id"]})
-            return get_latest_invoice.invoke({"user_id": user_id})
+                tool_args = {"invoice_id": latest_invoice["invoice_id"]}
+                text = explain_invoice_charge.invoke(tool_args)
+                return self._tool_bundle(
+                    tool_name="explain_invoice_charge",
+                    text=text,
+                    tool_args=tool_args,
+                )
+            tool_args = {"user_id": user_id}
+            text = get_latest_invoice.invoke(tool_args)
+            return self._tool_bundle(
+                tool_name="get_latest_invoice",
+                text=text,
+                tool_args=tool_args,
+            )
 
         if self._is_invoice_lookup_query(message):
-            return get_latest_invoice.invoke({"user_id": user_id})
+            tool_args = {"user_id": user_id}
+            text = get_latest_invoice.invoke(tool_args)
+            return self._tool_bundle(
+                tool_name="get_latest_invoice",
+                text=text,
+                tool_args=tool_args,
+            )
 
         return None
 
@@ -1090,10 +1238,11 @@ class SupportAgent:
         baseline_risk: str,
         baseline_sentiment: SentimentResult,
     ) -> Dict[str, Any]:
+        billing_ticket_process_query = self._is_billing_ticket_process_query(message)
         needs_knowledge = baseline_intent in {"question", "complaint"}
         needs_action = baseline_intent == "request" or any(
             token in message.lower() for token in self.TICKET_HINTS + self.ACCOUNT_HINTS
-        )
+        ) and not billing_ticket_process_query
         needs_escalation = baseline_risk == "high"
 
         intent = baseline_intent
@@ -1174,6 +1323,15 @@ class SupportAgent:
             execution_steps = []
             needs_action_after_knowledge = False
             route_reason = f"{route_reason}+billing_action"
+
+        if billing_ticket_process_query:
+            intent = "question"
+            needs_knowledge = True
+            needs_action = False
+            selected_agent = "knowledge"
+            execution_steps = []
+            needs_action_after_knowledge = False
+            route_reason = f"{route_reason}+billing_ticket_process"
 
         if self._is_billing_ticket_request(message):
             intent = "request"
@@ -1274,11 +1432,18 @@ class SupportAgent:
     def _merge_unique(self, left: List[str], right: List[str]) -> List[str]:
         return merge_unique(left, right)
 
+    def _merge_evidence_items(
+        self,
+        left: List[EvidenceItem],
+        right: List[EvidenceItem],
+    ) -> List[EvidenceItem]:
+        return merge_evidence_items(left, right)
+
+    def _citations_from_state(self, state: OrchestrationState) -> List[str]:
+        return build_citations_from_evidence_items(state.get("evidence_items", []))
+
     def _ticket_id_from_text(self, text: str) -> Optional[str]:
         return ticket_id_from_text(text)
-
-    def _extract_citations(self, text: str) -> List[str]:
-        return extract_citations(text)
 
     def _is_positive_escalation_text(self, text: str) -> bool:
         return is_positive_escalation_text(text)
@@ -1554,6 +1719,7 @@ class SupportAgent:
         trace_details: Optional[Dict[str, Any]] = None,
         tool_source: Optional[str] = None,
         explicit_ticket_id: Optional[str] = None,
+        evidence_items: Optional[List[EvidenceItem]] = None,
         preserve_ticket_lookup: bool = True,
         langsmith: Optional[Dict[str, Any]] = None,
     ) -> SupportResponse:
@@ -1570,9 +1736,9 @@ class SupportAgent:
         merged_state["active_agent"] = role
         merged_state["run_status"] = "completed"
         merged_state["interrupts"] = []
-        merged_state["citations"] = self._merge_unique(
-            merged_state.get("citations", []),
-            self._extract_citations(resumed_text),
+        merged_state["evidence_items"] = self._merge_evidence_items(
+            merged_state.get("evidence_items", []),
+            evidence_items or [],
         )
         merged_state["trace_events"] = [
             *merged_state.get("trace_events", []),
@@ -1586,9 +1752,9 @@ class SupportAgent:
         ]
 
         if role == "knowledge":
-            merged_state["retrieval_text"] = resumed_text
+            merged_state["retrieval_text"] = strip_source_annotations(resumed_text)
         if role in {"action", "escalation"}:
-            merged_state["tool_text"] = resumed_text
+            merged_state["tool_text"] = strip_source_annotations(resumed_text)
             if tool_source:
                 merged_state["tool_source"] = tool_source
             if merged_state.get("ticket_id") is None:
@@ -1609,6 +1775,7 @@ class SupportAgent:
             trace_id=trace_id,
         )
         response_message = merged_state.get("final_message", resumed_text)
+        citations = self._citations_from_state(merged_state)
 
         self._pending_role.pop(thread_id, None)
         self._pending_state.pop(thread_id, None)
@@ -1622,7 +1789,7 @@ class SupportAgent:
             run_status="completed",
             metadata={
                 "trace_id": trace_id,
-                "citations": merged_state.get("citations", []),
+                "citations": citations,
                 "ticket_id": merged_state.get("ticket_id"),
                 "resumed": True,
             },
@@ -1655,7 +1822,7 @@ class SupportAgent:
             ticket_created=merged_state.get("ticket_id"),
             thread_id=thread_id,
             run_status="completed",
-            citations=merged_state.get("citations", []),
+            citations=citations,
             active_agent=merged_state.get("selected_agent", role),
             trace_id=trace_id,
             route_path=merged_state.get("route_path", []),
@@ -1688,11 +1855,9 @@ class SupportAgent:
 
         lowered = message.lower()
         if role == "knowledge":
-            structured_lookup = self._run_structured_knowledge_lookup(message)
-            if structured_lookup is not None:
-                return intro + structured_lookup
             try:
-                return intro + search_knowledge_base.invoke({"query": message, "category": None})
+                bundle = self._run_knowledge_lookup_bundle(message)
+                return intro + str(bundle.get("text", "")).strip()
             except Exception as error:
                 return intro + f"知识检索失败：{error}"
 
@@ -1735,11 +1900,11 @@ class SupportAgent:
         if role == "responder":
             response_parts: List[str] = []
             if retrieval_text:
-                response_parts.append(retrieval_text)
+                response_parts.append(strip_source_annotations(retrieval_text))
             if tool_text:
-                response_parts.append(tool_text)
+                response_parts.append(strip_source_annotations(tool_text))
             if response_parts:
-                return intro + "\n\n".join(response_parts)
+                return strip_source_annotations(intro + "\n\n".join(response_parts))
             return (
                 intro
                 + "我可以帮助你处理产品使用、账单账户、技术排障与工单问题。"
@@ -2137,6 +2302,7 @@ class SupportAgent:
             "retrieval_text": "",
             "tool_text": "",
             "tool_source": "",
+            "evidence_items": [],
             "validation_notes": [],
             "validation_passed": True,
             "final_message": "",
@@ -2207,7 +2373,7 @@ class SupportAgent:
                     thread_id=thread,
                     run_status="completed",
                     interrupts=[],
-                    citations=self._extract_citations(fallback),
+                    citations=[],
                     active_agent=initial_state["selected_agent"],
                     trace_id=trace_id,
                     route_path=["fallback"],
@@ -2268,6 +2434,7 @@ class SupportAgent:
                 self._refresh_thread_summary_if_needed(thread)
                 sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
                 approval = self._build_approval_payload(final_state.get("interrupts", []))
+                citations = self._citations_from_state(final_state)
                 return SupportResponse(
                     message=wait_message,
                     intent=final_state.get("intent", "other"),
@@ -2278,7 +2445,7 @@ class SupportAgent:
                     thread_id=thread,
                     run_status="interrupted",
                     interrupts=final_state.get("interrupts", []),
-                    citations=final_state.get("citations", []),
+                    citations=citations,
                     active_agent=pending_role,
                     trace_id=trace_id,
                     route_path=final_state.get("route_path", []),
@@ -2300,7 +2467,7 @@ class SupportAgent:
             response_message = final_state.get("final_message") or final_state.get("tool_text") or final_state.get(
                 "retrieval_text"
             ) or "抱歉，我暂时无法给出有效回复。"
-            citations = final_state.get("citations", [])
+            citations = self._citations_from_state(final_state)
             ticket_id = final_state.get("ticket_id") or self._ticket_id_from_text(response_message)
             active_agent = final_state.get("selected_agent", "supervisor")
             sentiment = self._build_sentiment_result(baseline_sentiment, final_state)
@@ -2524,6 +2691,7 @@ class SupportAgent:
                 }
                 tool_source = "Approval Decision"
                 explicit_ticket_id: Optional[str] = None
+                resumed_evidence_items: List[EvidenceItem] = []
 
                 role_started = perf_counter()
                 if decision_type == "reject":
@@ -2583,6 +2751,13 @@ class SupportAgent:
                         resumed_text = str(tool.invoke(tool_args, config=tool_config))
                     tool_source = "Support Tools"
                     explicit_ticket_id = self._tool_result_ticket_id(tool_name, resumed_text)
+                    evidence_item = self._build_tool_evidence_item(
+                        tool_name=tool_name,
+                        text=resumed_text,
+                        tool_args=tool_args,
+                    )
+                    if evidence_item:
+                        resumed_evidence_items.append(evidence_item)
 
                 role_elapsed_ms = (perf_counter() - role_started) * 1000
                 return self._complete_resumed_turn(
@@ -2599,6 +2774,7 @@ class SupportAgent:
                     trace_details=trace_details,
                     tool_source=tool_source,
                     explicit_ticket_id=explicit_ticket_id,
+                    evidence_items=resumed_evidence_items,
                     preserve_ticket_lookup=False,
                     langsmith=resume_langsmith,
                 )
@@ -2769,6 +2945,11 @@ class SupportAgent:
             )
 
         resumed_text = self._extract_ai_text(result)
+        resumed_evidence_items = (
+            self._extract_tool_evidence_items(result)
+            if role in {"action", "escalation"}
+            else []
+        )
         return self._complete_resumed_turn(
             thread_id=thread_id,
             user_id=user_id,
@@ -2782,6 +2963,7 @@ class SupportAgent:
             trace_summary="审批完成，继续执行图流程。",
             trace_details=None,
             tool_source="Support Tools" if role in {"action", "escalation"} else None,
+            evidence_items=resumed_evidence_items,
         )
 
     def stream_chat(

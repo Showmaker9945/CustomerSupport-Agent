@@ -55,6 +55,30 @@ def test_route_to_action_agent(agent):
     assert response.route_path == ["analyze", "action", "validate", "respond"]
 
 
+def test_knowledge_citations_are_derived_from_structured_evidence(agent):
+    response = agent.chat(user_id="citation_user", message="如何重置密码？")
+
+    assert response.run_status == "completed"
+    assert response.citations
+    assert all(citation.startswith("帮助中心::") for citation in response.citations)
+    assert "来源：" not in response.message
+
+
+def test_hallucinated_source_line_is_stripped_from_responder_output(agent):
+    agent.llm_enabled = True
+    agent.basic_model = None
+    agent.role_agents = {
+        "responder": _FakeRoleAgent("你可以通过找回流程重置密码。\n来源：官方《不存在的文档》。"),
+    }
+
+    response = agent.chat(user_id="fake_source_user", message="如何重置密码？")
+
+    assert response.run_status == "completed"
+    assert response.citations
+    assert "不存在的文档" not in response.message
+    assert all("不存在的文档" not in citation for citation in response.citations)
+
+
 def test_route_to_escalation(agent):
     response = agent.chat(user_id="user_e", message="我要投诉并要求人工经理现在处理")
 
@@ -302,6 +326,15 @@ def test_billing_ticket_request_requires_hitl_when_llm_enabled(monkeypatch, isol
     agent.close()
 
 
+def test_billing_ticket_process_question_routes_to_knowledge(agent):
+    response = agent.chat(user_id="billing_process_user", message="账单异常工单创建后会发生什么？")
+
+    assert response.run_status == "completed"
+    assert response.active_agent == "knowledge"
+    assert response.route_path == ["analyze", "knowledge", "validate", "respond"]
+    assert response.citations
+
+
 class _FakeRoleAgent:
     def __init__(self, text: str):
         self.text = text
@@ -434,6 +467,83 @@ def test_deterministic_resume_reject_skips_tool_execution(agent):
     assert "取消" in resumed.message or "未执行" in resumed.message
     assert "Approval Decision" in resumed.sources
     assert list_ticket_records("resume_reject_user") == []
+
+
+def test_resume_merges_existing_knowledge_evidence_with_new_tool_evidence(agent):
+    agent.llm_enabled = True
+    agent.basic_model = None
+    agent.role_agents = {
+        "action": _FakeRoleAgent("unused"),
+        "responder": _FakeRoleAgent("已为你创建账单异常工单，后续会继续跟进。"),
+    }
+
+    thread_id = "thread-resume-evidence"
+    agent._thread_user[thread_id] = "resume_evidence_user"
+    agent._trace_by_thread[thread_id] = "trace-resume-evidence"
+    agent._pending_role[thread_id] = "action"
+    agent._pending_state[thread_id] = {
+        "user_id": "resume_evidence_user",
+        "thread_id": thread_id,
+        "current_message": "帮我创建一个账单异常工单",
+        "intent": "request",
+        "risk": "medium",
+        "selected_agent": "action",
+        "active_agent": "action",
+        "route_path": ["analyze", "knowledge", "action"],
+        "trace_events": [
+            build_trace_event(node="analyze", agent="supervisor", summary="已完成路由决策。"),
+            build_trace_event(node="knowledge", agent="knowledge", summary="已完成知识检索。"),
+            build_trace_event(node="action", agent="action", summary="动作节点因审批中断。", status="interrupted"),
+        ],
+        "decision_summary": "意图=request，风险=medium，首选代理=action，执行路径=knowledge -> action，原因=test。",
+        "run_status": "interrupted",
+        "interrupts": [
+            {
+                "id": "interrupt-evidence-1",
+                "tool": "create_ticket",
+                "tool_label": "创建工单",
+                "reason": "创建工单属于高风险写操作，需要人工审批。",
+                "args_preview": {"subject": "账单异常核查"},
+                "allowed_decisions": ["approve", "edit", "reject"],
+            }
+        ],
+        "pending_approval_plan": {
+            "mode": "deterministic_tool_call",
+            "tool": "create_ticket",
+            "tool_label": "创建工单",
+            "args": {
+                "user_id": "resume_evidence_user",
+                "subject": "账单异常核查",
+                "description": "账单存在重复扣费，请创建工单",
+                "priority": "high",
+                "category": "billing",
+            },
+            "reject_message": "已取消创建工单。",
+        },
+        "retrieval_text": "账单异常工单会先进入财务复核，再由客服同步处理结果。",
+        "evidence_items": [
+            {
+                "evidence_id": "knowledge:billing-ticket-flow",
+                "kind": "knowledge",
+                "source_type": "help_center",
+                "source_label": "帮助中心::Customer Support Help Center > 工单与服务 > 账单异常工单审核流程",
+                "document_title": "Customer Support Help Center",
+                "section_path": "Customer Support Help Center > 工单与服务 > 账单异常工单审核流程",
+                "source_path": "knowledge/help-center.md",
+                "snippet": "账单异常工单会先进入财务复核，再由客服同步处理结果。",
+                "confidence": 0.93,
+                "metadata": {"parent_chunk_id": "parent-flow-1"},
+            }
+        ],
+        "citations": [],
+    }
+
+    response = agent.resume(thread_id=thread_id, decisions=[{"type": "approve"}])
+
+    assert response.run_status == "completed"
+    assert "帮助中心::Customer Support Help Center > 工单与服务 > 账单异常工单审核流程" in response.citations
+    assert "Support Tools::创建工单" in response.citations
+    assert response.ticket_created is not None
 
 
 def test_tool_result_ticket_id_ignores_failure_payload(agent):

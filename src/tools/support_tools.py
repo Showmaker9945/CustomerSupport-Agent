@@ -453,6 +453,79 @@ def _normalize_knowledge_category(category: Optional[str]) -> Optional[str]:
     return alias_map.get(normalized, raw)
 
 
+def _knowledge_result_to_evidence(result: Any, rank: int) -> Dict[str, Any]:
+    metadata = result.metadata or {}
+    matched_chunks = metadata.get("matched_chunks", [])
+    best_match = matched_chunks[0] if matched_chunks else {}
+    parent_chunk_id = str(metadata.get("parent_chunk_id") or f"result-{rank}")
+    snippet = str(result.answer or best_match.get("preview") or "").strip()
+    return {
+        "evidence_id": f"knowledge:{parent_chunk_id}",
+        "kind": "knowledge",
+        "source_type": "help_center",
+        "source_label": _knowledge_source_label(result),
+        "document_title": str(metadata.get("document_title") or "").strip(),
+        "section_path": str(metadata.get("section_path") or "").strip(),
+        "source_path": str(metadata.get("source_path") or "").strip(),
+        "snippet": snippet,
+        "confidence": float(getattr(result, "confidence", 0.0) or 0.0),
+        "metadata": {
+            "rank": rank,
+            "category": str(getattr(result, "category", "") or "").strip(),
+            "parent_chunk_id": parent_chunk_id,
+            "matched_chunks": matched_chunks,
+        },
+    }
+
+
+def search_knowledge_base_bundle(query: str, category: Optional[str] = None) -> Dict[str, Any]:
+    """Return retriever text plus structured evidence for service/graph usage."""
+    store = get_knowledge_store()
+    normalized_category = _normalize_knowledge_category(category)
+    results = store.search_hybrid(query, category=normalized_category, top_k=settings.rag_top_k)
+    trace = store.get_last_query_trace()
+
+    if not results:
+        return {
+            "text": f"未在帮助中心中找到与该问题相关的内容：{query}",
+            "evidence_items": [],
+            "trace": trace,
+            "result_count": 0,
+        }
+
+    output_parts = [f"帮助中心共找到 {len(results)} 条相关内容（混合检索+重排）：\n"]
+    if settings.debug:
+        strategy_parts = []
+        if trace.get("effective_category"):
+            strategy_parts.append(f"分类过滤：{trace['effective_category']}")
+        if trace.get("vector_hits") is not None:
+            strategy_parts.append(f"向量召回：{trace['vector_hits']}")
+        if trace.get("keyword_hits") is not None:
+            strategy_parts.append(f"关键词召回：{trace['keyword_hits']}")
+        if trace.get("candidate_count") is not None:
+            strategy_parts.append(f"候选块：{trace['candidate_count']}")
+        if trace.get("documents_indexed") is not None:
+            strategy_parts.append(f"已索引文档：{trace['documents_indexed']}")
+        if strategy_parts:
+            output_parts.append("检索摘要：" + " | ".join(strategy_parts))
+
+    evidence_items: List[Dict[str, Any]] = []
+    for index, result in enumerate(results, 1):
+        evidence_items.append(_knowledge_result_to_evidence(result, rank=index))
+        output_parts.append(
+            f"\n{index}. {result.question}\n"
+            f"   答案：{result.answer}\n"
+            f"   分类：{result.category} | 相关度：{result.confidence:.0%}"
+        )
+
+    return {
+        "text": "\n".join(output_parts),
+        "evidence_items": evidence_items,
+        "trace": trace,
+        "result_count": len(results),
+    }
+
+
 @tool
 def search_knowledge_base(query: str, category: Optional[str] = None) -> str:
     """
@@ -466,40 +539,8 @@ def search_knowledge_base(query: str, category: Optional[str] = None) -> str:
         带相关度的格式化检索结果
     """
     try:
-        store = get_knowledge_store()
-        normalized_category = _normalize_knowledge_category(category)
-        results = store.search_hybrid(query, category=normalized_category, top_k=settings.rag_top_k)
-        trace = store.get_last_query_trace()
-
-        if not results:
-            return f"未在帮助中心中找到与该问题相关的内容：{query}"
-
-        output_parts = [f"帮助中心共找到 {len(results)} 条相关内容（混合检索+重排）：\n"]
-
-        if settings.debug:
-            strategy_parts = []
-            if trace.get("effective_category"):
-                strategy_parts.append(f"分类过滤：{trace['effective_category']}")
-            if trace.get("vector_hits") is not None:
-                strategy_parts.append(f"向量召回：{trace['vector_hits']}")
-            if trace.get("keyword_hits") is not None:
-                strategy_parts.append(f"关键词召回：{trace['keyword_hits']}")
-            if trace.get("candidate_count") is not None:
-                strategy_parts.append(f"候选块：{trace['candidate_count']}")
-            if trace.get("documents_indexed") is not None:
-                strategy_parts.append(f"已索引文档：{trace['documents_indexed']}")
-            if strategy_parts:
-                output_parts.append("检索摘要：" + " | ".join(strategy_parts))
-
-        for i, result in enumerate(results, 1):
-            output_parts.append(
-                f"\n{i}. {result.question}\n"
-                f"   答案：{result.answer}\n"
-                f"   分类：{result.category} | 相关度：{result.confidence:.0%}\n"
-                f"   来源：{_knowledge_source_label(result)}"
-            )
-
-        return "\n".join(output_parts)
+        bundle = search_knowledge_base_bundle(query=query, category=category)
+        return str(bundle.get("text", "")).strip()
 
     except Exception as e:
         logger.error(f"Knowledge base search error: {e}")

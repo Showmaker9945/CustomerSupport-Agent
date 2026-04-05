@@ -93,6 +93,23 @@ class ConversationState(TypedDict):
     run_status: Optional[str]
 
 
+class EvidenceItem(TypedDict, total=False):
+    """Structured evidence item captured during retrieval or tool execution."""
+
+    evidence_id: str
+    kind: Literal["knowledge", "tool"]
+    source_type: str
+    source_label: str
+    document_title: str
+    section_path: str
+    source_path: str
+    snippet: str
+    confidence: float
+    tool_name: str
+    tool_label: str
+    metadata: Dict[str, Any]
+
+
 class OrchestrationState(TypedDict, total=False):
     """Shared LangGraph orchestration state."""
 
@@ -120,6 +137,7 @@ class OrchestrationState(TypedDict, total=False):
     needs_escalation: bool
     retrieval_text: str
     tool_text: str
+    evidence_items: List[EvidenceItem]
     validation_notes: List[str]
     validation_passed: bool
     final_message: str
@@ -381,19 +399,97 @@ def merge_unique(left: List[str], right: List[str]) -> List[str]:
     return merged
 
 
+def _clean_evidence_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _evidence_identity(item: EvidenceItem) -> str:
+    metadata = item.get("metadata") or {}
+    parts = [
+        _clean_evidence_text(item.get("evidence_id")),
+        _clean_evidence_text(item.get("kind")),
+        _clean_evidence_text(item.get("source_label")),
+        _clean_evidence_text(item.get("section_path")),
+        _clean_evidence_text(item.get("tool_name")),
+        _clean_evidence_text(item.get("snippet")),
+        _clean_evidence_text(metadata.get("parent_chunk_id")),
+        _clean_evidence_text(metadata.get("tool_call_id")),
+    ]
+    joined = "|".join(part for part in parts if part)
+    return joined or json.dumps(item, ensure_ascii=False, sort_keys=True)
+
+
+def merge_evidence_items(
+    left: List[EvidenceItem],
+    right: List[EvidenceItem],
+) -> List[EvidenceItem]:
+    merged: List[EvidenceItem] = []
+    seen: set[str] = set()
+    for candidate in [*(left or []), *(right or [])]:
+        if not isinstance(candidate, dict):
+            continue
+        item: EvidenceItem = {
+            key: value
+            for key, value in candidate.items()
+            if key
+            in {
+                "evidence_id",
+                "kind",
+                "source_type",
+                "source_label",
+                "document_title",
+                "section_path",
+                "source_path",
+                "snippet",
+                "confidence",
+                "tool_name",
+                "tool_label",
+                "metadata",
+            }
+        }
+        if isinstance(item.get("confidence"), (int, float)):
+            item["confidence"] = round(float(item["confidence"]), 4)
+        if item.get("metadata") and not isinstance(item["metadata"], dict):
+            item["metadata"] = {"raw": item["metadata"]}
+        identity = _evidence_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(item)
+    return merged
+
+
+def evidence_source_label(item: EvidenceItem) -> str:
+    source_label = _clean_evidence_text(item.get("source_label"))
+    if source_label:
+        return source_label
+    section_path = _clean_evidence_text(item.get("section_path"))
+    if section_path:
+        return f"帮助中心::{section_path}"
+    document_title = _clean_evidence_text(item.get("document_title"))
+    if document_title:
+        return f"帮助中心::{document_title}"
+    tool_label = _clean_evidence_text(item.get("tool_label"))
+    if tool_label:
+        return tool_label
+    tool_name = _clean_evidence_text(item.get("tool_name"))
+    if tool_name:
+        return f"工具::{tool_name}"
+    return ""
+
+
+def build_citations_from_evidence_items(items: List[EvidenceItem]) -> List[str]:
+    citations: List[str] = []
+    for item in items or []:
+        label = evidence_source_label(item)
+        if label and label not in citations:
+            citations.append(label)
+    return citations
+
+
 def ticket_id_from_text(text: str) -> Optional[str]:
     match = re.search(r"TKT-\d{8,14}-\d{3,6}", text, re.IGNORECASE)
     return match.group(0).upper() if match else None
-
-
-def extract_citations(text: str) -> List[str]:
-    citations = re.findall(r"来源：([^\n]+)", text)
-    unique: List[str] = []
-    for cite in citations:
-        cleaned = cite.strip()
-        if cleaned and cleaned not in unique:
-            unique.append(cleaned)
-    return unique
 
 
 def is_positive_escalation_text(text: str) -> bool:
@@ -411,6 +507,14 @@ def is_positive_escalation_text(text: str) -> bool:
 
 def contains_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def strip_source_annotations(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"(?mi)^\s*(来源|出处|source)\s*[:：].*$", "", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def normalize_execution_steps(value: Any) -> List[str]:
@@ -500,18 +604,8 @@ def build_role_system_prompt(role: str, memory_items: List[Dict[str, Any]]) -> s
         f"{role_rules.get(role, '你是客服助手。')}\n"
         "输出必须为中文，语气专业、简洁、可执行。\n"
         "若信息不足，明确说明并提出下一步收集项。\n"
-        "回答尽量包含来源与依据，不编造事实。"
+        "回答必须基于已给出的依据，不编造事实。"
         f"{memory_block}"
-    )
-
-
-def compose_knowledge_prompt(state: OrchestrationState) -> str:
-    history_text = state.get("recent_history_text", "")
-    history_block = f"\n短期对话上下文：\n{history_text}\n" if history_text else ""
-    return (
-        f"用户问题：{state.get('current_message', '')}\n"
-        f"{history_block}"
-        "任务：调用知识检索工具，输出关键结论，并附上来源行（格式：来源：xxx）。"
     )
 
 
@@ -545,9 +639,10 @@ def compose_responder_prompt(state: OrchestrationState) -> str:
     notes = state.get("validation_notes", [])
     note_block = "\n".join(f"- {note}" for note in notes) if notes else "无"
     history_text = state.get("recent_history_text") or "无"
-    retrieval_text = state.get("retrieval_text") or "无"
-    tool_text = state.get("tool_text") or "无"
+    retrieval_text = strip_source_annotations(state.get("retrieval_text") or "") or "无"
+    tool_text = strip_source_annotations(state.get("tool_text") or "") or "无"
     decision_summary = state.get("decision_summary") or "无"
+    evidence_count = len(state.get("evidence_items", []))
     return (
         "请基于以下结构化上下文生成最终客服答复：\n"
         f"- 用户问题：{state.get('current_message', '')}\n"
@@ -559,10 +654,11 @@ def compose_responder_prompt(state: OrchestrationState) -> str:
         f"- 图决策摘要：{decision_summary}\n"
         f"- 知识证据：\n{retrieval_text}\n"
         f"- 工具执行结果：\n{tool_text}\n"
+        f"- 可用结构化证据数：{evidence_count}\n"
         f"- 是否人工升级：{'是' if state.get('escalated') else '否'}\n"
         f"- 工单号：{state.get('ticket_id') or '无'}\n"
         f"- 校验修正要求：\n{note_block}\n"
-        "要求：中文输出；先结论后步骤；若有来源请保留“来源：xxx”；如果证据不足，要明确告知并给出下一步建议。"
+        "要求：中文输出；先结论后步骤；只输出答复正文；不要输出“来源：”“出处：”或自造文档标题；如果证据不足，要明确告知并给出下一步建议。"
     )
 
 
@@ -809,29 +905,12 @@ class SupportAgentOrchestrator:
         }
 
     def node_knowledge(self, state: OrchestrationState) -> Dict[str, Any]:
-        user_id = state.get("user_id", "unknown_user")
-        thread_id = state.get("thread_id", "unknown_thread")
-        intent = state.get("intent", "question")
-        risk = state.get("risk", "low")
-
-        structured_lookup = self.owner._run_structured_knowledge_lookup(state.get("current_message", ""))
-        if structured_lookup is not None:
-            retrieval_text = structured_lookup
-        elif self.owner.llm_enabled:
-            result = self.owner._call_role_agent(
-                role="knowledge",
-                user_id=user_id,
-                thread_id=thread_id,
-                trace_id=state.get("trace_id", ""),
-                intent=intent,
-                risk=risk,
-                message=compose_knowledge_prompt(state),
-            )
-            retrieval_text = self.owner._extract_ai_text(result)
-        else:
-            retrieval_text = self.owner._fallback_response("knowledge", user_id, state.get("current_message", ""), None)
-
-        citations = merge_unique(state.get("citations", []), extract_citations(retrieval_text))
+        bundle = self.owner._run_knowledge_lookup_bundle(state.get("current_message", ""))
+        retrieval_text = strip_source_annotations(bundle.get("text", ""))
+        evidence_items = merge_evidence_items(
+            state.get("evidence_items", []),
+            bundle.get("evidence_items", []),
+        )
         trace_update = extend_trace(
             state,
             node="knowledge",
@@ -839,14 +918,14 @@ class SupportAgentOrchestrator:
             summary="知识检索已完成。",
             details={
                 "has_retrieval": bool(retrieval_text),
-                "citation_count": len(citations),
+                "evidence_count": len(evidence_items),
                 "text_length": len(retrieval_text),
             },
         )
         return {
             "active_agent": "knowledge",
             "retrieval_text": retrieval_text,
-            "citations": citations,
+            "evidence_items": evidence_items,
             "run_status": "completed",
             **trace_update,
         }
@@ -876,7 +955,7 @@ class SupportAgentOrchestrator:
                 "active_agent": "action",
                 "run_status": "interrupted",
                 "interrupts": interrupts,
-                "citations": state.get("citations", []),
+                "evidence_items": state.get("evidence_items", []),
                 "pending_approval_plan": interrupt_payload.get("pending_approval_plan", {}),
                 **trace_update,
             }
@@ -885,8 +964,15 @@ class SupportAgentOrchestrator:
             user_id=user_id,
             message=state.get("current_message", ""),
         )
+        evidence_items = state.get("evidence_items", [])
+        tool_source = state.get("tool_source", "")
         if structured_action is not None:
-            tool_text = structured_action
+            tool_text = structured_action.get("text", "")
+            evidence_items = merge_evidence_items(
+                evidence_items,
+                structured_action.get("evidence_items", []),
+            )
+            tool_source = structured_action.get("tool_source", "") or tool_source
         elif self.owner.llm_enabled:
             result = self.owner._call_role_agent(
                 role="action",
@@ -912,16 +998,29 @@ class SupportAgentOrchestrator:
                     "active_agent": "action",
                     "run_status": "interrupted",
                     "interrupts": interrupts,
-                    "citations": state.get("citations", []),
+                    "evidence_items": state.get("evidence_items", []),
                     **trace_update,
                 }
             tool_text = self.owner._extract_ai_text(result)
+            evidence_items = merge_evidence_items(
+                evidence_items,
+                self.owner._extract_tool_evidence_items(result),
+            )
+            tool_source = tool_source or "Support Tools"
         else:
             tool_text = self.owner._fallback_response("action", user_id, state.get("current_message", ""), None)
 
-        ticket_id = ticket_id_from_text(tool_text) or state.get("ticket_id")
-        citations = merge_unique(state.get("citations", []), extract_citations(tool_text))
-        escalated = bool(state.get("escalated")) or is_positive_escalation_text(tool_text)
+        tool_text = strip_source_annotations(tool_text)
+        ticket_id = (
+            (structured_action or {}).get("ticket_id")
+            if isinstance(structured_action, dict)
+            else None
+        ) or ticket_id_from_text(tool_text) or state.get("ticket_id")
+        escalated = (
+            bool(state.get("escalated"))
+            or bool((structured_action or {}).get("escalated"))
+            or is_positive_escalation_text(tool_text)
+        )
         trace_update = extend_trace(
             state,
             node="action",
@@ -930,18 +1029,18 @@ class SupportAgentOrchestrator:
             details={
                 "ticket_id": ticket_id,
                 "escalated": escalated,
-                "citation_count": len(citations),
+                "evidence_count": len(evidence_items),
             },
         )
         return {
             "active_agent": "action",
             "tool_text": tool_text,
-            "tool_source": "Support Tools",
+            "tool_source": tool_source or "Support Tools",
             "ticket_id": ticket_id,
             "escalated": escalated,
             "run_status": "completed",
             "interrupts": [],
-            "citations": citations,
+            "evidence_items": evidence_items,
             **trace_update,
         }
 
@@ -976,15 +1075,20 @@ class SupportAgentOrchestrator:
                     "run_status": "interrupted",
                     "interrupts": interrupts,
                     "escalated": True,
-                    "citations": state.get("citations", []),
+                    "evidence_items": state.get("evidence_items", []),
                     **trace_update,
                 }
             tool_text = self.owner._extract_ai_text(result)
+            evidence_items = merge_evidence_items(
+                state.get("evidence_items", []),
+                self.owner._extract_tool_evidence_items(result),
+            )
         else:
             tool_text = self.owner._fallback_response("escalation", user_id, state.get("current_message", ""), None)
+            evidence_items = state.get("evidence_items", [])
 
+        tool_text = strip_source_annotations(tool_text)
         ticket_id = ticket_id_from_text(tool_text) or state.get("ticket_id")
-        citations = merge_unique(state.get("citations", []), extract_citations(tool_text))
         trace_update = extend_trace(
             state,
             node="escalation",
@@ -992,7 +1096,7 @@ class SupportAgentOrchestrator:
             summary="人工升级流程已完成。",
             details={
                 "ticket_id": ticket_id,
-                "citation_count": len(citations),
+                "evidence_count": len(evidence_items),
             },
         )
         return {
@@ -1003,7 +1107,7 @@ class SupportAgentOrchestrator:
             "escalated": True,
             "run_status": "completed",
             "interrupts": [],
-            "citations": citations,
+            "evidence_items": evidence_items,
             **trace_update,
         }
 
@@ -1011,9 +1115,10 @@ class SupportAgentOrchestrator:
         notes: List[str] = []
         retrieval_text = (state.get("retrieval_text") or "").strip()
         tool_text = (state.get("tool_text") or "").strip()
+        evidence_items = state.get("evidence_items", [])
         current_message = state.get("current_message", "")
         combined_text = "\n".join(part for part in (retrieval_text, tool_text) if part).strip()
-        has_evidence = bool(state.get("retrieval_text") or state.get("tool_text"))
+        has_evidence = bool(combined_text or evidence_items)
         selected_agent = state.get("selected_agent")
         is_subscription_query = any(token in current_message for token in ("套餐", "订阅", "续费"))
         is_billing_query = any(token in current_message for token in ("账单", "发票", "扣费", "扣款", "金额"))
@@ -1032,16 +1137,14 @@ class SupportAgentOrchestrator:
         elif not contains_chinese(combined_text):
             notes.append("最终回复必须保持中文输出。")
 
-        if has_evidence and not state.get("citations"):
-            notes.append("若引用了知识库或工具结果，需要在最终回复中保留来源。")
+        if (retrieval_text or tool_text) and not evidence_items:
+            notes.append("知识检索或工具执行已产出结果，但缺少结构化证据，无法稳定生成引用。")
         if state.get("ticket_id") and state["ticket_id"] not in combined_text:
             notes.append("如果已经生成工单号，需要在最终回复中明确展示。")
         if state.get("escalated") and "人工" not in combined_text and "升级" not in combined_text:
             notes.append("如果已经升级人工，需要明确告知用户后续人工跟进。")
         if state.get("selected_agent") in {"action", "escalation"} and not tool_text and state.get("run_status") == "completed":
             notes.append("如果本轮未真正执行动作，需要解释原因并给出下一步处理方式。")
-        if retrieval_text and "来源：" not in retrieval_text and not state.get("citations"):
-            notes.append("知识检索结果存在但未体现来源，最终回复中必须补充来源信息。")
         if is_subscription_query and not any(token in combined_text for token in ("套餐", "订阅", "续费", "状态")):
             notes.append("订阅类问题的最终回复需要明确写出套餐、订阅状态或续费信息。")
         if is_billing_query and not any(token in combined_text for token in ("账单", "发票", "金额", "扣费")):
@@ -1090,7 +1193,7 @@ class SupportAgentOrchestrator:
                 tool_text=state.get("tool_text", ""),
             )
 
-        citations = merge_unique(state.get("citations", []), extract_citations(final_message))
+        final_message = strip_source_annotations(final_message)
         ticket_id = state.get("ticket_id") or ticket_id_from_text(final_message)
         escalated = bool(state.get("escalated") or state.get("selected_agent") == "escalation")
         trace_update = extend_trace(
@@ -1100,7 +1203,7 @@ class SupportAgentOrchestrator:
             summary="最终回复已生成。",
             details={
                 "message_length": len(final_message),
-                "citation_count": len(citations),
+                "evidence_count": len(state.get("evidence_items", [])),
                 "validation_passed": state.get("validation_passed", True),
             },
         )
@@ -1108,7 +1211,6 @@ class SupportAgentOrchestrator:
             "final_message": final_message,
             "ticket_id": ticket_id,
             "escalated": escalated,
-            "citations": citations,
             "run_status": "completed",
             **trace_update,
         }

@@ -12,6 +12,7 @@ from src.tools.support_tools import (
     TicketPriority,
     TicketStore,
     search_knowledge_base,
+    search_knowledge_base_bundle,
     create_ticket,
     get_ticket_status,
     update_ticket,
@@ -255,6 +256,17 @@ class TestSupportTools:
         """Test help-center knowledge-base search tool."""
         result = search_knowledge_base.invoke({"query": "如何重置密码", "category": None})
         assert ("帮助中心共找到" in result) or ("未在帮助中心中找到" in result)
+
+    def test_search_knowledge_base_bundle_returns_evidence(self):
+        bundle = search_knowledge_base_bundle(query="如何重置密码", category=None)
+
+        assert "text" in bundle
+        assert "evidence_items" in bundle
+        assert isinstance(bundle["evidence_items"], list)
+        if bundle["evidence_items"]:
+            evidence = bundle["evidence_items"][0]
+            assert evidence["kind"] == "knowledge"
+            assert evidence["source_label"].startswith("帮助中心::")
 
     def test_search_knowledge_base_with_category(self):
         """Test help-center knowledge-base search with category filter."""
