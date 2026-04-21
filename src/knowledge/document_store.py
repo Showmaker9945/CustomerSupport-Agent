@@ -892,13 +892,51 @@ class DocumentStore:
         self._bm25_records = []
         self._last_query_trace = {}
 
+    def _chunk_ids_for_documents(
+        self,
+        chunk_cache: Dict[str, Dict[str, Any]],
+        doc_ids: List[str],
+    ) -> List[str]:
+        if not doc_ids:
+            return []
+        doc_id_set = set(doc_ids)
+        return [
+            chunk_id
+            for chunk_id, payload in chunk_cache.items()
+            if payload.get("doc_id") in doc_id_set
+        ]
+
+    def _delete_collection_records(self, collection: Any, ids: List[str]) -> None:
+        cleaned_ids = [str(item).strip() for item in ids if str(item).strip()]
+        if not cleaned_ids:
+            return
+        try:
+            collection.delete(ids=cleaned_ids)
+        except Exception as error:
+            logger.warning(f"Failed to delete stale Chroma records: {error}")
+
+    def _add_collection_records(self, collection: Any, chunks: List[Dict[str, Any]]) -> None:
+        if not chunks:
+            return
+        chunk_texts = [self._collection_document_text(chunk) for chunk in chunks]
+        collection.add(
+            ids=[chunk["chunk_id"] for chunk in chunks],
+            embeddings=[self._create_document_embedding(text) for text in chunk_texts],
+            documents=chunk_texts,
+            metadatas=[
+                {
+                    **chunk["metadata"],
+                    "chunk_id": chunk["chunk_id"],
+                }
+                for chunk in chunks
+            ],
+        )
+
     def reindex(self, clear_existing: bool = False) -> Dict[str, Any]:
         documents: List[Dict[str, Any]] = []
         parent_chunks: List[Dict[str, Any]] = []
         child_chunks: List[Dict[str, Any]] = []
         supported_documents = self._supported_documents()
-
-        self.clear_all()
 
         timestamp = datetime.now(timezone.utc).isoformat()
         for path in supported_documents:
@@ -919,40 +957,37 @@ class DocumentStore:
             parent_chunks.extend(doc_parent_chunks)
             child_chunks.extend(doc_child_chunks)
 
+        incoming_doc_ids = sorted({document["doc_id"] for document in documents})
+        removed_doc_ids: List[str] = []
+
+        if clear_existing:
+            self.clear_all()
+        else:
+            existing_doc_ids = {
+                str(document.get("doc_id", "")).strip()
+                for document in list_knowledge_documents()
+                if str(document.get("doc_id", "")).strip()
+            }
+            removed_doc_ids = sorted(existing_doc_ids - set(incoming_doc_ids))
+            doc_ids_to_refresh = sorted(set(incoming_doc_ids) | set(removed_doc_ids))
+            self._delete_collection_records(
+                self.parent_collection,
+                self._chunk_ids_for_documents(self._parent_chunks, doc_ids_to_refresh),
+            )
+            self._delete_collection_records(
+                self.child_collection,
+                self._chunk_ids_for_documents(self._child_chunks, doc_ids_to_refresh),
+            )
+
         replace_knowledge_corpus(
             documents=documents,
             chunks=[*parent_chunks, *child_chunks],
-            clear_existing=True or clear_existing,
+            clear_existing=clear_existing,
+            remove_doc_ids=removed_doc_ids,
         )
 
-        if parent_chunks:
-            parent_texts = [self._collection_document_text(chunk) for chunk in parent_chunks]
-            self.parent_collection.add(
-                ids=[chunk["chunk_id"] for chunk in parent_chunks],
-                embeddings=[self._create_document_embedding(text) for text in parent_texts],
-                documents=parent_texts,
-                metadatas=[
-                    {
-                        **chunk["metadata"],
-                        "chunk_id": chunk["chunk_id"],
-                    }
-                    for chunk in parent_chunks
-                ],
-            )
-        if child_chunks:
-            child_texts = [self._collection_document_text(chunk) for chunk in child_chunks]
-            self.child_collection.add(
-                ids=[chunk["chunk_id"] for chunk in child_chunks],
-                embeddings=[self._create_document_embedding(text) for text in child_texts],
-                documents=child_texts,
-                metadatas=[
-                    {
-                        **chunk["metadata"],
-                        "chunk_id": chunk["chunk_id"],
-                    }
-                    for chunk in child_chunks
-                ],
-            )
+        self._add_collection_records(self.parent_collection, parent_chunks)
+        self._add_collection_records(self.child_collection, child_chunks)
 
         self._load_metadata_cache()
         stats = self.get_stats()
@@ -962,6 +997,7 @@ class DocumentStore:
                 "indexed_parent_chunks": len(parent_chunks),
                 "indexed_child_chunks": len(child_chunks),
                 "clear_existing": clear_existing,
+                "removed_documents": len(removed_doc_ids),
             }
         )
         return stats

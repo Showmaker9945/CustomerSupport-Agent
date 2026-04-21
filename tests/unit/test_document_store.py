@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from src.db.repositories import list_knowledge_documents
 from src.knowledge.document_store import create_document_store
 from src.memory.semantic_store import SemanticMemoryStore
 
@@ -104,6 +105,46 @@ def test_document_store_prefers_account_recovery_section_for_unavailable_email_q
     assert results[0].metadata["document_title"] == "账户访问与安全管理指南"
     assert "注册邮箱不可用时的身份核验" in results[0].metadata["section_path"]
     assert "身份核验" in results[0].answer or "原邮箱不可用" in results[0].answer
+
+
+def test_document_store_incremental_reindex_syncs_added_and_removed_documents(tmp_path, isolated_business_db):
+    knowledge_dir = tmp_path / "knowledge"
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    alpha_path = knowledge_dir / "alpha.md"
+    alpha_path.write_text(
+        "# Alpha Guide\n\n## Alpha\n\nalpha-only keyword lives here.\n",
+        encoding="utf-8",
+    )
+
+    store = create_document_store(
+        knowledge_base_path=knowledge_dir,
+        chroma_path=tmp_path / "chroma",
+    )
+    initial_stats = store.reindex(clear_existing=True)
+
+    assert initial_stats["total_documents"] == 1
+    assert [item["source_path"] for item in list_knowledge_documents()] == ["alpha.md"]
+    assert store.search_hybrid("alpha-only keyword", top_k=2)
+
+    alpha_path.unlink()
+    beta_path = knowledge_dir / "beta.md"
+    beta_path.write_text(
+        "# Beta Guide\n\n## Beta\n\nbeta-only keyword lives here.\n",
+        encoding="utf-8",
+    )
+
+    synced_stats = store.reindex(clear_existing=False)
+    persisted_paths = [item["source_path"] for item in list_knowledge_documents()]
+    beta_results = store.search_hybrid("beta-only keyword", top_k=2)
+    alpha_results = store.search_hybrid("alpha-only keyword", top_k=2)
+
+    assert synced_stats["clear_existing"] is False
+    assert synced_stats["removed_documents"] == 1
+    assert synced_stats["total_documents"] == 1
+    assert persisted_paths == ["beta.md"]
+    assert beta_results
+    assert beta_results[0].metadata["source_path"] == "beta.md"
+    assert all(result.metadata["source_path"] != "alpha.md" for result in alpha_results)
 
 
 def test_semantic_memory_store_persists_and_searches(tmp_path, isolated_business_db):
