@@ -850,13 +850,24 @@ def replace_knowledge_corpus(
     documents: List[Dict[str, Any]],
     chunks: List[Dict[str, Any]],
     clear_existing: bool = True,
+    remove_doc_ids: Optional[List[str]] = None,
 ) -> Dict[str, int]:
     """Replace the persisted document knowledge metadata with the latest corpus snapshot."""
     ensure_business_database(seed_demo=False)
     with session_scope() as session:
+        normalized_remove_doc_ids = sorted(
+            {
+                str(doc_id).strip()
+                for doc_id in (remove_doc_ids or [])
+                if str(doc_id).strip()
+            }
+        )
         if clear_existing:
             session.execute(delete(KnowledgeChunk))
             session.execute(delete(KnowledgeDocument))
+        elif normalized_remove_doc_ids:
+            session.execute(delete(KnowledgeChunk).where(KnowledgeChunk.doc_id.in_(normalized_remove_doc_ids)))
+            session.execute(delete(KnowledgeDocument).where(KnowledgeDocument.doc_id.in_(normalized_remove_doc_ids)))
 
         for payload in documents:
             document = session.get(KnowledgeDocument, payload["doc_id"]) or KnowledgeDocument(doc_id=payload["doc_id"])
@@ -899,6 +910,7 @@ def replace_knowledge_corpus(
         "chunks": len(chunks),
         "parent_chunks": sum(1 for chunk in chunks if chunk.get("chunk_level") == "parent"),
         "child_chunks": sum(1 for chunk in chunks if chunk.get("chunk_level") == "child"),
+        "removed_documents": len(normalized_remove_doc_ids),
     }
 
 
