@@ -115,6 +115,7 @@ class OrchestrationState(TypedDict, total=False):
 
     user_id: str
     thread_id: str
+    graph_thread_id: str
     trace_id: str
     current_message: str
     recent_history_text: str
@@ -699,7 +700,12 @@ class SupportAgentOrchestrator:
         )
         return result
 
-    def build(self) -> Any:
+    def build(
+        self,
+        *,
+        checkpointer: Any = None,
+        store: Any = None,
+    ) -> Any:
         workflow = StateGraph(OrchestrationState)
         workflow.add_node(
             "analyze",
@@ -793,7 +799,7 @@ class SupportAgentOrchestrator:
         )
         workflow.add_edge("validate", "respond")
         workflow.add_edge("respond", END)
-        return workflow.compile()
+        return workflow.compile(checkpointer=checkpointer, store=store)
 
     def finalize_after_execution(self, state: OrchestrationState) -> OrchestrationState:
         merged = dict(state)

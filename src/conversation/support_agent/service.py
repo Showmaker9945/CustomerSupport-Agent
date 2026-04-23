@@ -162,7 +162,10 @@ class SupportAgent:
             logger.warning("LLM 未可用：将使用规则路由与模板回复。")
 
         self.orchestrator = SupportAgentOrchestrator(self)
-        self.orchestration_graph = self.orchestrator.build()
+        self.orchestration_graph = self.orchestrator.build(
+            checkpointer=self.persistence.checkpointer,
+            store=self.persistence.store,
+        )
 
     def close(self) -> None:
         """Release backend resources."""
@@ -1451,6 +1454,9 @@ class SupportAgent:
     def _agent_thread_id(self, thread_id: str, role: str) -> str:
         return f"{settings.langgraph_thread_prefix}:{role}:{thread_id}"
 
+    def _graph_thread_id(self, thread_id: str) -> str:
+        return f"{settings.langgraph_thread_prefix}:graph:{thread_id}"
+
     def _tool_label(self, tool_name: str) -> str:
         return TOOL_LABELS.get(tool_name, tool_name or "未知动作")
 
@@ -2076,7 +2082,10 @@ class SupportAgent:
         pending_state = self._pending_state.get(thread_id, {})
 
         if role and pending_state:
-            return user_id, trace_id or str(uuid.uuid4()), role, pending_state
+            loaded_state = dict(pending_state)
+            loaded_state.setdefault("graph_thread_id", self._graph_thread_id(thread_id))
+            self._pending_state[thread_id] = loaded_state
+            return user_id, trace_id or str(uuid.uuid4()), role, loaded_state
 
         thread = get_conversation_thread(thread_id)
         if not thread:
@@ -2088,11 +2097,13 @@ class SupportAgent:
         persisted_user_id = thread.get("user_id") or user_id
 
         if persisted_role and isinstance(persisted_state, dict) and persisted_state:
+            loaded_state = dict(persisted_state)
+            loaded_state.setdefault("graph_thread_id", self._graph_thread_id(thread_id))
             self._thread_user[thread_id] = persisted_user_id
             self._trace_by_thread[thread_id] = persisted_trace_id
             self._pending_role[thread_id] = persisted_role
-            self._pending_state[thread_id] = dict(persisted_state)
-            return persisted_user_id, persisted_trace_id, persisted_role, dict(persisted_state)
+            self._pending_state[thread_id] = loaded_state
+            return persisted_user_id, persisted_trace_id, persisted_role, loaded_state
 
         return persisted_user_id, persisted_trace_id, None, {}
 
@@ -2242,6 +2253,7 @@ class SupportAgent:
         """Process a user turn through the LangGraph workflow."""
         started = perf_counter()
         thread = thread_id or str(uuid.uuid4())
+        graph_thread_id = self._graph_thread_id(thread)
         trace_id = str(uuid.uuid4())
         self._thread_user[thread] = user_id
         self._trace_by_thread[thread] = trace_id
@@ -2280,6 +2292,7 @@ class SupportAgent:
         initial_state: OrchestrationState = {
             "user_id": user_id,
             "thread_id": thread,
+            "graph_thread_id": graph_thread_id,
             "trace_id": trace_id,
             "current_message": message,
             "recent_history_text": recent_context.get("text", ""),
@@ -2319,6 +2332,7 @@ class SupportAgent:
             user_id=user_id,
             thread_id=thread,
             trace_id=trace_id,
+            checkpoint_thread_id=graph_thread_id,
             role="supervisor",
             intent=initial_intent,
             risk=initial_risk,

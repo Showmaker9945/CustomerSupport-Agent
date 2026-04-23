@@ -1,5 +1,6 @@
 """Unit tests for the upgraded multi-agent support core."""
 
+import src.conversation.support_agent.graph as support_graph_module
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,63 @@ def test_chat_returns_extended_contract(agent):
     assert response.decision_summary
     assert response.next_action
     assert response.message
+
+
+def test_orchestrator_build_wires_main_graph_persistence(monkeypatch):
+    checkpointer = object()
+    store = object()
+    captured = {}
+    compiled_graph = object()
+
+    def fake_compile(self, *args, **kwargs):
+        captured.update(kwargs)
+        return compiled_graph
+
+    monkeypatch.setattr(support_graph_module.StateGraph, "compile", fake_compile)
+    owner = SimpleNamespace(persistence=SimpleNamespace(checkpointer=checkpointer, store=store))
+
+    orchestrator = support_graph_module.SupportAgentOrchestrator(owner)
+    result = orchestrator.build(checkpointer=checkpointer, store=store)
+
+    assert result is compiled_graph
+    assert captured["checkpointer"] is checkpointer
+    assert captured["store"] is store
+
+
+def test_chat_uses_stable_graph_thread_id(agent):
+    thread_id = "thread-graph-persist"
+    fake_graph = _FakeOrchestrationGraph(
+        {
+            "intent": "question",
+            "risk": "low",
+            "selected_agent": "knowledge",
+            "active_agent": "knowledge",
+            "route_path": ["analyze", "knowledge", "validate", "respond"],
+            "trace_events": [build_trace_event(node="respond", agent="responder", summary="完成回复。")],
+            "node_timings": [
+                {"node": "analyze", "agent": "supervisor", "duration_ms": 1.0, "status": "completed"}
+            ],
+            "decision_summary": "主图已使用稳定 checkpoint thread id。",
+            "validation_notes": [],
+            "run_status": "completed",
+            "final_message": "这是一次测试回复。",
+            "citations": [],
+            "evidence_items": [],
+            "retrieval_text": "",
+            "tool_text": "",
+            "tool_source": "",
+            "escalated": False,
+        }
+    )
+    agent.orchestration_graph = fake_graph
+
+    response = agent.chat(user_id="graph_user", message="如何重置密码？", thread_id=thread_id)
+    invocation = fake_graph.calls[-1]
+    expected_graph_thread_id = agent._graph_thread_id(thread_id)
+
+    assert invocation["state"]["graph_thread_id"] == expected_graph_thread_id
+    assert invocation["config"]["configurable"]["thread_id"] == expected_graph_thread_id
+    assert response.thread_id == thread_id
 
 
 def test_route_to_knowledge_agent(agent):
@@ -157,6 +215,34 @@ def test_short_term_history_survives_new_agent_instance(monkeypatch, isolated_bu
         assert context["messages"]
     finally:
         second_agent.close()
+
+
+def test_load_pending_context_backfills_graph_thread_id(agent):
+    pending_state = {
+        "user_id": "pending_graph_user",
+        "thread_id": "thread-pending-graph",
+        "intent": "request",
+        "risk": "medium",
+        "selected_agent": "action",
+        "active_agent": "action",
+        "route_path": ["analyze", "action"],
+        "run_status": "interrupted",
+        "interrupts": [{"id": "interrupt-1", "tool": "create_ticket"}],
+    }
+    save_pending_conversation_state(
+        thread_id="thread-pending-graph",
+        user_id="pending_graph_user",
+        pending_role="action",
+        pending_state=pending_state,
+        trace_id="trace-pending-graph",
+        status="interrupted",
+        last_active_agent="action",
+    )
+
+    _, _, role, loaded_state = agent._load_pending_context("thread-pending-graph")
+
+    assert role == "action"
+    assert loaded_state["graph_thread_id"] == agent._graph_thread_id("thread-pending-graph")
 
 
 def test_resume_can_recover_pending_state_from_database(monkeypatch, isolated_business_db):
@@ -341,6 +427,18 @@ class _FakeRoleAgent:
 
     def invoke(self, _payload, config=None, context=None):
         return {"messages": [AIMessage(content=self.text)]}
+
+
+class _FakeOrchestrationGraph:
+    def __init__(self, result):
+        self.result = dict(result)
+        self.calls = []
+
+    def invoke(self, state, config=None):
+        self.calls.append({"state": dict(state), "config": dict(config or {})})
+        merged = dict(state)
+        merged.update(self.result)
+        return merged
 
 
 def test_resume_approve_does_not_false_escalate(agent):
