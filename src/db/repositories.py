@@ -79,6 +79,9 @@ def _ensure_business_schema() -> None:
     ddl_by_column = {
         "pending_role": "ALTER TABLE conversation_threads ADD COLUMN pending_role VARCHAR(64)",
         "pending_state_json": "ALTER TABLE conversation_threads ADD COLUMN pending_state_json JSON",
+        "graph_thread_id": "ALTER TABLE conversation_threads ADD COLUMN graph_thread_id VARCHAR(128)",
+        "last_graph_node": "ALTER TABLE conversation_threads ADD COLUMN last_graph_node VARCHAR(64)",
+        "last_checkpoint_at": "ALTER TABLE conversation_threads ADD COLUMN last_checkpoint_at VARCHAR(64)",
         "trace_id": "ALTER TABLE conversation_threads ADD COLUMN trace_id VARCHAR(64)",
     }
     with engine.begin() as connection:
@@ -300,6 +303,9 @@ def _thread_to_record(thread: ConversationThread) -> Dict[str, Any]:
         "last_active_agent": thread.last_active_agent,
         "pending_role": thread.pending_role,
         "pending_state": thread.pending_state_json or {},
+        "graph_thread_id": thread.graph_thread_id,
+        "last_graph_node": thread.last_graph_node,
+        "last_checkpoint_at": thread.last_checkpoint_at,
         "trace_id": thread.trace_id,
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
@@ -516,6 +522,9 @@ def create_or_touch_conversation_thread(
     rolling_summary: Optional[str] = None,
     pending_role: Optional[str] = None,
     pending_state: Optional[Dict[str, Any]] = None,
+    graph_thread_id: Optional[str] = None,
+    last_graph_node: Optional[str] = None,
+    last_checkpoint_at: Optional[str] = None,
     trace_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """创建或更新一条对话线程元数据。"""
@@ -534,6 +543,9 @@ def create_or_touch_conversation_thread(
                 last_active_agent=last_active_agent,
                 pending_role=pending_role,
                 pending_state_json=pending_state or {},
+                graph_thread_id=graph_thread_id,
+                last_graph_node=last_graph_node,
+                last_checkpoint_at=last_checkpoint_at,
                 trace_id=trace_id,
                 created_at=now,
                 updated_at=now,
@@ -551,6 +563,12 @@ def create_or_touch_conversation_thread(
                 thread.pending_role = pending_role
             if pending_state is not None:
                 thread.pending_state_json = pending_state
+            if graph_thread_id is not None:
+                thread.graph_thread_id = graph_thread_id
+            if last_graph_node is not None:
+                thread.last_graph_node = last_graph_node
+            if last_checkpoint_at is not None:
+                thread.last_checkpoint_at = last_checkpoint_at
             if trace_id is not None:
                 thread.trace_id = trace_id
             if status:
@@ -574,6 +592,9 @@ def append_conversation_message(
     estimated_tokens: Optional[int] = None,
     metadata: Optional[Dict[str, Any]] = None,
     thread_status: Optional[str] = None,
+    graph_thread_id: Optional[str] = None,
+    last_graph_node: Optional[str] = None,
+    last_checkpoint_at: Optional[str] = None,
     trace_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """向短期 transcript 写入一条消息，并同步更新线程元数据。"""
@@ -592,6 +613,9 @@ def append_conversation_message(
                 last_active_agent=active_agent,
                 pending_role=None,
                 pending_state_json={},
+                graph_thread_id=graph_thread_id,
+                last_graph_node=last_graph_node,
+                last_checkpoint_at=last_checkpoint_at,
                 trace_id=trace_id,
                 created_at=now,
                 updated_at=now,
@@ -605,6 +629,12 @@ def append_conversation_message(
                 thread.last_active_agent = active_agent
             if trace_id is not None:
                 thread.trace_id = trace_id
+            if graph_thread_id is not None:
+                thread.graph_thread_id = graph_thread_id
+            if last_graph_node is not None:
+                thread.last_graph_node = last_graph_node
+            if last_checkpoint_at is not None:
+                thread.last_checkpoint_at = last_checkpoint_at
             if thread_status:
                 thread.status = thread_status
             elif run_status in {"completed", "interrupted", "error"}:
@@ -642,6 +672,9 @@ def mark_conversation_thread_status(
     rolling_summary: Optional[str] = None,
     pending_role: Optional[str] = None,
     pending_state: Optional[Dict[str, Any]] = None,
+    graph_thread_id: Optional[str] = None,
+    last_graph_node: Optional[str] = None,
+    last_checkpoint_at: Optional[str] = None,
     trace_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """更新线程状态，不额外写入消息。"""
@@ -660,6 +693,12 @@ def mark_conversation_thread_status(
             thread.pending_role = pending_role
         if pending_state is not None:
             thread.pending_state_json = pending_state
+        if graph_thread_id is not None:
+            thread.graph_thread_id = graph_thread_id
+        if last_graph_node is not None:
+            thread.last_graph_node = last_graph_node
+        if last_checkpoint_at is not None:
+            thread.last_checkpoint_at = last_checkpoint_at
         if trace_id is not None:
             thread.trace_id = trace_id
         session.add(thread)
@@ -799,6 +838,9 @@ def save_pending_conversation_state(
     trace_id: Optional[str],
     status: str = "interrupted",
     last_active_agent: Optional[str] = None,
+    graph_thread_id: Optional[str] = None,
+    last_graph_node: Optional[str] = None,
+    last_checkpoint_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """持久化待审批线程状态，便于跨进程 resume。"""
     return create_or_touch_conversation_thread(
@@ -808,6 +850,9 @@ def save_pending_conversation_state(
         last_active_agent=last_active_agent or pending_role,
         pending_role=pending_role,
         pending_state=pending_state,
+        graph_thread_id=graph_thread_id,
+        last_graph_node=last_graph_node,
+        last_checkpoint_at=last_checkpoint_at,
         trace_id=trace_id,
     )
 
@@ -817,6 +862,9 @@ def clear_pending_conversation_state(
     *,
     status: str,
     last_active_agent: Optional[str] = None,
+    graph_thread_id: Optional[str] = None,
+    last_graph_node: Optional[str] = None,
+    last_checkpoint_at: Optional[str] = None,
     trace_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """清空线程中的待审批状态。"""
@@ -826,6 +874,9 @@ def clear_pending_conversation_state(
         last_active_agent=last_active_agent,
         pending_role="",
         pending_state={},
+        graph_thread_id=graph_thread_id,
+        last_graph_node=last_graph_node,
+        last_checkpoint_at=last_checkpoint_at,
         trace_id=trace_id,
     )
 

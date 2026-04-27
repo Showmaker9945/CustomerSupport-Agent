@@ -153,6 +153,9 @@ class ThreadPayload(BaseModel):
     last_active_agent: Optional[str]
     pending_role: Optional[str]
     pending_approval: bool
+    graph_thread_id: Optional[str]
+    last_graph_node: Optional[str]
+    last_checkpoint_at: Optional[str]
     trace_id: Optional[str]
     created_at: str
     updated_at: str
@@ -201,6 +204,9 @@ def _build_thread_payload(thread: Dict[str, Any]) -> ThreadPayload:
         last_active_agent=thread.get("last_active_agent"),
         pending_role=thread.get("pending_role") or None,
         pending_approval=bool(thread.get("pending_role") and thread.get("pending_state")),
+        graph_thread_id=thread.get("graph_thread_id"),
+        last_graph_node=thread.get("last_graph_node"),
+        last_checkpoint_at=thread.get("last_checkpoint_at"),
         trace_id=thread.get("trace_id"),
         created_at=thread.get("created_at") or "",
         updated_at=thread.get("updated_at") or "",

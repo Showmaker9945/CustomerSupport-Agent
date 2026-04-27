@@ -1251,7 +1251,7 @@ class SupportAgent:
         intent = baseline_intent
         risk = baseline_risk
         sentiment_label = baseline_sentiment.label
-        frustration_score = baseline_sentiment.frustration_score
+        frustration_score = self._safe_float(baseline_sentiment.frustration_score)
         selected_agent = "supervisor"
         execution_steps: List[str] = []
         route_reason = "heuristic"
@@ -1400,7 +1400,7 @@ class SupportAgent:
             "intent": intent,
             "risk": risk,
             "sentiment_label": sentiment_label,
-            "frustration_score": frustration_score,
+            "frustration_score": self._safe_float(frustration_score),
             "needs_knowledge": needs_knowledge,
             "needs_action": needs_action,
             "needs_escalation": needs_escalation,
@@ -1456,6 +1456,69 @@ class SupportAgent:
 
     def _graph_thread_id(self, thread_id: str) -> str:
         return f"{settings.langgraph_thread_prefix}:graph:{thread_id}"
+
+    def _checkpoint_timestamp(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _last_graph_node_from_state(self, state: OrchestrationState) -> str:
+        timings = state.get("node_timings", [])
+        if isinstance(timings, list):
+            for item in reversed(timings):
+                if isinstance(item, dict) and item.get("node"):
+                    return str(item["node"])
+
+        route_path = state.get("route_path", [])
+        if isinstance(route_path, list) and route_path:
+            return str(route_path[-1])
+
+        return str(state.get("active_agent") or state.get("selected_agent") or "analyze")
+
+    def _pending_display_state(self, state: OrchestrationState) -> Dict[str, Any]:
+        """Build the lightweight approval snapshot stored in conversation_threads."""
+        display: Dict[str, Any] = {}
+        for key in (
+            "user_id",
+            "thread_id",
+            "graph_thread_id",
+            "trace_id",
+            "intent",
+            "risk",
+            "selected_agent",
+            "active_agent",
+            "run_status",
+            "route_path",
+            "decision_summary",
+            "interrupts",
+            "citations",
+            "validation_notes",
+        ):
+            if key in state:
+                display[key] = state.get(key)
+
+        display["last_graph_node"] = self._last_graph_node_from_state(state)
+        approval = self._build_approval_payload(state.get("interrupts", []))
+        if approval:
+            display["approval"] = approval
+        return display
+
+    def _graph_checkpoint_config(self, thread_id: str) -> Dict[str, Any]:
+        return {"configurable": {"thread_id": self._graph_thread_id(thread_id)}}
+
+    def _load_graph_checkpoint_state(self, thread_id: str) -> OrchestrationState:
+        try:
+            snapshot = self.orchestration_graph.get_state(self._graph_checkpoint_config(thread_id))
+        except Exception as error:
+            logger.debug(f"Failed to load orchestration checkpoint for {thread_id}: {error}")
+            return {}
+
+        values = getattr(snapshot, "values", None)
+        if not isinstance(values, dict) or not values:
+            return {}
+
+        loaded_state = dict(values)
+        loaded_state.setdefault("thread_id", thread_id)
+        loaded_state.setdefault("graph_thread_id", self._graph_thread_id(thread_id))
+        return loaded_state
 
     def _tool_label(self, tool_name: str) -> str:
         return TOOL_LABELS.get(tool_name, tool_name or "未知动作")
@@ -1782,6 +1845,9 @@ class SupportAgent:
         )
         response_message = merged_state.get("final_message", resumed_text)
         citations = self._citations_from_state(merged_state)
+        graph_thread_id = str(merged_state.get("graph_thread_id") or self._graph_thread_id(thread_id))
+        last_graph_node = self._last_graph_node_from_state(merged_state)
+        checkpoint_at = self._checkpoint_timestamp()
 
         self._pending_role.pop(thread_id, None)
         self._pending_state.pop(thread_id, None)
@@ -1800,12 +1866,18 @@ class SupportAgent:
                 "resumed": True,
             },
             thread_status="completed",
+            graph_thread_id=graph_thread_id,
+            last_graph_node=last_graph_node,
+            last_checkpoint_at=checkpoint_at,
             trace_id=trace_id,
         )
         clear_pending_conversation_state(
             thread_id,
             status="completed",
             last_active_agent=merged_state.get("selected_agent", role),
+            graph_thread_id=graph_thread_id,
+            last_graph_node=last_graph_node,
+            last_checkpoint_at=checkpoint_at,
             trace_id=trace_id,
         )
         self._refresh_thread_summary_if_needed(thread_id)
@@ -1931,6 +2003,9 @@ class SupportAgent:
         status: str = "active",
         title: Optional[str] = None,
         last_active_agent: Optional[str] = None,
+        graph_thread_id: Optional[str] = None,
+        last_graph_node: Optional[str] = None,
+        last_checkpoint_at: Optional[str] = None,
         trace_id: Optional[str] = None,
     ) -> None:
         """确保线程元数据存在，便于 transcript 与 API 查询统一落库。"""
@@ -1940,6 +2015,9 @@ class SupportAgent:
             status=status,
             title=title,
             last_active_agent=last_active_agent,
+            graph_thread_id=graph_thread_id,
+            last_graph_node=last_graph_node,
+            last_checkpoint_at=last_checkpoint_at,
             trace_id=trace_id,
         )
 
@@ -2075,9 +2153,29 @@ class SupportAgent:
         )
 
     def _load_pending_context(self, thread_id: str) -> Tuple[str, str, Optional[str], OrchestrationState]:
-        """优先从内存缓存读取待审批状态，不存在时回退到数据库。"""
+        """Load pending state from the main graph checkpoint, then legacy caches."""
         user_id = self._thread_user.get(thread_id, "unknown_user")
         trace_id = self._trace_by_thread.get(thread_id, "")
+
+        checkpoint_state = self._load_graph_checkpoint_state(thread_id)
+        if checkpoint_state and (
+            checkpoint_state.get("run_status") == "interrupted"
+            or bool(checkpoint_state.get("interrupts"))
+            or bool(checkpoint_state.get("pending_approval_plan"))
+        ):
+            loaded_state = dict(checkpoint_state)
+            loaded_state.setdefault("graph_thread_id", self._graph_thread_id(thread_id))
+            checkpoint_user_id = str(loaded_state.get("user_id") or user_id)
+            checkpoint_trace_id = str(loaded_state.get("trace_id") or trace_id or uuid.uuid4())
+            checkpoint_role = str(
+                loaded_state.get("active_agent") or loaded_state.get("selected_agent") or "action"
+            )
+            self._thread_user[thread_id] = checkpoint_user_id
+            self._trace_by_thread[thread_id] = checkpoint_trace_id
+            self._pending_role[thread_id] = checkpoint_role
+            self._pending_state[thread_id] = loaded_state
+            return checkpoint_user_id, checkpoint_trace_id, checkpoint_role, loaded_state
+
         role = self._pending_role.get(thread_id)
         pending_state = self._pending_state.get(thread_id, {})
 
@@ -2120,6 +2218,9 @@ class SupportAgent:
         metadata: Optional[Dict[str, Any]] = None,
         visible: bool = True,
         thread_status: Optional[str] = None,
+        graph_thread_id: Optional[str] = None,
+        last_graph_node: Optional[str] = None,
+        last_checkpoint_at: Optional[str] = None,
         trace_id: Optional[str] = None,
     ) -> None:
         """将用户可见对话历史持久化到业务数据库。"""
@@ -2134,6 +2235,9 @@ class SupportAgent:
             run_status=run_status,
             metadata=metadata,
             thread_status=thread_status,
+            graph_thread_id=graph_thread_id,
+            last_graph_node=last_graph_node,
+            last_checkpoint_at=last_checkpoint_at,
             trace_id=trace_id,
         )
 
@@ -2273,6 +2377,9 @@ class SupportAgent:
             status="active",
             title=message,
             last_active_agent="supervisor",
+            graph_thread_id=graph_thread_id,
+            last_graph_node="analyze",
+            last_checkpoint_at=self._checkpoint_timestamp(),
             trace_id=trace_id,
         )
         recent_context = self._load_recent_history_context(thread)
@@ -2300,7 +2407,7 @@ class SupportAgent:
             "intent": initial_intent,
             "risk": initial_risk,
             "sentiment_label": baseline_sentiment.label,
-            "frustration_score": baseline_sentiment.frustration_score,
+            "frustration_score": self._safe_float(baseline_sentiment.frustration_score),
             "route_reason": "bootstrap",
             "selected_agent": "supervisor",
             "active_agent": "supervisor",
@@ -2351,7 +2458,7 @@ class SupportAgent:
             try:
                 final_state = self.orchestration_graph.invoke(initial_state, config=graph_config)
             except Exception as error:
-                logger.error(f"Graph invocation failed, fallback to template: {error}")
+                logger.exception(f"Graph invocation failed, fallback to template: {error}")
                 fallback = self._fallback_response(
                     role="supervisor",
                     user_id=user_id,
@@ -2374,6 +2481,9 @@ class SupportAgent:
                     thread,
                     status="completed",
                     last_active_agent=initial_state["selected_agent"],
+                    graph_thread_id=graph_thread_id,
+                    last_graph_node="fallback",
+                    last_checkpoint_at=self._checkpoint_timestamp(),
                     trace_id=trace_id,
                 )
                 self._refresh_thread_summary_if_needed(thread)
@@ -2424,10 +2534,13 @@ class SupportAgent:
                     thread_id=thread,
                     user_id=user_id,
                     pending_role=pending_role,
-                    pending_state=dict(final_state),
+                    pending_state=self._pending_display_state(final_state),
                     trace_id=trace_id,
                     status="interrupted",
                     last_active_agent=pending_role,
+                    graph_thread_id=graph_thread_id,
+                    last_graph_node=self._last_graph_node_from_state(final_state),
+                    last_checkpoint_at=self._checkpoint_timestamp(),
                 )
                 wait_message = "检测到高风险动作，已暂停执行，等待人工审批（approve/edit/reject）。"
                 self._record_history(
@@ -2443,6 +2556,9 @@ class SupportAgent:
                         "interrupt_count": len(final_state.get("interrupts", [])),
                     },
                     thread_status="interrupted",
+                    graph_thread_id=graph_thread_id,
+                    last_graph_node=self._last_graph_node_from_state(final_state),
+                    last_checkpoint_at=self._checkpoint_timestamp(),
                     trace_id=trace_id,
                 )
                 self._refresh_thread_summary_if_needed(thread)
@@ -2508,6 +2624,9 @@ class SupportAgent:
                 thread,
                 status="completed",
                 last_active_agent=active_agent,
+                graph_thread_id=graph_thread_id,
+                last_graph_node=self._last_graph_node_from_state(final_state),
+                last_checkpoint_at=self._checkpoint_timestamp(),
                 trace_id=trace_id,
             )
             self._refresh_thread_summary_if_needed(thread)
@@ -2800,6 +2919,9 @@ class SupportAgent:
                 thread_id,
                 status="completed",
                 last_active_agent=role,
+                graph_thread_id=pending_state.get("graph_thread_id") or self._graph_thread_id(thread_id),
+                last_graph_node=self._last_graph_node_from_state(pending_state),
+                last_checkpoint_at=self._checkpoint_timestamp(),
                 trace_id=trace_id,
             )
             return SupportResponse(
@@ -2927,10 +3049,13 @@ class SupportAgent:
                 thread_id=thread_id,
                 user_id=user_id,
                 pending_role=role,
-                pending_state=updated_state,
+                pending_state=self._pending_display_state(updated_state),
                 trace_id=trace_id,
                 status="interrupted",
                 last_active_agent=role,
+                graph_thread_id=updated_state.get("graph_thread_id") or self._graph_thread_id(thread_id),
+                last_graph_node=self._last_graph_node_from_state(updated_state),
+                last_checkpoint_at=self._checkpoint_timestamp(),
             )
             approval = self._build_approval_payload(interrupts)
             return SupportResponse(

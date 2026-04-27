@@ -245,6 +245,47 @@ def test_load_pending_context_backfills_graph_thread_id(agent):
     assert loaded_state["graph_thread_id"] == agent._graph_thread_id("thread-pending-graph")
 
 
+def test_load_pending_context_prefers_graph_checkpoint(agent):
+    thread_id = "thread-checkpoint-pending"
+    display_state = {
+        "thread_id": thread_id,
+        "intent": "request",
+        "risk": "medium",
+        "active_agent": "action",
+        "run_status": "interrupted",
+        "interrupts": [{"id": "display-only", "tool": "create_ticket"}],
+    }
+    checkpoint_state = {
+        **display_state,
+        "user_id": "checkpoint_user",
+        "graph_thread_id": agent._graph_thread_id(thread_id),
+        "trace_id": "trace-checkpoint",
+        "current_message": "checkpoint source message",
+        "pending_approval_plan": {"mode": "deterministic_tool_call", "tool": "create_ticket"},
+    }
+    agent.orchestration_graph = _FakeOrchestrationGraph({}, checkpoint_values=checkpoint_state)
+    save_pending_conversation_state(
+        thread_id=thread_id,
+        user_id="db_user",
+        pending_role="action",
+        pending_state=display_state,
+        trace_id="trace-db-display",
+        status="interrupted",
+        last_active_agent="action",
+        graph_thread_id=agent._graph_thread_id(thread_id),
+        last_graph_node="action",
+        last_checkpoint_at="2026-04-27T00:00:00+00:00",
+    )
+
+    user_id, trace_id, role, loaded_state = agent._load_pending_context(thread_id)
+
+    assert user_id == "checkpoint_user"
+    assert trace_id == "trace-checkpoint"
+    assert role == "action"
+    assert loaded_state["current_message"] == "checkpoint source message"
+    assert loaded_state["pending_approval_plan"]["mode"] == "deterministic_tool_call"
+
+
 def test_resume_can_recover_pending_state_from_database(monkeypatch, isolated_business_db):
     monkeypatch.setenv("DISABLE_LLM", "true")
     agent = SupportAgent(enable_memory=True, enable_sentiment=True)
@@ -430,15 +471,21 @@ class _FakeRoleAgent:
 
 
 class _FakeOrchestrationGraph:
-    def __init__(self, result):
+    def __init__(self, result, checkpoint_values=None):
         self.result = dict(result)
+        self.checkpoint_values = dict(checkpoint_values or {})
         self.calls = []
+        self.state_calls = []
 
     def invoke(self, state, config=None):
         self.calls.append({"state": dict(state), "config": dict(config or {})})
         merged = dict(state)
         merged.update(self.result)
         return merged
+
+    def get_state(self, config=None):
+        self.state_calls.append(dict(config or {}))
+        return SimpleNamespace(values=dict(self.checkpoint_values))
 
 
 def test_resume_approve_does_not_false_escalate(agent):
@@ -500,11 +547,20 @@ def test_deterministic_resume_approve_executes_ticket(agent):
     }
 
     interrupted = agent.chat(user_id="resume_ticket_user", message="帮我创建一个账单异常工单")
+    pending_record = get_conversation_thread(interrupted.thread_id)
     resumed = agent.resume(thread_id=interrupted.thread_id, decisions=[{"type": "approve"}])
     thread_record = get_conversation_thread(interrupted.thread_id)
     tickets = list_ticket_records("resume_ticket_user")
 
     assert interrupted.run_status == "interrupted"
+    assert pending_record is not None
+    assert pending_record["graph_thread_id"] == agent._graph_thread_id(interrupted.thread_id)
+    assert pending_record["last_graph_node"] == "action"
+    assert pending_record["last_checkpoint_at"]
+    assert pending_record["pending_state"]["run_status"] == "interrupted"
+    assert "interrupts" in pending_record["pending_state"]
+    assert "current_message" not in pending_record["pending_state"]
+    assert "pending_approval_plan" not in pending_record["pending_state"]
     assert resumed.run_status == "completed"
     assert resumed.ticket_created is not None
     assert resumed.ticket_created.startswith("TKT-")

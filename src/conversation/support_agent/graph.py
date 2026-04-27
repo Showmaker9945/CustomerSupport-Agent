@@ -286,6 +286,29 @@ def build_trace_event(
     return event
 
 
+def to_checkpoint_safe(value: Any) -> Any:
+    """Normalize graph state values so LangGraph checkpointers can serialize them."""
+    if value is None or type(value) in {str, int, float, bool}:
+        return value
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): to_checkpoint_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_checkpoint_safe(item) for item in value]
+    if hasattr(value, "item"):
+        with suppress(Exception):
+            return to_checkpoint_safe(value.item())
+    if hasattr(value, "tolist"):
+        with suppress(Exception):
+            return to_checkpoint_safe(value.tolist())
+    return str(value)
+
+
 def extend_trace(
     state: OrchestrationState,
     *,
@@ -678,7 +701,7 @@ class SupportAgentOrchestrator:
         handler: Any,
     ) -> Dict[str, Any]:
         started = perf_counter()
-        result = dict(handler(state) or {})
+        result = to_checkpoint_safe(dict(handler(state) or {}))
         elapsed_ms = (perf_counter() - started) * 1000
 
         status = "completed"
@@ -698,7 +721,7 @@ class SupportAgentOrchestrator:
                 status=status,
             )
         )
-        return result
+        return to_checkpoint_safe(result)
 
     def build(
         self,
